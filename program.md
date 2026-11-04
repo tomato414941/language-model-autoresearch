@@ -11,7 +11,7 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
-4. **Prepare the data**: on the rented machine, check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, run `uv run prepare.py` there.
+4. **Prepare the data**: run `uv run prepare.py` on the processing server (see the rules at the end). When you rent, bring the tokenizer from there; on the rented machine `prepare.py` then only downloads the data shards, which is fast.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -123,5 +123,5 @@ As an example use case, a user might leave you running while they sleep. If each
 
 - **Rentals.** H100 time costs money, so rent one at most once a day, only to run experiments, for at most the length the user gives, and delete it right after. When you rent, set a timer that deletes it at that length, in case you stop responding.
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiments as ready-to-run commits so that rented time goes to training only, and make renting faster and cheaper. When a kept change moves the baseline during a rental, put the prepared experiments on top of it before running them.
-- **CPU work.** Work heavier than editing and git, such as installing the environment or checking code, runs on the processing server in your environment notes, never on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
+- **CPU work.** Rented GPU time is only for the 5-minute trainings. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that each prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPU and the time budget. Propose such changes with the evidence.
