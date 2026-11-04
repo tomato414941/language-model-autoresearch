@@ -42,7 +42,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **Discarded is not forever**: An idea that did not help can be tried again when the baseline has changed, when it is combined or configured differently, when the earlier difference was within noise, or when new evidence appears. Only avoid repeating the same experiment unchanged.
 
-**Follow the latest work**: Before choosing ideas, and again every 10 experiments, search the web for what is new: speedrun (modded-nanogpt) and nanochat records, recent arXiv papers on small-model pretraining, and other people's autoresearch results. Put the source of each idea in its description.
+**Follow the latest work**: Between rentals, search the web for what is new: speedrun (modded-nanogpt) and nanochat records, recent arXiv papers on small-model pretraining, and other people's autoresearch results. Put the source of each idea in its description.
 
 ## Output format
 
@@ -115,12 +115,12 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period. In this repository the loop alternates rentals and the work between them (see the rules at the end); never stop to ask.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
 
 ## Rules of this repository
 
-- Do not keep the GPU running. Rent the H100 only when a batch of experiments is ready, run them back to back and delete it right after. Do the research and the planning of the next batch without a machine.
-- When you rent, set a timer that deletes the machine at the user's budget, in case you stop responding. Stop when the budget is reached.
+- **Rentals.** H100 time costs money, so rent one only to run experiments, for at most the length the user gives, and delete it right after. When you rent, set a timer that deletes it at that length, in case you stop responding.
+- **Between rentals.** Analyze the results, search for the latest work, and prepare the next experiments as ready-to-run commits, so that rented time goes to training only. The next rental comes after the interval the user gives.
 - Anything outside `train.py`, such as the data, `prepare.py`, the dependencies, the GPU or the time budget, is the user's to change. Propose such changes with the evidence.
