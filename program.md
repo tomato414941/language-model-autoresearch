@@ -11,7 +11,7 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
-4. **Prepare the data**: run `uv run prepare.py` on the processing server (see the rules at the end). When you rent, bring the tokenizer from there; on the rented machine `prepare.py` then only downloads the data shards, which is fast.
+4. **Prepare the data**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer. When you rent, bring the tokenizer from there and run `uv run prepare.py` on the rented machine, which then only downloads the data shards.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -19,7 +19,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 40 minutes** (wall clock training time, excluding startup/compilation): one run in each daily rental of at most 1 hour. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -29,16 +29,19 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 - Train on data that is not allowed. The allowed data is what `prepare.py` downloads, now FineWeb-Edu only. Only the human adds data, by adding it to `prepare.py`.
+- Continue an earlier run's training. Every run trains from scratch and ends within its rental.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 40 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
-**The first run**: Your very first runs establish the baseline and its noise: run the training script as is three times, changing only the seed. The baseline is their mean, and the noise is the gap between the highest and the lowest.
+**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
 
-**Bundles**: One run per small change is too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
+**Noise**: Keep a change only if it beats the best val_bpb by more than the noise between seeds. Until you have measured it here, take it as 0.3%.
+
+**Bundles**: With one run a day, one change per run is far too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
 **Discarded is not forever**: An idea that did not help can be tried again when the baseline has changed, when it is combined or configured differently, when the earlier difference was within noise, or when new evidence appears. Only avoid repeating the same experiment unchanged.
 
@@ -46,7 +49,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+Once the script finishes it prints a summary like this (these numbers are from a 5-minute run in autoresearch):
 
 ```
 ---
@@ -61,7 +64,7 @@ num_params_M:     50.3
 depth:            8
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Note that the script is configured to always stop after 40 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
 grep "^val_bpb:" run.log
@@ -111,17 +114,15 @@ LOOP FOREVER:
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment takes 40 minutes of training plus startup and eval, and must end within the 1-hour rental. If it cannot, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period. In this repository the loop alternates rentals and the work between them (see the rules at the end); never stop to ask.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period. In this repository the loop alternates the daily rental and the work between rentals (see the rules at the end).
 
 ## Rules of this repository
 
-- **Rentals.** Rent one H100 at most once a day and for at most 1 hour, only to run experiments, and delete it right after. This hour is the fixed budget of the loop, as the 5 minutes are of a run: everything else exists to make the most of it. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
-- **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiments as ready-to-run commits so that rented time goes to training only, and make renting faster and cheaper. When a kept change moves the baseline during a rental, put the prepared experiments on top of it before running them.
-- **CPU work.** Rented GPU time is only for the 5-minute trainings. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that each prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
+- **Rentals.** Rent one H100 at most once a day and for at most 1 hour, run the day's experiment and delete it right after. This hour is fixed, as the 5 minutes are in autoresearch: everything else exists to make the most of it. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
+- **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiment as a ready-to-run commit so that rented time goes to training only, and make renting faster and cheaper.
+- **CPU work.** Rented GPU time is only for the training. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that the prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPU, the time budget and the daily hour. Propose such changes with the evidence.
