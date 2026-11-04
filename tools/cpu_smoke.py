@@ -42,7 +42,9 @@ def main():
     namespace = load_model_namespace()
     torch.manual_seed(42)
     config = namespace['GPTConfig'](sequence_len=32, vocab_size=256, n_layer=4, n_head=2, n_kv_head=2, n_embd=64, window_pattern='SSSL')
-    model = namespace['GPT'](config)
+    with torch.device('meta'):
+        model = namespace['GPT'](config)
+    model.to_empty(device='cpu')
     model.init_weights()
     optimizer = model.setup_optimizer(embedding_lr=0.03, matrix_lr=0.02)
     torch.manual_seed(42)
