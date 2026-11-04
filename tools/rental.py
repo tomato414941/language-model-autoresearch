@@ -200,18 +200,18 @@ def prepare_job(commit, baseline, description):
 
 
 def choose_offer():
-    query = {'verified': {'eq': True}, 'external': {'eq': False}, 'rentable': {'eq': True},
+    query = {'external': {'eq': False}, 'rentable': {'eq': True},
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
-             'gpu_name': {'in': ['H100 SXM', 'H100 NVL', 'H100 PCIE']}, 'gpu_ram': {'gte': 79000},
+             'gpu_name': {'eq': 'H100 SXM'}, 'gpu_ram': {'gte': 79000},
              'cpu_ram': {'gte': 32000}, 'cpu_cores_effective': {'gte': 12}, 'disk_space': {'gte': 90},
              'inet_down': {'gte': 800}, 'reliability2': {'gte': 0.98}, 'cuda_max_good': {'gte': 12.8},
              'order': [['dph_total', 'asc']], 'type': 'ondemand', 'allocated_storage': 90, 'limit': 20}
     offers = [row for row in api('POST', 'bundles/', query)['offers']
-              if row.get('num_gpus') == 1 and row.get('gpu_name') in query['gpu_name']['in']
+              if row.get('num_gpus') == 1 and row.get('gpu_name') == 'H100 SXM'
               and float(row.get('gpu_ram', 0)) >= 79000 and float(row.get('cuda_max_good', 0)) >= 12.8
               and math.isfinite(row['dph_total']) and row['dph_total'] >= 0]
     if not offers:
-        raise RuntimeError('No suitable single H100 is available; no rental was requested.')
+        raise RuntimeError('No suitable single H100 SXM is available; no rental was requested.')
     return min(offers, key=lambda row: row['dph_total'])
 
 
@@ -247,8 +247,9 @@ def execute(job, instance, key):
                  capture_output=True, text=True).stdout.strip().splitlines()
     job['initial_gpu_observation'] = gpu
     save(job)
-    if len(gpu) != 1 or 'H100' not in gpu[0] or float(gpu[0].rsplit(',', 1)[1]) > 512:
-        raise RuntimeError('The rental does not provide one idle H100.')
+    if (len(gpu) != 1 or not re.search(r'H100 (?:SXM|80GB HBM3)', gpu[0])
+            or float(gpu[0].rsplit(',', 1)[1]) > 512):
+        raise RuntimeError('The rental does not provide one idle H100 SXM.')
     remote('mkdir -p autoresearch')
     for path in [ROOT / 'artifacts/gpu-env.tar.gz', ROOT / 'artifacts/gpu-assets.tar.gz',
                  job_path(job['id']).parent / 'source.tar.gz']:
@@ -401,7 +402,14 @@ def check_expiry():
 
 def cancel(job):
     if job.get('launch_unit'):
-        run(['systemctl', '--user', 'stop', job['launch_unit'] + '.timer', job['launch_unit'] + '.service'])
+        for suffix in ('.timer', '.service'):
+            unit = job['launch_unit'] + suffix
+            state = subprocess.run(['systemctl', '--user', 'show', unit, '--property=LoadState', '--value'],
+                                   capture_output=True, text=True)
+            if state.stdout.strip() == 'not-found':
+                continue
+            state.check_returncode()
+            run(['systemctl', '--user', 'stop', unit])
     job = load(job['id'])
     if job.get('creation_requested_at') and not job.get('deleted_at'):
         delete_instances(job)

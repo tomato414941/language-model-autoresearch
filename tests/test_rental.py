@@ -88,12 +88,25 @@ class RentalLifecycleTests(unittest.TestCase):
         api.assert_not_called()
         self.assertIn('deleted_at', rental.load('fixture'))
 
-    def test_selects_a_single_driver_compatible_h100_from_the_provider_results(self):
+    def test_cancels_a_scheduled_job_before_its_worker_has_started(self):
+        job = {**self.job, 'launch_unit': 'autoresearch-start-fixture', 'phase': 'prepared'}
+        rental.save(job)
+        states = [subprocess.CompletedProcess([], 0, stdout='loaded\n'),
+                  subprocess.CompletedProcess([], 1, stdout='not-found\n')]
+        with patch.object(rental.subprocess, 'run', side_effect=states):
+            with patch.object(rental, 'run') as stop:
+                rental.cancel(job)
+        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'autoresearch-start-fixture.timer'])
+        self.assertEqual(rental.load('fixture')['phase'], 'cancelled')
+
+    def test_selects_a_single_driver_compatible_h100_sxm_from_the_provider_results(self):
         base = dict(gpu_name='H100 SXM', num_gpus=1, cuda_max_good=12.8, gpu_ram=81559)
         offers = [{**base, 'id': 1, 'num_gpus': 2, 'dph_total': 1.0},
                   {**base, 'id': 2, 'gpu_name': 'H200', 'dph_total': 1.0},
                   {**base, 'id': 3, 'cuda_max_good': 12.6, 'dph_total': 1.0},
-                  {**base, 'id': 4, 'dph_total': 4.0}]
+                  {**base, 'id': 4, 'dph_total': 4.0},
+                  {**base, 'id': 5, 'gpu_name': 'H100 NVL', 'dph_total': 1.0},
+                  {**base, 'id': 6, 'gpu_name': 'H100 PCIE', 'dph_total': 1.0}]
         with patch.object(rental, 'api', return_value={'offers': offers}):
             self.assertEqual(rental.choose_offer()['id'], 4)
 
@@ -115,7 +128,7 @@ class RentalLifecycleTests(unittest.TestCase):
         def command(arguments, **kwargs):
             text = arguments[-1]
             if text.startswith('nvidia-smi'):
-                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100, 0\n')
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0\n')
             if 'nohup bash gpu_run.sh' in text:
                 launched.append(text)
             if 'kill -0' in text:

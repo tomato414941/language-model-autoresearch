@@ -1,5 +1,6 @@
 """Prepare and package the GPU runtime and fixed evaluation assets on the processing server."""
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ KERNEL_REPO = "varunneal/flash-attention-3"
 KERNEL_REVISION = "de87b9b5af06dd9984df595bef90b2eba44b181a"
 KERNEL_BUILD = "torch29-cxx11-cu128-x86_64-linux"
 CUDA_IMAGE = "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66"
+SOURCES = ("train.py", "prepare.py", "program.md", "pyproject.toml", "uv.lock")
 
 
 def run(command, **kwargs):
@@ -30,7 +32,33 @@ def pack(directory, destination):
     return prepare._file_sha256(destination)
 
 
+def refresh_source_hashes():
+    """Reuse verified runtime archives after changing only training or repository rules."""
+    prepare.verify_core_assets()
+    artifacts = ROOT / "artifacts"
+    path = artifacts / "runtime.json"
+    manifest = json.loads(path.read_text())
+    hashes = {name: prepare._file_sha256(ROOT / name) for name in SOURCES}
+    for name in ("prepare.py", "pyproject.toml", "uv.lock"):
+        if hashes[name] != manifest["sources"][name]:
+            raise RuntimeError("The runtime or evaluation changed; rebuild its archives first.")
+    for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
+        if prepare._file_sha256(artifacts / name) != manifest[field]:
+            raise RuntimeError("A prepared runtime archive changed; rebuild it first.")
+    manifest["sources"] = hashes
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary.replace(path)
+    print("Refreshed source hashes using the unchanged, verified runtime archives.", flush=True)
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--refresh-source-hashes", action="store_true")
+    args = parser.parse_args()
+    if args.refresh_source_hashes:
+        refresh_source_hashes()
+        return
     prepare.verify_core_assets()
     uv = shutil.which("uv")
     if uv is None:
@@ -87,8 +115,7 @@ def main():
         python_version=PYTHON_VERSION, kernel_repo=KERNEL_REPO, kernel_revision=KERNEL_REVISION,
         container_image=CUDA_IMAGE, nanochat_revision=prepare.CORE_NANOCHAT_REVISION,
         core_bundle_sha256=prepare.CORE_BUNDLE_SHA256,
-        sources={name: prepare._file_sha256(ROOT / name)
-                 for name in ("train.py", "prepare.py", "program.md", "pyproject.toml", "uv.lock")},
+        sources={name: prepare._file_sha256(ROOT / name) for name in SOURCES},
     )
     manifest["gpu_env_sha256"] = pack(runtime, artifacts / "gpu-env.tar.gz")
     manifest["gpu_assets_sha256"] = pack(assets, artifacts / "gpu-assets.tar.gz")
