@@ -177,8 +177,9 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        # Initialization: https://github.com/karpathy/nanochat/commit/a825e63f81e62e2e9fd38655e9b2e39417620545
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
         n_embd = self.config.n_embd
@@ -188,11 +189,13 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
+        for i in range(self.config.n_layer):
+            fraction = i / max(self.config.n_layer - 1, 1)
+            self.resid_lambdas[i] = 1.15 - 0.10 * fraction
+            self.x0_lambdas[i] = 0.20 - 0.15 * fraction
         self.smear_gain.zero_()
         self.backout_gain.fill_(0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
