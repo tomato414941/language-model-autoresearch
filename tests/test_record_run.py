@@ -120,6 +120,50 @@ class RecordedDecisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.record('baseline')
 
+    def test_finalizes_native_results_once_and_exports_the_fixed_core_decision(self):
+        self.make_run('baseline', 0.12, 1.0, baseline=True)
+        self.record('baseline')
+        self.make_run('candidate', 0.13, 1.5)
+        rental.save(dict(id='candidate', creation_requested_at=1000))
+
+        def delete(job):
+            rental.save(dict(id=job['id'], deleted_at=1100))
+
+        def record(command):
+            self.assertEqual(rental.load(command[-1])['deleted_at'], 1100)
+            return self.record(command[-1])
+
+        with patch.object(rental, 'delete_instances', side_effect=delete):
+            with patch.object(rental, 'run', side_effect=record):
+                for _ in range(2):
+                    rental.finalize(rental.load('candidate'))
+        records = json.loads((self.root / 'results/decisions.json').read_text())
+        self.assertEqual(len(records), 2)
+        self.assertEqual((records[-1]['status'], records[-1]['incumbent']), ('keep', 'baseline'))
+        self.assertEqual((records[-1]['core_metric'], records[-1]['val_bpb']), (0.13, 1.5))
+        with (self.root / 'results.tsv').open(newline='') as source:
+            rows = list(csv.reader(source, delimiter='\t'))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[-1][4], 'keep')
+
+    def test_finalizes_a_failed_attempt_with_its_reference_bpb_and_preserves_the_incumbent(self):
+        self.make_run('baseline', 0.12, 1.0, baseline=True)
+        self.record('baseline')
+        self.make_run('failed', 0.15, 0.5)
+        rental.save(dict(id='failed', phase='failed', exit_code=1, creation_requested_at=1000))
+
+        def delete(job):
+            rental.save(dict(id=job['id'], deleted_at=1100))
+
+        with patch.object(rental, 'delete_instances', side_effect=delete):
+            with patch.object(rental, 'run', side_effect=lambda command: self.record(command[-1])):
+                rental.finalize(rental.load('failed'))
+        records = json.loads((self.root / 'results/decisions.json').read_text())
+        self.assertEqual(records[-1]['status'], 'crash')
+        self.assertIsNone(records[-1]['core_metric'])
+        self.assertEqual(records[-1]['val_bpb'], 0.5)
+        self.assertEqual([row['id'] for row in records if row['status'] == 'keep'], ['baseline'])
+
 
 if __name__ == '__main__':
     unittest.main()

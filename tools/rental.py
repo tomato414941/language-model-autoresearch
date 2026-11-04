@@ -152,6 +152,16 @@ def delete_instances(job):
         subprocess.run(['systemctl', '--user', 'stop', job['expiry_unit'] + '.timer'], check=False)
 
 
+def finalize(job):
+    delete_instances(job)
+    current = load(job['id'])
+    if (current.get('creation_requested_at') is not None
+            and not current.get('creation_rejected')
+            and current['phase'] in ('evaluated', 'failed')):
+        # Record only after deletion; the existing ledger validates native artifacts and is idempotent.
+        run([sys.executable, str(ROOT / 'tools/record_run.py'), current['id']])
+
+
 def validate_environment():
     if not os.environ.get('VAST_API_KEY'):
         raise RuntimeError('VAST_API_KEY is required in the environment.')
@@ -428,7 +438,7 @@ def start(job):
         raise
     finally:
         # Expiry has its own service, credentials and timer if this controller disappears.
-        delete_instances(job)
+        finalize(job)
 
 
 def schedule(job, when):
@@ -507,7 +517,7 @@ def main():
     if args.action == 'expire':
         if job.get('diagnostic'):
             validate_environment()
-        delete_instances(job)
+        finalize(job)
     elif args.action == 'schedule':
         schedule(job, args.at)
     elif args.action == 'cancel':

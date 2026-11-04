@@ -33,6 +33,71 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(stored['exit_code'], 0)
         self.assertEqual(stored['deleted_at'], 123)
 
+    def test_records_completed_and_failed_attempts_after_confirming_deletion(self):
+        for phase in ('evaluated', 'failed'):
+            with self.subTest(phase=phase):
+                rental.save(dict(id='fixture', phase=phase, creation_requested_at=1000))
+                events = []
+
+                def delete(job):
+                    rental.save(dict(id=job['id'], deleted_at=1100))
+                    events.append('deleted')
+
+                def record(command):
+                    self.assertEqual(rental.load('fixture')['deleted_at'], 1100)
+                    self.assertEqual(command[1:], [str(self.root / 'tools/record_run.py'), 'fixture'])
+                    events.append('recorded')
+
+                with patch.object(rental, 'delete_instances', side_effect=delete):
+                    with patch.object(rental, 'run', side_effect=record):
+                        rental.finalize(self.job)
+                self.assertEqual(events, ['deleted', 'recorded'])
+
+    def test_reloads_the_collected_phase_before_recording_an_expiry_observation(self):
+        rental.save(dict(id='fixture', creation_requested_at=1000))
+
+        def delete(job):
+            rental.save(dict(id=job['id'], phase='evaluated', exit_code=0, deleted_at=1100))
+
+        with patch.object(rental, 'delete_instances', side_effect=delete):
+            with patch.object(rental, 'run') as record:
+                rental.finalize(self.job)
+        record.assert_called_once()
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+
+    def test_retains_the_original_deletion_failure_before_exporting_a_decision(self):
+        rental.save(dict(id='fixture', phase='evaluated', creation_requested_at=1000))
+        with patch.object(rental, 'delete_instances', side_effect=RuntimeError('deletion pending')):
+            with patch.object(rental, 'run') as record:
+                with self.assertRaisesRegex(RuntimeError, 'deletion pending'):
+                    rental.finalize(self.job)
+        record.assert_not_called()
+
+    def test_leaves_unfinished_rejected_and_unrequested_jobs_for_observation(self):
+        cases = [dict(phase='running', creation_requested_at=1000, creation_rejected=False),
+                 dict(phase='failed', creation_requested_at=1000, creation_rejected=True),
+                 dict(phase='failed', creation_requested_at=None, creation_rejected=False)]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                rental.save(dict(id='fixture', **fields))
+                with patch.object(rental, 'delete_instances'):
+                    with patch.object(rental, 'run') as record:
+                        rental.finalize(self.job)
+                record.assert_not_called()
+
+    def test_keeps_collected_results_available_when_decision_export_fails(self):
+        rental.save(dict(id='fixture', phase='evaluated', exit_code=0, creation_requested_at=1000))
+
+        def delete(job):
+            rental.save(dict(id=job['id'], deleted_at=1100))
+
+        with patch.object(rental, 'delete_instances', side_effect=delete):
+            with patch.object(rental, 'run', side_effect=subprocess.CalledProcessError(1, 'record')):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    rental.finalize(self.job)
+        stored = rental.load('fixture')
+        self.assertEqual((stored['phase'], stored['exit_code'], stored['deleted_at']), ('evaluated', 0, 1100))
+
     def test_keeps_another_experiments_instance_untouched(self):
         with patch.object(rental, 'list_instances', return_value=[{'id': 42, 'label': 'another-project'}]):
             with patch.object(rental, 'api') as api:
