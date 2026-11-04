@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
+3. **Rent the GPU**: experiments run on one rented H100 SXM, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
 4. **Prepare the data and evaluations**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer and prepare the complete pinned CORE evaluation. Bring the tokenizer and the entire CORE cache when renting, then run `uv run prepare.py` on the rented machine to download the remaining training shards. Finish the CORE integration and its CPU checks before measuring the baseline.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
@@ -126,7 +126,7 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 ## Rules of this repository
 
-- **Rentals.** Rent one H100 at most once a day and for at most 1 hour: the setup, the day's 30-minute training and its eval must fit in it. Delete it right after. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
+- **Rentals.** Rent one H100 SXM at most once a day and for at most 1 hour, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's 30-minute training and its eval must fit in it. Delete it right after. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiment as a ready-to-run commit so that rented time goes to training only, and make renting faster and cheaper.
 - **CPU work.** Rented GPU time is only for the training. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that the prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
 - **Source and secrets.** Edit source and configuration only in the local Git repository, then send them to the processing server; its copy is not a Git checkout. Keep keys in the ignored `.env`, and have tools read environment variables. Add `.env` to `.gitignore` before creating it. Never commit secrets or machine-specific connection details.

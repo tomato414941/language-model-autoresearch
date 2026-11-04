@@ -27,7 +27,7 @@ SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
 FRAME_SOURCES = SOURCES[1:]
 LEASE_SECONDS = 3600
 CLEANUP_SECONDS = 60
-PROJECT_LABELS = ('autoresearch-', 'language-model-research')
+PROJECT_LABELS = ('autoresearch-',)
 
 
 def digest(path):
