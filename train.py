@@ -36,10 +36,10 @@ from prepare import (
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
+    n_layer: int = 10
+    n_head: int = 5
+    n_kv_head: int = 5
+    n_embd: int = 640
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
 
@@ -497,7 +497,7 @@ WARMDOWN_RATIO = 0.65   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
 
 # Model size
-DEPTH = 12              # number of transformer layers
+DEPTH = 10              # number of transformer layers
 DEVICE_BATCH_SIZE = 64   # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
