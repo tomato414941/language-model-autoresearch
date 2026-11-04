@@ -1,6 +1,7 @@
 import ast
 import inspect
 from pathlib import Path
+import types
 import unittest
 
 import torch
@@ -43,7 +44,109 @@ def documents(split):
         yield rows, batch // 4 + 1
 
 
+class DeferredStream:
+    """Model FIFO device work while host writes remain immediate."""
+
+    def __init__(self):
+        self.pending = []
+        self.submitted = 0
+        self.observed = []
+
+    def submit(self, function):
+        self.submitted += 1
+        self.pending.append((self.submitted, function))
+        return self.submitted
+
+    def synchronize(self, boundary=None):
+        while self.pending and (boundary is None or self.pending[0][0] <= boundary):
+            _, function = self.pending.pop(0)
+            function()
+
+    def consume(self, inputs, targets, epoch):
+        self.submit(lambda: self.observed.append((inputs.clone(), targets.clone(), epoch)))
+
+    def event(self):
+        stream = self
+
+        class Event:
+            def __init__(self):
+                self.boundary = None
+
+            def record(self):
+                self.boundary = stream.submit(lambda: None)
+
+            def synchronize(self):
+                stream.synchronize(self.boundary)
+
+        return Event()
+
+    def torch_proxy(self):
+        stream = self
+
+        class DeviceBuffer:
+            is_cuda = True
+
+            def __init__(self, *args, **kwargs):
+                self.values = torch.empty(*args, **kwargs)
+
+            def __getitem__(self, item):
+                return self.values[item]
+
+            def copy_(self, source, non_blocking=False):
+                stream.submit(lambda: self.values.copy_(source))
+                if not non_blocking:
+                    stream.synchronize()
+                return self
+
+        def empty(*args, **kwargs):
+            device = kwargs.pop('device', None)
+            kwargs.pop('pin_memory', None)
+            if device == 'cuda':
+                return DeviceBuffer(*args, **kwargs)
+            return torch.empty(*args, **kwargs)
+
+        return types.SimpleNamespace(empty=empty, tensor=torch.tensor, long=torch.long,
+                                     cuda=types.SimpleNamespace(Event=self.event, synchronize=self.synchronize))
+
+
+def deferred_training_batches(source):
+    namespace = load_model_namespace()
+    stream = DeferredStream()
+    namespace.update(torch=stream.torch_proxy(), _document_batches=documents)
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'make_training_dataloader')
+    exec(compile(ast.Module(body=[function], type_ignores=[]), '<deferred_training_loader>', 'exec'), namespace)
+    loader = namespace['make_training_dataloader'](ToyTokenizer(), 2, 17, buffer_size=23)
+    inputs, targets, epoch = next(loader)
+    # Match the training loop's initial synchronization and two accumulation passes.
+    for _ in range(2):
+        stream.synchronize()
+        for _ in range(2):
+            stream.consume(inputs, targets, epoch)
+            inputs, targets, epoch = next(loader)
+        stream.synchronize()
+    return stream.observed
+
+
 class TrainingLoaderTests(unittest.TestCase):
+    def test_preserves_each_training_batch_when_nonblocking_transfers_are_deferred(self):
+        reference_namespace = dict(torch=torch, _document_batches=documents)
+        function = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
+                                   reference_namespace)
+        reference = function(ToyTokenizer(), 2, 17, 'train', buffer_size=23)
+        expected = []
+        for _ in range(4):
+            x, y, epoch = next(reference)
+            expected.append((x.clone(), y.clone(), epoch))
+        source = (Path(__file__).resolve().parents[1] / 'train.py').read_text()
+        actual = deferred_training_batches(source)
+        self.assertEqual(len(actual), len(expected))
+        for (inputs, targets, epoch), (expected_inputs, expected_targets, expected_epoch) in zip(
+                actual, expected, strict=True):
+            torch.testing.assert_close(inputs, expected_inputs, rtol=0, atol=0)
+            torch.testing.assert_close(targets, expected_targets, rtol=0, atol=0)
+            self.assertEqual(epoch, expected_epoch)
+
     def test_selects_the_largest_fit_with_fifo_ties_and_the_shortest_overflow(self):
         namespace = load_model_namespace()
         index = namespace['LengthIndexedDocuments']()

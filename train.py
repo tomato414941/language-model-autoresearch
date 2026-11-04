@@ -443,6 +443,7 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
+    transfer_done = None
     while True:
         for row_idx in range(B):
             pos = 0
@@ -456,9 +457,16 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
                     document = document[:remaining]
                 row_buffer[row_idx, pos:pos + len(document)] = torch.tensor(document, dtype=torch.long)
                 pos += len(document)
+        # Pinned host storage must remain unchanged until its prior H2D copy completes.
+        if transfer_done is not None:
+            transfer_done.synchronize()
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
         gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if gpu_buffer.is_cuda:
+            if transfer_done is None:
+                transfer_done = torch.cuda.Event()
+            transfer_done.record()
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
