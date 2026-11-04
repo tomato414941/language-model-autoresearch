@@ -121,5 +121,6 @@ As an example use case, a user might leave you running while they sleep. If each
 
 ## Rules of this repository
 
-- Delete the rented machine when you stop or when the user's budget is reached. When you rent it, set a timer that deletes it at the budget, in case you stop responding.
+- Do not keep the GPU running. Rent the H100 only when a batch of experiments is ready, run them back to back and delete it right after. Do the research and the planning of the next batch without a machine.
+- When you rent, set a timer that deletes the machine at the user's budget, in case you stop responding. Stop when the budget is reached.
 - Anything outside `train.py`, such as the data, `prepare.py`, the dependencies, the GPU or the time budget, is the user's to change. Propose such changes with the evidence.
