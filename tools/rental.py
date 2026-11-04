@@ -27,6 +27,8 @@ SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
 FRAME_SOURCES = SOURCES[1:]
 LEASE_SECONDS = 3600
 CLEANUP_SECONDS = 60
+EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup, compilation and reference BPB estimate.
+COLLECTION_SECONDS = 45
 PROJECT_LABELS = ('autoresearch-',)
 
 
@@ -160,7 +162,24 @@ def validate_environment():
                                        stderr=subprocess.DEVNULL).strip()
 
 
-def prepare_job(commit, baseline, description):
+def execution_budget(job):
+    from prepare import TIME_BUDGET
+
+    expected_core = float(job['expected_core_seconds'])
+    if not math.isfinite(expected_core) or expected_core <= 0:
+        raise ValueError('Reserve a positive finite duration for the complete CORE evaluation.')
+    required = TIME_BUDGET + expected_core + EXECUTION_SETUP_SECONDS + COLLECTION_SECONDS
+    if required >= LEASE_SECONDS - CLEANUP_SECONDS:
+        raise ValueError('The prepared runtime estimate does not fit inside the rental.')
+    return required
+
+
+def require_execution_time(job):
+    if job['expires_at'] - time.time() < execution_budget(job):
+        raise TimeoutError('Insufficient time remains for training and the complete fixed evaluation.')
+
+
+def prepare_job(commit, baseline, description, expected_core_seconds=None):
     import prepare
 
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
@@ -172,6 +191,9 @@ def prepare_job(commit, baseline, description):
         raise RuntimeError('The complete prompt preflight is not ready for this frame.')
     if preflight['tokenizer_sha256'] != digest(Path(prepare.TOKENIZER_DIR) / 'tokenizer.pkl'):
         raise RuntimeError('The tokenizer differs from the completed prompt preflight.')
+    if expected_core_seconds is None:
+        expected_core_seconds = sum(task['seconds'] for task in preflight['tasks'])
+    execution_budget(dict(expected_core_seconds=expected_core_seconds))
     manifest = json.loads((ROOT / 'artifacts/runtime.json').read_text())
     hashes = {name: digest(ROOT / name) for name in SOURCES}
     for name in FRAME_SOURCES:
@@ -183,6 +205,7 @@ def prepare_job(commit, baseline, description):
     identifier = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
     directory = job_path(identifier).parent
     directory.mkdir(parents=True)
+    shutil.copy2(ROOT / 'artifacts/runtime.json', directory / 'runtime.json')
     source_dir = directory / 'source'
     source_dir.mkdir()
     for name in SOURCES:
@@ -194,7 +217,8 @@ def prepare_job(commit, baseline, description):
     job = dict(id=identifier, label='autoresearch-' + identifier, commit=commit, baseline=baseline,
                description=description, phase='prepared', source_sha256=hashes,
                source_archive_sha256=digest(directory / 'source.tar.gz'),
-               runtime_manifest_sha256=digest(ROOT / 'artifacts/runtime.json'), max_hourly_cost=5.0)
+               runtime_manifest_sha256=digest(ROOT / 'artifacts/runtime.json'), max_hourly_cost=5.0,
+               expected_core_seconds=expected_core_seconds)
     save(job)
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
 
@@ -231,9 +255,10 @@ def ssh_connection(instance, key, prefer_direct=True):
 
 
 def execute(job, instance, key):
+    require_execution_time(job)
     connection = ssh_connection(instance, key)
     deadline = job['expires_at'] - 5
-    observe_until = job['expires_at'] - 45
+    observe_until = job['expires_at'] - COLLECTION_SECONDS
     destination = ROOT / 'results/runs' / job['id']
     destination.mkdir(parents=True, exist_ok=True)
 
@@ -251,10 +276,17 @@ def execute(job, instance, key):
             or float(gpu[0].rsplit(',', 1)[1]) > 512):
         raise RuntimeError('The rental does not provide one idle H100 SXM.')
     remote('mkdir -p autoresearch')
+    job['transfer_started_at'] = time.time()
+    save(job)
     for path in [ROOT / 'artifacts/gpu-env.tar.gz', ROOT / 'artifacts/gpu-assets.tar.gz',
                  job_path(job['id']).parent / 'source.tar.gz']:
         with path.open('rb') as source:
             remote('tar -xzf - -C autoresearch', timeout=900, stdin=source)
+    job['transfer_completed_at'] = time.time()
+    save(job)
+    require_execution_time(job)
+    job['launch_requested_at'] = time.time()
+    save(job)
     try:
         remote('cd autoresearch && if mkdir .started 2>/dev/null; then '
                'nohup bash gpu_run.sh > bootstrap.log 2>&1 < /dev/null & echo $! > run.pid; fi')
@@ -270,6 +302,7 @@ def execute(job, instance, key):
                            'else echo missing; fi', capture_output=True, text=True).stdout.strip()
             if probe.startswith('exit '):
                 status = int(probe.split()[1])
+                job['completed_observed_at'] = time.time()
                 break
             if probe == 'missing':
                 raise RuntimeError('The remote training process handle is missing.')
@@ -282,7 +315,7 @@ def execute(job, instance, key):
             print('Observation failed; rechecking the same rental:', type(error).__name__, flush=True)
             connection = ssh_connection(instance, key, prefer_direct=False)
         time.sleep(min(30, max(0, observe_until - time.time())))
-    for name in ('run.log', 'prepare.log', 'bootstrap.log', 'results/core.json', 'results/core.csv'):
+    for name in ('run.log', 'prepare.log', 'bootstrap.log', 'run.exit', 'results/core.json', 'results/core.csv'):
         try:
             with (destination / Path(name).name).open('wb') as output:
                 remote('cd autoresearch && cat ' + shlex.quote(name), stdout=output, stderr=subprocess.DEVNULL)
@@ -290,6 +323,7 @@ def execute(job, instance, key):
             pass
     job['exit_code'] = status
     job['phase'] = 'evaluated' if status == 0 else 'failed'
+    job['collected_at'] = time.time()
     save(job)
 
 
@@ -307,6 +341,7 @@ def start(job):
     for name in FRAME_SOURCES:
         if digest(ROOT / name) != job['source_sha256'][name]:
             raise RuntimeError('The experiment frame changed after this job was prepared.')
+    required_seconds = execution_budget(job)
     check_daily_budget(time.time())
     public = validate_environment()
     offer = choose_offer()
@@ -336,7 +371,7 @@ def start(job):
                 api('POST', f"instances/{job['instance_id']}/ssh/", {'ssh_key': public})
             except (urllib.error.URLError, TimeoutError):
                 print('SSH-key acknowledgement unavailable; observing access to the same instance.', flush=True)
-            while time.time() < job['expires_at'] - 1900:
+            while time.time() < job['expires_at'] - required_seconds:
                 try:
                     instance = next((row for row in list_instances() if row['id'] == job['instance_id']), None)
                 except (urllib.error.URLError, TimeoutError, RuntimeError) as error:
@@ -350,11 +385,13 @@ def start(job):
                     except (subprocess.SubprocessError, OSError):
                         time.sleep(15)
                         continue
+                    job['ready_at'] = time.time()
+                    save(job)
                     execute(job, instance, key)
                     break
                 time.sleep(15)
             else:
-                raise TimeoutError('The rental did not become ready in time for a full training run.')
+                raise TimeoutError('The rental did not become ready in time for training and the complete CORE suite.')
     except BaseException as error:
         if isinstance(error, urllib.error.HTTPError) and error.code in (400, 401, 402, 403, 404, 409, 410, 422, 429):
             if not job.get('instance_id'):
@@ -424,6 +461,7 @@ def main():
     preparation.add_argument('--commit', required=True)
     preparation.add_argument('--baseline', action='store_true')
     preparation.add_argument('--description', required=True)
+    preparation.add_argument('--expected-core-seconds', type=float)
     sub.add_parser('check-expiry')
     for action in ('start', 'expire', 'status', 'cancel'):
         command = sub.add_parser(action)
@@ -433,7 +471,7 @@ def main():
     scheduling.add_argument('--at', required=True)
     args = parser.parse_args()
     if args.action == 'prepare':
-        prepare_job(args.commit, args.baseline, args.description)
+        prepare_job(args.commit, args.baseline, args.description, args.expected_core_seconds)
         return
     if args.action == 'check-expiry':
         check_expiry()

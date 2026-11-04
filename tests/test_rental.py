@@ -16,7 +16,8 @@ class RentalLifecycleTests(unittest.TestCase):
         self.root_patch = patch.object(rental, 'ROOT', self.root)
         self.root_patch.start()
         self.job = dict(id='fixture', label='autoresearch-fixture', instance_id=42,
-                        phase='running', creation_uncertain=False, expires_at=time.time() + 180)
+                        phase='running', creation_uncertain=False, expires_at=time.time() + 3500,
+                        expected_core_seconds=900)
         rental.job_path(self.job['id']).parent.mkdir(parents=True)
         rental.save(self.job)
 
@@ -115,6 +116,45 @@ class RentalLifecycleTests(unittest.TestCase):
             with patch.object(rental.subprocess, 'check_output', return_value='inactive\n'):
                 with self.assertRaises(RuntimeError):
                     rental.arm_expiry(self.job)
+
+    def test_reserves_time_for_thirty_minute_training_and_the_complete_core_evaluation(self):
+        with patch.object(rental.time, 'time', return_value=1000):
+            with self.assertRaises(TimeoutError):
+                rental.require_execution_time({**self.job, 'expires_at': 2900})
+            rental.require_execution_time({**self.job, 'expires_at': 4500})
+
+    def test_requires_a_finite_evaluation_estimate_that_fits_the_daily_rental(self):
+        for estimate in (0, -1, float('nan'), float('inf'), 2000):
+            with self.subTest(estimate=estimate):
+                with self.assertRaises(ValueError):
+                    rental.execution_budget(dict(expected_core_seconds=estimate))
+
+    def test_ends_setup_when_transfer_uses_the_time_needed_for_the_full_evaluation(self):
+        for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):
+            path = self.root / 'artifacts' / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b'archive fixture')
+        (rental.job_path('fixture').parent / 'source.tar.gz').write_bytes(b'source fixture')
+        now = [1000]
+        job = {**self.job, 'expires_at': 4500}
+        launched = []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            if text.startswith('nvidia-smi'):
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0\n')
+            if text.startswith('tar -xzf'):
+                now[0] += 300
+            if 'nohup bash gpu_run.sh' in text:
+                launched.append(text)
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        with patch.object(rental, 'ssh_connection', return_value=['ssh']):
+            with patch.object(rental, 'run', side_effect=command):
+                with patch.object(rental.time, 'time', side_effect=lambda: now[0]):
+                    with self.assertRaises(TimeoutError):
+                        rental.execute(job, {}, self.root / 'key')
+        self.assertEqual(launched, [])
 
     def test_starts_training_once_when_one_observation_times_out(self):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):
