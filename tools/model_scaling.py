@@ -1,5 +1,6 @@
 """Inspect model sizes and training shapes on CPU without training or scoring a model."""
 
+import argparse
 import ast
 from dataclasses import dataclass
 import hashlib
@@ -18,7 +19,11 @@ from prepare import MAX_SEQ_LEN, Tokenizer
 
 
 def main():
-    source = (ROOT / 'train.py').read_text()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, default=ROOT / 'train.py')
+    parser.add_argument('--output', type=Path, default=ROOT / 'results/model-scaling.json')
+    args = parser.parse_args()
+    source = args.source.read_text()
     tree = ast.parse(source)
     names = {'GPTConfig', 'CausalSelfAttention', 'MLP', 'Block', 'GPT',
              'norm', 'has_ve', 'apply_rotary_emb', 'build_model_config'}
@@ -38,7 +43,7 @@ def main():
             config = namespace['build_model_config'](depth)
             with torch.device('meta'):
                 model = namespace['GPT'](config)
-            model.window_sizes = [(MAX_SEQ_LEN // divisor, right) if left < MAX_SEQ_LEN else (left, right)
+            model.window_sizes = [(MAX_SEQ_LEN // divisor, right) if 0 <= left < MAX_SEQ_LEN else (left, right)
                                   for left, right in model.window_sizes]
             counts = model.num_scaling_params()
             for device_batch, total_batch in ((128, 524288), (64, 262144)):
@@ -48,9 +53,10 @@ def main():
                     accumulation_steps=total_batch // (device_batch * MAX_SEQ_LEN),
                     parameters=counts, scaling_parameters=counts['transformer_matrices'] + counts['lm_head'],
                     flops_per_token=model.estimate_flops(),
+                    window_sizes=model.window_sizes,
                 ))
     report = dict(training_source_sha256=hashlib.sha256(source.encode()).hexdigest(), models=rows)
-    destination = ROOT / 'results/model-scaling.json'
+    destination = args.output
     destination.parent.mkdir(exist_ok=True)
     destination.write_text(json.dumps(report, indent=2) + '\n')
     for row in rows:

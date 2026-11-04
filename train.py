@@ -199,7 +199,8 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+    # RoPE base: https://github.com/karpathy/nanochat/commit/6ed7d1d82cee16c2e26f45d559ad3338447a6c1b
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         if device is None:
             device = self.transformer.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -214,14 +215,14 @@ class GPT(nn.Module):
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 4
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        short_window = config.sequence_len // 4
+        # Let L layers attend to the supplied prefix, including longer inputs.
+        char_to_window = {"L": (-1, 0), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
+        window_sizes[-1] = (-1, 0)
         return window_sizes
 
     def estimate_flops(self):
