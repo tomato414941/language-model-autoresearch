@@ -21,18 +21,50 @@ class PromptPrepared(Exception):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'results/core-preflight.json')
+    parser.add_argument('--inspect-spans', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(2)
     tasks = prepare.verify_core_assets()
     evaluator = prepare._load_nanochat_core()
-    evaluate_example = evaluator.__globals__["evaluate_task"].__globals__["evaluate_example"]
+    core_globals = evaluator.__globals__["evaluate_task"].__globals__
+    evaluate_example = core_globals["evaluate_example"]
     tokenizer = prepare.Tokenizer.from_directory()
     records = []
+    active_record = [None]
+    active_example = [None]
+
+    if args.inspect_spans:
+        def observe_batch(original):
+            def observed(*args, **kwargs):
+                result = original(*args, **kwargs)
+                tokens, starts, ends = result
+                record = active_record[0]
+                record['span_sequences'] += len(tokens)
+                empty = [i for i, (start, end) in enumerate(zip(starts, ends)) if start == end]
+                record['empty_span_sequences'] += len(empty)
+                record['nonpositive_start_sequences'] += sum(start <= 0 for start in starts)
+                if empty:
+                    record['examples_with_empty_span'] += 1
+                    if len(record['empty_span_examples']) < 10:
+                        record['empty_span_examples'].append(dict(
+                            index=active_example[0], options=empty,
+                            starts=list(starts), ends=list(ends),
+                            sequence_lengths=[len(sequence) for sequence in tokens],
+                        ))
+                return result
+            return observed
+
+        for name in ('batch_sequences_mc', 'batch_sequences_schema', 'batch_sequences_lm'):
+            core_globals[name] = observe_batch(core_globals[name])
 
     def inspect_task(model, tokenizer, data, device, metadata):
         label = tasks[len(records)]["label"]
         record = dict(task=label, examples=len(data), max_sequence_len=0, max_batch_tokens=0,
                       input_sequences=0, input_tokens=0)
+        if args.inspect_spans:
+            record.update(span_sequences=0, empty_span_sequences=0, examples_with_empty_span=0,
+                          nonpositive_start_sequences=0, empty_span_examples=[], task_type=metadata['task_type'])
+            active_record[0] = record
         shapes = Counter()
         started = time.monotonic()
 
@@ -48,6 +80,7 @@ def main():
 
         recorder = ShapeRecorder()
         for index in range(len(data)):
+            active_example[0] = index
             try:
                 evaluate_example(index, recorder, tokenizer, data, "cpu", metadata)
             except PromptPrepared:
@@ -78,6 +111,15 @@ def main():
         max_sequence_len=max(record["max_sequence_len"] for record in records),
         max_batch_tokens=max(record["max_batch_tokens"] for record in records),
     )
+    if args.inspect_spans:
+        report['span_inspection'] = dict(
+            core_source_sha256=prepare._file_sha256(Path(prepare._core_source_dir()) / 'nanochat/core_eval.py'),
+            span_sequences=sum(record['span_sequences'] for record in records),
+            empty_span_sequences=sum(record['empty_span_sequences'] for record in records),
+            examples_with_empty_span=sum(record['examples_with_empty_span'] for record in records),
+            nonpositive_start_sequences=sum(record['nonpositive_start_sequences'] for record in records),
+            purpose='Observational metadata only: original batch results are returned unchanged; no predictions, scores or adoption gates.',
+        )
     destination = args.output
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2) + "\n")
