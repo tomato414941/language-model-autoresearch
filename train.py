@@ -9,6 +9,8 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import bisect
+from collections import deque
 import math
 import time
 from dataclasses import dataclass, asdict
@@ -24,8 +26,8 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import (
-    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb,
-    evaluate_core, save_core_results, verify_core_assets,
+    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb,
+    evaluate_core, save_core_results, verify_core_assets, _document_batches,
 )
 
 # ---------------------------------------------------------------------------
@@ -393,6 +395,72 @@ class TailEMA:
             torch.cuda.synchronize(device)
         return time.perf_counter() - started
 
+
+class LengthIndexedDocuments:
+    """Select the native best fit while preserving first-arrival ties."""
+
+    def __init__(self):
+        self.lengths = []
+        self.buckets = {}
+        self.count = 0
+
+    def __len__(self):
+        return self.count
+
+    def extend(self, documents):
+        for document in documents:
+            length = len(document)
+            if length not in self.buckets:
+                bisect.insort(self.lengths, length)
+                self.buckets[length] = deque()
+            self.buckets[length].append(document)
+            self.count += 1
+
+    def pop_best(self, remaining):
+        index = max(0, bisect.bisect_right(self.lengths, remaining) - 1)
+        length = self.lengths[index]
+        bucket = self.buckets[length]
+        document = bucket.popleft()
+        self.count -= 1
+        if not bucket:
+            self.lengths.pop(index)
+            del self.buckets[length]
+        return document
+
+
+def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
+    # Keep prepare.py's document stream, refill boundary, cropping and shifted targets.
+    # Per-length FIFO queues preserve its first-match tie rule without scanning every document.
+    row_capacity = T + 1
+    batches = _document_batches("train")
+    bos_token = tokenizer.get_bos_token_id()
+    documents = LengthIndexedDocuments()
+    epoch = 1
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+    while True:
+        for row_idx in range(B):
+            pos = 0
+            while pos < row_capacity:
+                while len(documents) < buffer_size:
+                    texts, epoch = next(batches)
+                    documents.extend(tokenizer.encode(texts, prepend=bos_token))
+                remaining = row_capacity - pos
+                document = documents.pop_best(remaining)
+                if len(document) > remaining:
+                    document = document[:remaining]
+                row_buffer[row_idx, pos:pos + len(document)] = torch.tensor(document, dtype=torch.long)
+                pos += len(document)
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        yield inputs, targets, epoch
+
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
 # ---------------------------------------------------------------------------
@@ -614,7 +682,7 @@ optimizer = model.setup_optimizer(
 tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_training_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")

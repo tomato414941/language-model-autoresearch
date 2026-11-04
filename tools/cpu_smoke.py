@@ -1,4 +1,6 @@
 import ast
+import bisect
+from collections import deque
 import dataclasses
 import math
 import pathlib
@@ -22,6 +24,7 @@ def load_model_namespace(path=None):
             node.decorator_list = [d for d in node.decorator_list if not (
                 isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == 'compile')]
     namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math, 'time': time,
+                 'bisect': bisect, 'deque': deque,
                  'dataclass': dataclasses.dataclass, 'fa3': types.SimpleNamespace(flash_attn_func=attention)}
     exec(compile(ast.fix_missing_locations(tree), 'train.py', 'exec'), namespace)
     return namespace
