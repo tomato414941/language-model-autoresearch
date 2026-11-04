@@ -77,11 +77,18 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
+    def project_qkv(self, x):
+        # Keep separate Muon parameters while sharing the projection GEMM.
+        weight = torch.cat((self.c_q.weight, self.c_k.weight, self.c_v.weight), dim=0)
+        widths = (self.n_head * self.head_dim, self.n_kv_head * self.head_dim, self.n_kv_head * self.head_dim)
+        return F.linear(x, weight).split(widths, dim=-1)
+
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        q, k, v = self.project_qkv(x)
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim)
+        v = v.view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
