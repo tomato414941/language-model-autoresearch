@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-3. **Rent the GPU**: experiments run on one rented RTX 4090, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
+3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
 4. **Prepare the data**: on the rented machine, check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, run `uv run prepare.py` there.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
