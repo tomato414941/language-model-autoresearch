@@ -27,7 +27,7 @@ def attention(q, k, v, causal, window_size):
 namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math, 'dataclass': dataclasses.dataclass, 'fa3': types.SimpleNamespace(flash_attn_func=attention)}
 exec(compile(ast.fix_missing_locations(tree), 'train.py', 'exec'), namespace)
 torch.manual_seed(42)
-config = namespace['GPTConfig'](sequence_len=32, vocab_size=256, n_layer=2, n_head=2, n_kv_head=2, n_embd=64, window_pattern='SL')
+config = namespace['GPTConfig'](sequence_len=32, vocab_size=256, n_layer=4, n_head=2, n_kv_head=2, n_embd=64, window_pattern='SSSL')
 model = namespace['GPT'](config)
 model.init_weights()
 optimizer = model.setup_optimizer(embedding_lr=0.03, matrix_lr=0.02)
