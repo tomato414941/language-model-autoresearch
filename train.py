@@ -1,25 +1,29 @@
-"""The file the loop changes: model, optimizer and training. Single GPU, single file.
-
-Adapted from karpathy/autoresearch's train.py (MIT), which was cherry-picked and simplified from nanochat. Changed
-here: PyTorch's scaled_dot_product_attention in place of FlashAttention 3 and its sliding windows, so that it runs
-on an RTX 4090; GPT-2's vocabulary and the speedrun's FineWeb tokens from prepare.py; and the batch sizes.
+"""
+Autoresearch pretraining script. Single-GPU, single-file.
+Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
 """
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
 import time
 from dataclasses import dataclass, asdict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, VOCAB_SIZE, evaluate, train_shards
+from kernels import get_kernel
+cap = torch.cuda.get_device_capability()
+# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+fa3 = get_kernel(repo).flash_attn_interface
+
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -28,11 +32,12 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, VOCAB_SIZE, evaluate, train_shards
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
-    vocab_size: int = 50304
+    vocab_size: int = 32768
     n_layer: int = 12
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
+    window_pattern: str = "SSSL"
 
 
 def norm(x):
@@ -69,7 +74,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin):
+    def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -85,11 +90,8 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            is_causal=True, enable_gqa=self.n_kv_head != self.n_head,
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -113,8 +115,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin):
-        x = x + self.attn(norm(x), ve, cos_sin)
+    def forward(self, x, ve, cos_sin, window_size):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
 
@@ -123,6 +125,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.window_sizes = self._compute_window_sizes(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
@@ -189,6 +192,19 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
+    def _compute_window_sizes(self, config):
+        pattern = config.window_pattern.upper()
+        assert all(c in "SL" for c in pattern)
+        long_window = config.sequence_len
+        short_window = long_window // 2
+        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(char_to_window[char])
+        window_sizes[-1] = (long_window, 0)
+        return window_sizes
+
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
@@ -198,7 +214,11 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
-        attn_flops = 12 * h * q * t * self.config.n_layer
+        attn_flops = 0
+        for window_size in self.window_sizes:
+            window = window_size[0]
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops += 12 * h * q * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def num_scaling_params(self):
@@ -256,7 +276,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin)
+            x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
         softcap = 15
@@ -412,9 +432,10 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -427,23 +448,22 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 8   # sequences per forward and backward (reduce if out of memory)
-
-SEED = 42
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
-# Setup: model, optimizer, dataloader
+# Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-PEAK_FLOPS = 165.2e12  # RTX 4090, bf16 with fp32 accumulation, dense
+H100_BF16_PEAK_FLOPS = 989.5e12
 
-vocab_size = (VOCAB_SIZE + 127) // 128 * 128  # padded for faster matmuls
+tokenizer = Tokenizer.from_directory()
+vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
@@ -453,6 +473,7 @@ def build_model_config(depth):
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=WINDOW_PATTERN,
     )
 
 config = build_model_config(DEPTH)
@@ -486,22 +507,8 @@ optimizer = model.setup_optimizer(
 
 model = torch.compile(model, dynamic=False)
 
-def make_train_loader(B, T):
-    """Yield (inputs, targets) of B contiguous rows of T tokens, reading the training shards in order."""
-    shards = train_shards()
-    shard, position = 0, 0
-    while True:
-        tokens = shards[shard]
-        if position + B * T + 1 > len(tokens):
-            shard, position = (shard + 1) % len(shards), 0
-            continue
-        window = torch.from_numpy(tokens[position:position + B * T + 1].astype(np.int64))
-        position += B * T
-        window = window.pin_memory().to(device, non_blocking=True)
-        yield window[:-1].view(B, T), window[1:].view(B, T)
-
-train_loader = make_train_loader(DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
-x, y = next(train_loader)  # prefetch first batch
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -542,7 +549,7 @@ while True:
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        x, y = next(train_loader)
+        x, y, epoch = next(train_loader)
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -577,10 +584,10 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -603,17 +610,16 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb, val_loss = evaluate(model, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
-print(f"val_loss:         {val_loss:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")

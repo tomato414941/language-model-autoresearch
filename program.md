@@ -1,80 +1,119 @@
-# language-model-autoresearch
+# autoresearch
 
-エージェントが小さな言語モデルの学習を自分で試し、良くしていくためのリポジトリ。形は karpathy/autoresearch と同じで、データだけを speedrun（modded-nanogpt）の FineWeb にしている。
+This is an experiment to have the LLM do its own research.
 
-## 枠
+## Setup
 
-試しの中では変えないもの。
+To set up a new experiment, work with the user to:
 
-- **物差し：** `prepare.py` の `evaluate` が返す val_bpb。検証データの1バイトあたりのビット数で、低いほど良い。val_loss（1トークンあたりの損失）は、speedrun の記録と比べるための参考。
-- **データ：** speedrun と同じ、FineWeb の GPT-2 トークン（Hugging Face の `kjj0/fineweb10B-gpt2`）。FineWeb は ODC-By、トークンの置き場は MIT で、どちらも商用で使える。
-- **学習時間：** 1回 300 秒（`TIME_BUDGET`）。起動とコンパイルの時間は数えない。
-- **機械：** RTX 4090 を1枚。時間で区切るので、ほかの GPU で測った結果とは比べない。
-- **変えてよいファイル：** `train.py` だけ。モデル、最適化、学習率、バッチ、データの読み方など、何を変えてもよい。ただし検証データは読まない。
-- **変えないもの：** `prepare.py`（データ、トークナイザ、検証、定数）と、`pyproject.toml` の依存。
+1. **Work on `main`**: do not create branches.
+2. **Read the in-scope files**: The repo is small. Read these files for full context:
+   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
+   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on. Rent one, keep it for the whole loop, and delete it when the budget the user gave is spent or when you stop. Never write hosts, keys or IP addresses into the repository.
+4. **Prepare the data**: on the rented machine, check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, run `uv run prepare.py` there.
+5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+6. **Confirm and go**: Confirm setup looks good.
 
-枠そのものを変える改善（データ、トークナイザ、学習時間、機械、採点、依存を変えるもの）は、ループの中では試さない。根拠を添えて人に提案する。人が決めたら枠を変え、比べる相手を測り直す。
+Once you get confirmation, kick off the experimentation.
 
-## はじめに
+## Experimentation
 
-1. 借りた機械で `uv run prepare.py` を走らせ、データを用意する。
-2. `train.py` をそのまま、`SEED` だけを変えて3回学習する。3回の val_bpb の平均を最初の比べる相手にし、最大と最小の差を「揺れ」とする。
-3. 3回を `results.tsv` に記録してコミットする。
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
 
-最初の学習で `train.py` がメモリ不足などで動かなければ、直してから測る。
+**What you CAN do:**
+- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
 
-## 1回の試し
+**What you CANNOT do:**
+- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
+- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
+- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
-1. **何を試すか決める。**
-   - 候補の一覧は持たない。自分の知識、web で見つけた論文や記録、前の試しの結果など、どこから選んでもよい。
-   - 選ぶ前に、web で最新の動向を確かめる。少なくとも1日の最初と10回ごとに、speedrun と nanochat の新しい記録、arXiv の新しい論文、ほかの人の autoresearch の結果を見る。
-   - 1回に複数の変更をまとめて入れてよい。何を変えたかは全部記録する。
-2. **走らせる。** `train.py` を変えてコミットし、借りた機械で `uv run train.py > run.log 2>&1` を走らせる。このコミットに、試したコードが残る。
-3. **判定する。**
-   - **採用：** 比べる相手より揺れ以上に良い。または同じくらいで、コードが短くなった。記録の行を足してコミットし、これを新しい比べる相手にする。
-   - **不採用：** それ以外。`git revert --no-commit HEAD` で `train.py` を戻し、記録の行を足して一緒にコミットする。
-   - **失敗：** 動かなかった。すぐ直せる間違いなら直して走らせ直す。直せなければ不採用と同じように戻して、失敗と記録する。600 秒を超えた学習は止めて失敗にする。
+**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
-## 不採用は永久ではない
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
-不採用は「その時の条件では効かなかった」という意味でしかない。次のどれかに当たれば、試し直してよい。
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
-- 比べる相手が変わった
-- 組み合わせや設定を変える
-- 前の差が揺れの中だった
-- 新しい根拠（論文や記録）が出た
+**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
 
-まったく同じ条件の繰り返しだけは避ける。試したコードは、記録の commit から取り出せる。
+**Bundles**: One run per small change is too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
-## 確かめ直し
+**Discarded is not forever**: An idea that did not help can be tried again when the baseline has changed, when it is combined or configured differently, when the earlier difference was within noise, or when new evidence appears. Only avoid repeating the same experiment unchanged.
 
-20回試すごとに、今の比べる相手を `SEED` を変えて1回学習し直す。比べる相手の値は、それまでの値と確かめ直しの値の平均にする。たまたま良く出た結果を基準にし続けないため。
+**Follow the latest work**: Before choosing ideas, and again every 10 experiments, search the web for what is new: speedrun (modded-nanogpt) and nanochat records, recent arXiv papers on small-model pretraining, and other people's autoresearch results. Put the source of each idea in its description.
 
-## 記録
+## Output format
 
-`results.tsv` に、1回1行をタブ区切りで足す。
+Once the script finishes it prints a summary like this:
 
-| 列 | 中身 |
-|---|---|
-| commit | 試したコードのコミット（7文字） |
-| val_bpb | 失敗なら 0 |
-| val_loss | 失敗なら 0 |
-| memory_gb | ピークのメモリ |
-| cost_usd | その1回にかかった機械の費用（1時間の値段 × かかった時間） |
-| status | baseline、keep、discard、crash、recheck |
-| description | 何を変えたか。複数なら全部 |
-| source | 考えの出どころ。論文や記録の URL、own（自分の考え）、または元にした試しの commit |
+```
+---
+val_bpb:          0.997900
+training_seconds: 300.1
+total_seconds:    325.9
+peak_vram_mb:     45060.2
+mfu_percent:      39.80
+total_tokens_M:   499.6
+num_steps:        953
+num_params_M:     50.3
+depth:            8
+```
 
-コミットは main に直接する。push は人が頼んだときだけ。
+Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
-## お金と機械
+```
+grep "^val_bpb:" run.log
+```
 
-- 1日の上限額は人が決める。上限に届いたら、その日は止まる。
-- 借りる機械は1台だけ。ループの間は借りたままにして、上限に届いたときと、30分試さなかったときに消す。
-- エージェントが動いている機械では学習しない。
-- 接続先、鍵、IP など、環境の情報はリポジトリに書かない。
+## Logging results
 
-## 人とのやりとり
+When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-- 人の割り込みを最優先する。止めろと言われたら、走っている学習を止め、機械を消して止まる。
-- 毎ターンの最後に、今日の試しの回数と今日使った額を書く。
+The TSV has a header row and 5 columns:
+
+```
+commit	val_bpb	memory_gb	status	description
+```
+
+1. git commit hash (short, 7 chars)
+2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
+3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+4. status: `keep`, `discard`, or `crash`
+5. short text description of what this experiment tried, with the source of the idea
+
+Example:
+
+```
+commit	val_bpb	memory_gb	status	description
+a1b2c3d	0.997900	44.0	keep	baseline
+b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
+c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
+d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```
+
+## The experiment loop
+
+The experiment runs on `main`.
+
+LOOP FOREVER:
+
+1. Look at the git state: the current branch/commit we're on
+2. Tune `train.py` with an experimental idea by directly hacking the code.
+3. git commit
+4. Run the experiment on the rented GPU: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+9. If val_bpb is equal or worse, you git reset back to where you started
+
+The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+
+**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
