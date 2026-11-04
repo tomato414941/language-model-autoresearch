@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-3. **Rent the GPU**: experiments run on one rented H100 SXM 80GB, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
+3. **Rent the GPU**: experiments run on one rented H100, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
 4. **Prepare the data**: on the rented machine, check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, run `uv run prepare.py` there.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
@@ -121,6 +121,5 @@ As an example use case, a user might leave you running while they sleep. If each
 
 ## Rules of this repository
 
-1. **Compare only like with like.** Every run is 5 minutes on one H100 SXM 80GB. Machines of the same type differ in speed, so compare runs only on the same machine: when you switch machines, first rerun the current best there. Every 20 experiments, rerun the current best with a new seed and take the mean, so that a lucky run does not stay the baseline.
-2. **Pay only for training.** Rent from whichever provider is cheapest and reliable. The rented GPU should always be training. Delete it when you stop, when the user's budget is reached, when it breaks (rent another and rerun; a broken run is not a discard) or when nothing has run for 30 minutes. When you rent, set a timer that deletes it at the budget, in case you stop responding.
-3. **The frame is the user's.** You change `train.py` only. A change to anything else, such as the data, `prepare.py`, the dependencies, the GPU or the time budget, is a proposal to the user with the evidence. Do not filter the data's contents, and do not push.
+- Delete the rented machine when you stop or when the user's budget is reached. When you rent it, set a timer that deletes it at the budget, in case you stop responding.
+- Anything outside `train.py`, such as the data, `prepare.py`, the dependencies, the GPU or the time budget, is the user's to change. Propose such changes with the evidence.
