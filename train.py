@@ -41,6 +41,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    narrow_first_layer: bool = True
 
 
 def norm(x):
@@ -56,25 +57,28 @@ def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
+    # The narrow block uses a prefix of the trunk's rotary frequencies.
+    cos, sin = cos[..., :d], sin[..., :d]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, n_embd=None):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
+        self.n_embd = config.n_embd if n_embd is None else n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
+        assert self.head_dim % 2 == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
+        self.ve_gate_channels = min(32, self.n_embd)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def project_qkv(self, x):
@@ -108,10 +112,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, n_embd=None):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        width = config.n_embd if n_embd is None else n_embd
+        self.c_fc = nn.Linear(width, 4 * width, bias=False)
+        self.c_proj = nn.Linear(4 * width, width, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -121,14 +126,19 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, n_embd=None):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        width = config.n_embd if n_embd is None else n_embd
+        assert width == config.n_embd or 2 * width == config.n_embd
+        self.widen_output = width != config.n_embd
+        self.attn = CausalSelfAttention(config, layer_idx, width)
+        self.mlp = MLP(config, width)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
+        if self.widen_output:
+            x = torch.cat((x, x), dim=-1)
         return x
 
 
@@ -137,24 +147,27 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        # Narrow input block: https://github.com/karpathy/nanochat/pull/807
+        assert not config.narrow_first_layer or config.n_embd % 2 == 0
+        embedding_width = config.n_embd // 2 if config.narrow_first_layer else config.n_embd
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "wte": nn.Embedding(config.vocab_size, embedding_width),
+            "h": nn.ModuleList([Block(config, i, embedding_width if i == 0 else config.n_embd)
+                                for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Smear/backout: https://github.com/karpathy/nanochat/commit/a825e63f81e62e2e9fd38655e9b2e39417620545
-        self.smear_channels = min(24, config.n_embd)
+        self.smear_channels = min(24, embedding_width)
         self.smear_gate = nn.Linear(self.smear_channels, 1, bias=False)
         self.smear_gain = nn.Parameter(torch.zeros(1))
         self.backout_gain = nn.Parameter(torch.full((1,), 0.2))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+            str(i): nn.Embedding(config.vocab_size, block.attn.n_kv_head * block.attn.head_dim)
+            for i, block in enumerate(self.transformer.h) if has_ve(i, config.n_layer)
         })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
@@ -232,14 +245,12 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gain.numel() + self.backout_gain.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for block, window_size in zip(self.transformer.h, self.window_sizes, strict=True):
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+            attn_flops += 12 * block.attn.n_head * block.attn.head_dim * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def num_scaling_params(self):
@@ -304,6 +315,8 @@ class GPT(nn.Module):
         x0 = x
         middle = None
         for i, block in enumerate(self.transformer.h):
+            if x0.size(-1) < x.size(-1):
+                x0 = torch.cat((x0, x0), dim=-1)
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])

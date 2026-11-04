@@ -52,6 +52,8 @@ def main():
                     device_batch=device_batch, total_batch_tokens=total_batch,
                     accumulation_steps=total_batch // (device_batch * MAX_SEQ_LEN),
                     parameters=counts, scaling_parameters=counts['transformer_matrices'] + counts['lm_head'],
+                    token_embedding_width=model.transformer.wte.embedding_dim,
+                    layer_head_dimensions=[block.attn.head_dim for block in model.transformer.h],
                     flops_per_token=model.estimate_flops(),
                     window_sizes=model.window_sizes,
                 ))

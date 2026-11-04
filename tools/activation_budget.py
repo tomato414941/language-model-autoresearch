@@ -126,6 +126,8 @@ def profile(path, batch, vocab_size, attention):
         return {
             "batch": batch, "sequence_length": MAX_SEQ_LEN, "width": width,
             "depth": config.n_layer, "vocabulary_size": vocab_size,
+            "token_embedding_width": model.transformer.wte.embedding_dim,
+            "layer_head_dimensions": [block.attn.head_dim for block in model.transformer.h],
             "configured_device_batch": settings["DEVICE_BATCH_SIZE"],
             "total_batch_tokens": settings["TOTAL_BATCH_SIZE"],
             "saved_unique_nonpersistent_bytes": sum(row["bytes"] for row in activation),

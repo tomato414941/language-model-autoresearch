@@ -23,11 +23,12 @@ class LongContextTests(unittest.TestCase):
 
     def identity_value_attention(self, model, index, inputs):
         attention = model.transformer.h[index].attn
+        inputs = inputs[..., :attention.n_embd]
         with torch.no_grad():
             attention.c_q.weight.zero_()
             attention.c_k.weight.zero_()
-            attention.c_v.weight.copy_(torch.eye(32))
-            attention.c_proj.weight.copy_(torch.eye(32))
+            attention.c_v.weight.copy_(torch.eye(attention.n_embd))
+            attention.c_proj.weight.copy_(torch.eye(attention.n_embd))
             rotary = (model.cos[:, :inputs.shape[1]], model.sin[:, :inputs.shape[1]])
             return attention(inputs, None, rotary, model.window_sizes[index])
 
