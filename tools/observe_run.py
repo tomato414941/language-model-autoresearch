@@ -40,8 +40,10 @@ def main():
             'if test -f run.pid; then printf "run_pid: "; cat run.pid; '
             'ps -p "$(cat run.pid)" -o pid=,etime=,stat=,args=; fi; '
             'if test -f run.exit; then printf "run_exit: "; cat run.exit; fi; '
-            'for file in bootstrap.log prepare.log run.log; do '
-            'if test -f "$file"; then printf "\\n%s\\n" "$file"; tail -c 4000 "$file"; fi; done; fi'
+            'for file in bootstrap.log prepare.log; do '
+            'if test -f "$file"; then printf "\\n%s\\n" "$file"; tail -n 4 "$file"; fi; done; '
+            'if test -f run.log; then printf "\\nrun.log\\n"; '
+            'tail -c 6000 run.log | tr "\\r" "\\n" | tail -n 8; fi; fi'
         )
         result = subprocess.run(ssh_connection(matches[0], key) + [command],
                                 capture_output=True, text=True, timeout=30)
