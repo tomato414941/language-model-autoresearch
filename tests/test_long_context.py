@@ -10,11 +10,11 @@ class LongContextTests(unittest.TestCase):
     def setUpClass(cls):
         cls.namespace = load_model_namespace()
 
-    def make_model(self, layers=2, pattern='SL'):
+    def make_model(self, layers=2, pattern='SL', value_silu=True):
         torch.manual_seed(42)
         config = self.namespace['GPTConfig'](
             sequence_len=16, vocab_size=64, n_layer=layers, n_head=2, n_kv_head=2,
-            n_embd=32, window_pattern=pattern)
+            n_embd=32, window_pattern=pattern, value_silu=value_silu)
         with torch.device('meta'):
             model = self.namespace['GPT'](config)
         model.to_empty(device='cpu')
@@ -33,11 +33,14 @@ class LongContextTests(unittest.TestCase):
             return attention(inputs, None, rotary, model.window_sizes[index])
 
     def test_long_attention_uses_distant_prefix_tokens_beyond_the_training_length(self):
-        model = self.make_model()
-        inputs = torch.zeros(1, 48, 32)
-        inputs[:, 0, 0] = 1
-        output = self.identity_value_attention(model, 1, inputs)
-        self.assertAlmostEqual(output[0, -1, 0].item(), 1 / 48, places=6)
+        for gated in (False, True):
+            with self.subTest(gated=gated):
+                model = self.make_model(value_silu=gated)
+                inputs = torch.zeros(1, 48, 32)
+                inputs[:, 0, 0] = 1
+                output = self.identity_value_attention(model, 1, inputs)
+                value = torch.sigmoid(torch.tensor(1.0)).item() if gated else 1.0
+                self.assertAlmostEqual(output[0, -1, 0].item(), value / 48, places=6)
 
     def test_short_attention_uses_recent_tokens_within_a_long_input(self):
         model = self.make_model()

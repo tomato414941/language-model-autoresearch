@@ -43,6 +43,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
     float32_embedding_master: bool = True
+    value_silu: bool = True
 
 
 def norm(x):
@@ -71,6 +72,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd if n_embd is None else n_embd
+        self.value_silu = config.value_silu
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.head_dim % 2 == 0
@@ -100,6 +102,11 @@ class CausalSelfAttention(nn.Module):
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
+
+        # GatedV: https://arxiv.org/abs/2611.02145v2
+        # Self-gate the complete value stream, including value embeddings, before aggregation.
+        if self.value_silu:
+            v = F.silu(v)
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
