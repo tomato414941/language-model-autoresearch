@@ -1,6 +1,7 @@
 """Run one prepared experiment, with a separate deletion timer and no training retries."""
 
 import argparse
+import csv
 import datetime as dt
 import fcntl
 import hashlib
@@ -254,6 +255,31 @@ def ssh_connection(instance, key, prefer_direct=True):
             '-o', 'UserKnownHostsFile=' + str(key.parent / 'known_hosts'), 'root@' + host]
 
 
+def record_gpu_observation(remote, destination):
+    observation = dict(observed_at=time.time())
+    try:
+        result = remote(
+            'nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv,noheader,nounits',
+            timeout=5, capture_output=True, text=True,
+        )
+        rows = list(csv.reader(result.stdout.splitlines()))
+        if len(rows) != 1 or len(rows[0]) != 3:
+            raise ValueError('Expected one GPU observation.')
+        name, memory, utilization = rows[0]
+        memory, utilization = float(memory), float(utilization)
+        if not (math.isfinite(memory) and memory >= 0 and 0 <= utilization <= 100):
+            raise ValueError('Invalid GPU observation.')
+        observation.update(gpu_name=name.strip(), memory_mib=memory, utilization_percent=utilization)
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        # Optional telemetry never changes the training lifecycle or decision.
+        observation['error_type'] = type(error).__name__
+    try:
+        with (destination / 'gpu-observations.jsonl').open('a') as output:
+            output.write(json.dumps(observation, allow_nan=False) + '\n')
+    except OSError:
+        print('The GPU observation could not be saved; retaining the original run.', flush=True)
+
+
 def execute(job, instance, key):
     require_execution_time(job)
     connection = ssh_connection(instance, key)
@@ -307,6 +333,7 @@ def execute(job, instance, key):
             if probe == 'missing':
                 raise RuntimeError('The remote training process handle is missing.')
             if probe == 'running':
+                record_gpu_observation(remote, destination)
                 print('Observed the same live training process.', flush=True)
             else:
                 print('The observation was incomplete; rechecking the same process.', flush=True)

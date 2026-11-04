@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tools import rental
 
@@ -167,6 +167,8 @@ class RentalLifecycleTests(unittest.TestCase):
 
         def command(arguments, **kwargs):
             text = arguments[-1]
+            if 'utilization.gpu' in text:
+                raise subprocess.TimeoutExpired('nvidia-smi', 5)
             if text.startswith('nvidia-smi'):
                 return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0\n')
             if 'nohup bash gpu_run.sh' in text:
@@ -186,6 +188,31 @@ class RentalLifecycleTests(unittest.TestCase):
                 rental.execute(self.job, {}, key)
         self.assertEqual(len(launched), 1)
         self.assertEqual(rental.load('fixture')['exit_code'], 0)
+        sample = json.loads((self.root / 'results/runs/fixture/gpu-observations.jsonl').read_text())
+        self.assertEqual(sample['error_type'], 'TimeoutExpired')
+
+    def test_records_timestamped_gpu_memory_and_utilization_samples_in_order(self):
+        results = [subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, 96\n'),
+                   subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 2900, 12\n')]
+        remote = Mock(side_effect=results)
+        with patch.object(rental.time, 'time', side_effect=[1000, 1030]):
+            rental.record_gpu_observation(remote, self.root)
+            rental.record_gpu_observation(remote, self.root)
+        samples = [json.loads(line) for line in (self.root / 'gpu-observations.jsonl').read_text().splitlines()]
+        self.assertEqual([sample['observed_at'] for sample in samples], [1000, 1030])
+        self.assertEqual([sample['memory_mib'] for sample in samples], [45060, 2900])
+        self.assertEqual([sample['utilization_percent'] for sample in samples], [96, 12])
+
+    def test_records_unavailable_telemetry_and_accepts_the_next_valid_sample(self):
+        remote = Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, N/A\n'),
+            subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, 90\n'),
+        ])
+        rental.record_gpu_observation(remote, self.root)
+        rental.record_gpu_observation(remote, self.root)
+        samples = [json.loads(line) for line in (self.root / 'gpu-observations.jsonl').read_text().splitlines()]
+        self.assertEqual(samples[0]['error_type'], 'ValueError')
+        self.assertEqual(samples[1]['utilization_percent'], 90)
 
 
 if __name__ == '__main__':
