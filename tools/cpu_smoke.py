@@ -2,6 +2,7 @@ import ast
 import dataclasses
 import math
 import pathlib
+import time
 import types
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ def load_model_namespace(path=None):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             node.decorator_list = [d for d in node.decorator_list if not (
                 isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == 'compile')]
-    namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math,
+    namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math, 'time': time,
                  'dataclass': dataclasses.dataclass, 'fa3': types.SimpleNamespace(flash_attn_func=attention)}
     exec(compile(ast.fix_missing_locations(tree), 'train.py', 'exec'), namespace)
     return namespace

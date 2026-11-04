@@ -351,6 +351,48 @@ class GPT(nn.Module):
             return loss
         return logits
 
+
+class TailEMA:
+    """Average late training iterates, then return one fixed blend for both evaluations."""
+
+    def __init__(self, model, start, tau, blend):
+        assert 0 <= start < 1 and math.isfinite(tau) and tau > 0 and 0 <= blend <= 1
+        self.params = [p for p in model.parameters() if p is not model.transformer.wte.weight]
+        self.start, self.tau, self.blend = start, tau, blend
+        self.average = None
+        self.last_progress = None
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, progress):
+        if progress < self.start:
+            return
+        if self.average is None:
+            self.average = [p.detach().float().clone() for p in self.params]
+        else:
+            delta = progress - self.last_progress
+            if delta < 0:
+                raise ValueError("Tail EMA requires nondecreasing training progress.")
+            weight = -math.expm1(-delta / self.tau)
+            torch._foreach_lerp_(self.average, [p.detach().float() for p in self.params], weight)
+        self.last_progress = progress
+        self.num_updates += 1
+
+    @torch.no_grad()
+    def apply(self):
+        if self.average is None:
+            raise RuntimeError("The declared tail average was not accumulated.")
+        device = self.params[0].device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        for parameter, average in zip(self.params, self.average, strict=True):
+            parameter.copy_(parameter.detach().float().lerp(average, self.blend))
+        self.average = None
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter() - started
+
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
 # ---------------------------------------------------------------------------
@@ -505,6 +547,10 @@ WEIGHT_DECAY = 0.28     # cautious weight decay for Muon
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.65   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
+# Tail-EMA adaptation: https://github.com/KellerJordan/modded-nanogpt/pull/398
+TAIL_EMA_START = 0.80   # fraction of timed training before averaging begins
+TAIL_EMA_TAU = 0.075    # time constant as a fraction of the fixed training budget
+TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
 
 # Model size
 DEPTH = 10              # number of transformer layers
@@ -565,6 +611,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
@@ -630,6 +677,7 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    tail_ema.update(progress)
 
     train_loss_f = train_loss.item()
 
@@ -673,6 +721,7 @@ while True:
 print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
+total_training_time += tail_ema.apply()
 
 # Final eval
 model.eval()
