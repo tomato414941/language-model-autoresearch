@@ -1,5 +1,7 @@
 """Check every official CORE prompt on CPU without running or scoring a model."""
 
+import argparse
+from collections import Counter
 import json
 from pathlib import Path
 import sys
@@ -17,6 +19,9 @@ class PromptPrepared(Exception):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT / 'results/core-preflight.json')
+    args = parser.parse_args()
     torch.set_num_threads(2)
     tasks = prepare.verify_core_assets()
     evaluator = prepare._load_nanochat_core()
@@ -26,11 +31,17 @@ def main():
 
     def inspect_task(model, tokenizer, data, device, metadata):
         label = tasks[len(records)]["label"]
-        record = dict(task=label, examples=len(data), max_sequence_len=0, max_batch_tokens=0)
+        record = dict(task=label, examples=len(data), max_sequence_len=0, max_batch_tokens=0,
+                      input_sequences=0, input_tokens=0)
+        shapes = Counter()
         started = time.monotonic()
 
         class ShapeRecorder:
             def __call__(self, input_ids):
+                batch, length = input_ids.shape
+                shapes[batch, length] += 1
+                record['input_sequences'] += batch
+                record['input_tokens'] += input_ids.numel()
                 record["max_sequence_len"] = max(record["max_sequence_len"], input_ids.shape[1])
                 record["max_batch_tokens"] = max(record["max_batch_tokens"], input_ids.numel())
                 raise PromptPrepared
@@ -46,8 +57,10 @@ def main():
             if (index + 1) % 1000 == 0:
                 print(f"Prompt preflight: {label} {index + 1}/{len(data)}", flush=True)
         record["seconds"] = time.monotonic() - started
+        record['shapes'] = [dict(batch=batch, sequence_len=length, calls=calls)
+                            for (batch, length), calls in sorted(shapes.items())]
         records.append(record)
-        print(json.dumps(record), flush=True)
+        print(json.dumps({key: value for key, value in record.items() if key != 'shapes'}), flush=True)
         # No model prediction exists in this preflight. Discard the synthetic aggregate.
         return 0.0
 
@@ -60,11 +73,13 @@ def main():
         tokenizer_sha256=prepare._file_sha256(Path(prepare.TOKENIZER_DIR) / "tokenizer.pkl"),
         tasks=records,
         total_examples=sum(record["examples"] for record in records),
+        total_input_sequences=sum(record['input_sequences'] for record in records),
+        total_input_tokens=sum(record['input_tokens'] for record in records),
         max_sequence_len=max(record["max_sequence_len"] for record in records),
         max_batch_tokens=max(record["max_batch_tokens"] for record in records),
     )
-    destination = ROOT / "results" / "core-preflight.json"
-    destination.parent.mkdir(exist_ok=True)
+    destination = args.output
+    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2) + "\n")
     print("Complete CORE prompt preflight finished; no model quality was measured.", flush=True)
 
