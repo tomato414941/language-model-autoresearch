@@ -42,6 +42,7 @@ class GPTConfig:
     n_embd: int = 640
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
+    float32_embedding_master: bool = True
 
 
 def norm(x):
@@ -210,10 +211,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        # FP32 master weights: https://arxiv.org/abs/1710.03740
+        embedding_dtype = torch.float32 if self.config.float32_embedding_master else torch.bfloat16
+        self.transformer.wte.to(dtype=embedding_dtype)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=embedding_dtype)
 
     # RoPE base: https://github.com/karpathy/nanochat/commit/6ed7d1d82cee16c2e26f45d559ad3338447a6c1b
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
@@ -309,7 +311,9 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        x = self.transformer.wte(idx)
+        activation_dtype = (torch.get_autocast_dtype(idx.device.type)
+                            if torch.is_autocast_enabled(idx.device.type) else self.lm_head.weight.dtype)
+        x = self.transformer.wte(idx).to(activation_dtype)
         x = norm(x)
         if T > 1:
             gate = torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_channels]))
@@ -321,7 +325,7 @@ class GPT(nn.Module):
             if x0.size(-1) < x.size(-1):
                 x0 = torch.cat((x0, x0), dim=-1)
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
             if i == self.config.n_layer // 2:
                 middle = x
