@@ -23,7 +23,10 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import (
+    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb,
+    evaluate_core, save_core_results, verify_core_assets,
+)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -455,6 +458,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
+verify_core_assets()
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
@@ -611,6 +615,8 @@ total_tokens = step * TOTAL_BATCH_SIZE
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    core_results = evaluate_core(model, tokenizer, device)
+save_core_results(core_results)
 
 # Final summary
 t_end = time.time()
@@ -619,6 +625,7 @@ steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / 
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
+print(f"core_metric:      {core_results['core_metric']:.17g}")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
