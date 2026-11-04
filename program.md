@@ -121,6 +121,6 @@ As an example use case, a user might leave you running while they sleep. If each
 
 ## Rules of this repository
 
-- **Rentals.** H100 time costs money, so rent one only to run experiments, for at most the length the user gives, and delete it right after. When you rent, set a timer that deletes it at that length, in case you stop responding.
-- **Between rentals.** Analyze the results, search for the latest work, and prepare the next experiments as ready-to-run commits, so that rented time goes to training only. The next rental comes after the interval the user gives.
+- **Rentals.** H100 time costs money, so rent one at most once a day, only to run experiments, for at most the length the user gives, and delete it right after. When you rent, set a timer that deletes it at that length, in case you stop responding.
+- **Between rentals.** Analyze the results, search for the latest work, and prepare the next experiments as ready-to-run commits, so that rented time goes to training only. When a kept change moves the baseline during a rental, put the prepared experiments on top of it before running them.
 - Anything outside `train.py`, such as the data, `prepare.py`, the dependencies, the GPU or the time budget, is the user's to change. Propose such changes with the evidence.
