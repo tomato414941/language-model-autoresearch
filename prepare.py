@@ -371,6 +371,19 @@ def bpb_improves(candidate, incumbent):
         raise ValueError("A val_bpb decision requires two finite values.")
     return candidate < incumbent
 
+
+def suites_improve(candidate, incumbent):
+    """Keep a candidate whose BPB falls on average over the suites, each suite counted by its rate of change."""
+    if not incumbent or set(candidate) != set(incumbent):
+        raise ValueError("A suite decision compares the same suites.")
+    rates = []
+    for name, base in incumbent.items():
+        value = candidate[name]
+        if not (math.isfinite(value) and math.isfinite(base) and value > 0 and base > 0):
+            raise ValueError("A suite decision requires finite positive BPB values.")
+        rates.append((base - value) / base)
+    return sum(rates) / len(rates) > 0
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------

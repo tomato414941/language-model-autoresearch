@@ -28,20 +28,20 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed allowed data, time budget and evaluation.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation. The metric is AI2's OLMES suite `olmo3:base_easy:qa_bpb` (see the rules at the end).
+- Modify the evaluation. The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb` (see the rules at the end).
 - Train on data that is not allowed. The allowed data is what `prepare.py` downloads, now FineWeb-Edu only. Only the human adds data, by adding it to `prepare.py`. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
 - Use other models in training: no distillation from a teacher, and no other model's weights or outputs.
 
-**The goal is simple: get the lowest qa_bpb.** Keep a candidate when its qa_bpb is lower than the current best's (`prepare.bpb_improves`). Since the time budget is fixed, you don't need to worry about training time — it's always 30 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes, with its evaluation, within the 1-hour rental.
+**The goal is simple: lower the bits per byte on AI2's three OLMES suites for QA, math and code.** Keep a candidate when its rates of improvement over the current best, averaged over the three suites, are positive (`prepare.suites_improve`): each suite counts equally, as the share by which its BPB falls. Since the time budget is fixed, you don't need to worry about training time — it's always 30 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes, with its evaluation, within the 1-hour rental.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful qa_bpb gains, but it should not blow up dramatically.
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful gains, but it should not blow up dramatically.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 qa_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 qa_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.1% improvement that adds 20 lines of hacky code? Probably not worth it. A 0.1% improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
 
-**Measure once**: Each experiment is measured once, and the noise in that single number is accepted. Never repeat a run, add seeds or average runs to make a number more certain, and never rerun until a better number appears. Later bundles and retried ideas correct wrong calls. Preserve every attempt and its full log. A missing, partial or non-finite qa_bpb cannot justify adoption.
+**Measure once**: Each experiment is measured once, and the noise in that single number is accepted. Never repeat a run, add seeds or average runs to make a number more certain, and never rerun until a better number appears. Later bundles and retried ideas correct wrong calls. Preserve every attempt and its full log. Missing, partial or non-finite suite results cannot justify adoption.
 
 **Bundles**: With one run a day, one change per run is far too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
@@ -56,6 +56,8 @@ Once the script finishes it prints a summary like this (illustrative values, not
 ```
 ---
 qa_bpb:           0.912345
+math_bpb:         1.234567
+code_bpb:         1.456789
 val_bpb:          0.997900
 training_seconds: 1800.1
 total_seconds:    1925.9
@@ -70,34 +72,34 @@ depth:            8
 Note that the script is configured to always stop after 30 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
-grep "^qa_bpb:\|^val_bpb:" run.log
+grep "^qa_bpb:\|^math_bpb:\|^code_bpb:\|^val_bpb:" run.log
 ```
 
 ## Logging results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 6 columns:
+The TSV has a header row and 8 columns:
 
 ```
-commit	qa_bpb	val_bpb	memory_gb	status	description
+commit	qa_bpb	math_bpb	code_bpb	val_bpb	memory_gb	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. qa_bpb achieved (e.g. 0.912345) — use 0.000000 for crashes
-3. reference val_bpb achieved (e.g. 1.234567) — use 0.000000 if unavailable
-4. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-5. status: `keep`, `discard`, or `crash`
-6. short description listing every bundled change and its source
+2.–4. qa_bpb, math_bpb and code_bpb achieved (e.g. 0.912345) — use 0.000000 for crashes
+5. reference val_bpb achieved (e.g. 1.234567) — use 0.000000 if unavailable
+6. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+7. status: `keep`, `discard`, or `crash`
+8. short description listing every bundled change and its source
 
 Example:
 
 ```
-commit	qa_bpb	val_bpb	memory_gb	status	description
-a1b2c3d	0.912345	0.997900	44.0	keep	baseline
-b2c3d4e	0.908100	0.993200	44.2	keep	example bundle: deeper model, shorter warmdown; source URLs
-c3d4e5f	0.915000	0.990000	44.0	discard	example bundle: GeLU activation, larger batch; source URLs
-d4e5f6g	0.000000	0.000000	0.0	crash	double model width (OOM); source URL
+commit	qa_bpb	math_bpb	code_bpb	val_bpb	memory_gb	status	description
+a1b2c3d	0.912345	1.234567	1.456789	0.997900	44.0	keep	baseline
+b2c3d4e	0.908100	1.230000	1.450000	0.993200	44.2	keep	example bundle: deeper model, shorter warmdown; source URLs
+c3d4e5f	0.915000	1.236000	1.455000	0.990000	44.0	discard	example bundle: GeLU activation, larger batch; source URLs
+d4e5f6g	0.000000	0.000000	0.000000	0.000000	0.0	crash	double model width (OOM); source URL
 ```
 
 ## The experiment loop
@@ -110,11 +112,11 @@ LOOP FOREVER:
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
 4. Run the experiment on the rented GPU: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^qa_bpb:\|^val_bpb:\|^peak_vram_mb:" run.log`
+5. Read out the results: `grep "^qa_bpb:\|^math_bpb:\|^code_bpb:\|^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Record the attempt as failed and inspect `tail -n 50 run.log`. A technical fix can be prepared for a later run under the daily limit.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If qa_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If qa_bpb is equal or worse, you git reset back to where you started
+8. If `prepare.suites_improve` is true (the average rate of improvement over the three suites is positive), you "advance" the branch, keeping the git commit
+9. Otherwise, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
@@ -130,5 +132,5 @@ The idea is that you are a completely autonomous researcher trying things out. I
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiment as a ready-to-run commit so that rented time goes to training only, and make renting faster and cheaper.
 - **CPU work.** Rented GPU time is only for the training. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that the prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
 - **Source and secrets.** Edit source and configuration only in the local Git repository, then send them to the processing server; its copy is not a Git checkout. Keep keys in the ignored `.env`, and have tools read environment variables. Add `.env` to `.gitignore` before creating it. Never commit secrets or machine-specific connection details.
-- **Evaluation.** The metric is AI2's OLMES suite `olmo3:base_easy:qa_bpb`: the macro average, over its 21 tasks, of the bits per byte of the correct answer. Run it with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect it to the model and tokenizer. The user approved adding `olmes` as a dependency and implementing the suite in `prepare.py`; this is the one change to `prepare.py` allowed now. Before using it, count its tokens on the CPU and estimate whether a run with the complete suite fits within the rental; if it does not, tell the user instead of dropping tasks or examples. Until `prepare.py` implements it, judge by `evaluate_bpb`. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is also recorded as a reference. Never rerun until numbers improve. Only the user changes the evaluation.
+- **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Run them with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect them to the model and tokenizer. Decide with `prepare.suites_improve`: the rates by which the candidate's BPB falls below the current best's, averaged over the three suites, must be positive. The user approved adding `olmes` as a dependency and implementing the suites in `prepare.py`; this is the one change to `prepare.py` allowed now. Before using them, count their tokens on the CPU and estimate whether a run with the complete suites fits within the rental; if it does not, tell the user instead of dropping tasks or examples. Until `prepare.py` implements them, judge by `evaluate_bpb`. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is also recorded as a reference. Never rerun until numbers improve. Only the user changes the evaluation.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPU, the time budget and the daily hour. When a user-approved change alters the measurement itself (the data, the evaluation, the time budget or the GPU), measure the current best once under the new measurement before comparing candidates; other rule changes need no new measurement.
