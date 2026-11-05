@@ -23,6 +23,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace; CORE must run unchanged on whatever tokenizer you use.
+- Prepare anything beforehand that needs only the CPU, such as a tokenizer, tables or statistics built from the allowed training data. Run it on the processing server; its code may live in files of its own. It does not count toward the 30-minute budget.
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed allowed data, time budget, evaluation and acceptance threshold.
