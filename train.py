@@ -28,7 +28,7 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import (
-    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer as BaseTokenizer, evaluate_bpb,
+    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer as BaseTokenizer, evaluate_bpb, evaluate_olmes,
     _document_batches,
 )
 
@@ -56,10 +56,10 @@ class Tokenizer(BaseTokenizer):
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 10
-    n_head: int = 5
-    n_kv_head: int = 5
-    n_embd: int = 640
+    n_layer: int = 8
+    n_head: int = 4
+    n_kv_head: int = 4
+    n_embd: int = 512
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
     float32_embedding_master: bool = True
@@ -739,7 +739,7 @@ TAIL_EMA_TAU = 0.075    # time constant as a fraction of the fixed training budg
 TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
 
 # Model size
-DEPTH = 10              # number of transformer layers
+DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 64   # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -919,14 +919,18 @@ total_training_time += tail_ema.apply()
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+olmes = evaluate_olmes(model, tokenizer)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = max(torch.cuda.max_memory_allocated() / 1024 / 1024,
+                   olmes["combined_peak_vram_mb"])
 
 print("---")
+for name in ("qa_bpb", "math_bpb", "code_bpb"):
+    print(f"{name}: {olmes['suites'][name]:.17g}")
 print(f"val_bpb:          {val_bpb:.17g}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
