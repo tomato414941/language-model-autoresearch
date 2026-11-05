@@ -18,7 +18,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget**, set per GPU (wall clock training time, excluding startup/compilation; 30 minutes on the H100): one run in each daily rental. You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget**, set per GPU (wall clock training time, excluding startup/compilation; 30 minutes on the H100 and 1 hour on the RTX 5090): one run in each daily rental. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
 - Modify the active GPU's `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
@@ -127,7 +127,7 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 ## Rules of this repository
 
-- **GPUs.** The loop has two GPUs, one H100 SXM and one RTX 5090, and runs on one of them at a time; the user chooses which. Each GPU has its own folder with its own `train.py`, current best and results. The two models are separate and need not run on the other GPU. Compare a candidate only with the current best of its own GPU; an idea found on one GPU may be tried on the other. Keep each GPU's settings (training time, rental length, price cap) in one place, so that switching changes only which GPU is active. On the H100 the training is 30 minutes in a rental of at most 1 hour; the user sets the 5090's when first switching to it. A GPU's first run measures its baseline. The user approved restructuring the repository and `prepare.py` for this.
+- **GPUs.** The loop has two GPUs, one H100 SXM and one RTX 5090, and runs on one of them at a time; the user chooses which. Each GPU has its own folder with its own `train.py`, current best and results. The two models are separate and need not run on the other GPU. Compare a candidate only with the current best of its own GPU; an idea found on one GPU may be tried on the other. Keep each GPU's settings (training time, rental length, price cap) in one place, so that switching changes only which GPU is active. On the H100 the training is 30 minutes in a rental of at most 1 hour; on the RTX 5090 it is 1 hour in a rental of at most 1 hour 45 minutes. A GPU's first run measures its baseline. The user approved restructuring the repository and `prepare.py` for this.
 - **Rentals.** Rent the active GPU at most once a day and for at most its rental length, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's training and its eval must fit in it. Delete it right after.
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental, even if it takes more than a day.
 - **CPU work.** Run work that needs no GPU on the processing server in your environment notes, never on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
