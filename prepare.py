@@ -61,6 +61,9 @@ FINEMATH_REPOSITORY = "HuggingFaceTB/finemath"
 FINEMATH_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
 FINEMATH_SUBSETS = ("finemath-3plus", "finemath-4plus")
 FINEMATH_DIR = os.path.join(CACHE_DIR, "finemath")
+COMMON_PILE_REPOSITORY = "common-pile/stackv2_edu_filtered"
+COMMON_PILE_REVISION = "c354dbe88469a1153e97c6a63ac50591849654de"
+COMMON_PILE_DIR = os.path.join(CACHE_DIR, "common_pile", "stackv2_edu_filtered")
 
 # ---------------------------------------------------------------------------
 # Data download
@@ -125,7 +128,7 @@ def download_data(num_shards, download_workers=8):
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
-# FineMath download
+# Additional data downloads
 # ---------------------------------------------------------------------------
 
 def _file_sha256(path):
@@ -136,17 +139,17 @@ def _file_sha256(path):
     return value.hexdigest()
 
 
-def _finemath_manifest(subset):
-    if subset not in FINEMATH_SUBSETS:
-        raise ValueError("Choose an approved FineMath subset.")
-    directory = Path(FINEMATH_DIR) / subset
+def _additional_manifest(source):
+    directory = source["directory"]
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "manifest.json"
     if path.exists():
         metadata = json.loads(path.read_text())
     else:
-        base = (f"https://huggingface.co/api/datasets/{FINEMATH_REPOSITORY}/tree/"
-                f"{FINEMATH_REVISION}/{subset}")
+        base = (f"https://huggingface.co/api/datasets/{source['repository']}/tree/"
+                f"{source['revision']}")
+        if source["subset"]:
+            base += "/" + source["subset"]
         url = base + "?recursive=true&expand=false"
         files = []
         while url:
@@ -157,26 +160,25 @@ def _finemath_manifest(subset):
                 entries = response.json()
                 url = response.links.get("next", {}).get("url")
             for entry in entries:
-                if entry["type"] != "file":
+                if entry["type"] != "file" or not re.fullmatch(source["pattern"], entry["path"]):
                     continue
                 source_path = entry["path"]
                 files.append(dict(path=source_path, bytes=entry["size"],
                                   sha256=(entry.get("lfs") or {}).get("oid")))
-        metadata = dict(repository=FINEMATH_REPOSITORY, revision=FINEMATH_REVISION,
-                        subset=subset, license="ODC-By-1.0", files=files)
-    if (metadata["repository"] != FINEMATH_REPOSITORY or
-            metadata["revision"] != FINEMATH_REVISION or metadata["subset"] != subset):
-        raise ValueError("The cached FineMath manifest differs from the approved source.")
+        metadata = {name: source[name] for name in ("repository", "revision", "subset", "license")}
+        metadata["files"] = files
+    if any(metadata[name] != source[name] for name in ("repository", "revision", "subset")):
+        raise ValueError("The cached manifest differs from the approved source.")
     files = metadata["files"]
     if not files or len({entry["path"] for entry in files}) != len(files):
-        raise ValueError("The FineMath manifest must contain unique training shards.")
+        raise ValueError("The manifest must contain unique training shards.")
     for entry in files:
-        if not re.fullmatch(re.escape(subset) + r"/train-\d+-of-\d+\.parquet", entry["path"]):
-            raise ValueError("The FineMath manifest contains an unexpected shard path.")
+        if not re.fullmatch(source["pattern"], entry["path"]):
+            raise ValueError("The manifest contains an unexpected shard path.")
         if not isinstance(entry["bytes"], int) or entry["bytes"] <= 0:
-            raise ValueError("A FineMath shard must have a positive byte count.")
+            raise ValueError("A shard must have a positive byte count.")
         if not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]):
-            raise ValueError("A FineMath shard must have its published SHA-256.")
+            raise ValueError("A shard must have its published SHA-256.")
     files.sort(key=lambda entry: entry["path"])
     if not path.exists():
         with tempfile.NamedTemporaryFile("w", dir=directory, suffix=".tmp", delete=False) as output:
@@ -186,18 +188,18 @@ def _finemath_manifest(subset):
     return files
 
 
-def _finemath_matches(path, entry):
+def _additional_shard_matches(path, entry):
     return (path.is_file() and path.stat().st_size == entry["bytes"]
             and _file_sha256(path) == entry["sha256"])
 
 
-def _download_finemath_shard(subset, entry):
-    directory = Path(FINEMATH_DIR) / subset
+def _download_additional_shard(source, entry):
+    directory = source["directory"]
     path = directory / Path(entry["path"]).name
-    if _finemath_matches(path, entry):
+    if _additional_shard_matches(path, entry):
         return path
-    url = (f"https://huggingface.co/datasets/{FINEMATH_REPOSITORY}/resolve/"
-           f"{FINEMATH_REVISION}/{entry['path']}?download=true")
+    url = (f"https://huggingface.co/datasets/{source['repository']}/resolve/"
+           f"{source['revision']}/{entry['path']}?download=true")
     for attempt in range(3):
         temporary = None
         try:
@@ -211,13 +213,13 @@ def _download_finemath_shard(subset, entry):
                         if block:
                             size += len(block)
                             if size > entry["bytes"]:
-                                raise ValueError("The FineMath shard exceeds its published size.")
+                                raise ValueError("The shard exceeds its published size.")
                             output.write(block)
                             value.update(block)
             if size != entry["bytes"] or value.hexdigest() != entry["sha256"]:
-                raise ValueError("The FineMath shard differs from its published checksum.")
+                raise ValueError("The shard differs from its published checksum.")
             os.replace(temporary, path)
-            print(f"FineMath: downloaded {subset}/{path.name}", flush=True)
+            print(f"{source['label']}: downloaded {entry['path']}", flush=True)
             return path
         except (requests.RequestException, OSError, ValueError):
             if temporary is not None:
@@ -227,26 +229,43 @@ def _download_finemath_shard(subset, entry):
             time.sleep(2 ** attempt)
 
 
-def download_finemath(subset, num_shards=1, download_workers=4):
-    """Download a verified shard prefix into its own dataset directory, without content filtering."""
+def _download_additional_data(source, num_shards, download_workers):
     if not isinstance(num_shards, int) or (num_shards != -1 and num_shards <= 0):
-        raise ValueError("Choose a positive FineMath shard count, or -1 for all shards.")
+        raise ValueError("Choose a positive shard count, or -1 for all shards.")
     if not isinstance(download_workers, int) or download_workers <= 0:
         raise ValueError("The download worker count must be positive.")
-    files = _finemath_manifest(subset)
+    files = _additional_manifest(source)
     selected = files if num_shards == -1 else files[:num_shards]
-    directory = Path(FINEMATH_DIR) / subset
+    directory = source["directory"]
     paths = [directory / Path(entry["path"]).name for entry in selected]
     pending = [entry for path, entry in zip(paths, selected, strict=True)
-               if not _finemath_matches(path, entry)]
+               if not _additional_shard_matches(path, entry)]
     needed = sum(entry["bytes"] for entry in pending)
     if needed > shutil.disk_usage(directory).free:
-        raise OSError(f"FineMath needs {needed} additional bytes for the selected shards.")
+        raise OSError(f"{source['label']} needs {needed} additional bytes for the selected shards.")
     if pending:
         with ThreadPoolExecutor(max_workers=min(download_workers, len(pending))) as pool:
-            list(pool.map(lambda entry: _download_finemath_shard(subset, entry), pending))
-    print(f"FineMath: {len(paths)} verified shards ready for {subset}", flush=True)
+            list(pool.map(lambda entry: _download_additional_shard(source, entry), pending))
+    print(f"{source['label']}: {len(paths)} verified shards ready", flush=True)
     return paths
+
+
+def download_finemath(subset, num_shards=1, download_workers=4):
+    """Download an approved FineMath shard prefix without content filtering."""
+    if subset not in FINEMATH_SUBSETS:
+        raise ValueError("Choose an approved FineMath subset.")
+    source = dict(repository=FINEMATH_REPOSITORY, revision=FINEMATH_REVISION, subset=subset,
+                  directory=Path(FINEMATH_DIR) / subset, license="ODC-By-1.0", label="FineMath",
+                  pattern=re.escape(subset) + r"/train-\d+-of-\d+\.parquet")
+    return _download_additional_data(source, num_shards, download_workers)
+
+
+def download_common_pile(num_shards=1, download_workers=4):
+    """Download original educational code shards, preserving every file's license metadata."""
+    source = dict(repository=COMMON_PILE_REPOSITORY, revision=COMMON_PILE_REVISION, subset="",
+                  directory=Path(COMMON_PILE_DIR), license="Original per-file open licenses",
+                  label="Common Pile", pattern=r"stack-edu-\d+\.json\.gz")
+    return _download_additional_data(source, num_shards, download_workers)
 
 
 # ---------------------------------------------------------------------------
@@ -533,11 +552,17 @@ def main(argv=None):
                         help="Download these FineMath subsets instead of the default data/tokenizer prep.")
     parser.add_argument("--finemath-shards", type=int, default=1,
                         help="Training shards per FineMath subset (-1 = all); no content filtering.")
+    parser.add_argument("--common-pile", action="store_true",
+                        help="Download Common Pile's educational code into its separate directory.")
+    parser.add_argument("--common-pile-shards", type=int, default=1,
+                        help="Common Pile training shards (-1 = all); preserve original file licenses.")
     args = parser.parse_args(argv)
 
-    if args.finemath:
+    if args.finemath or args.common_pile:
         for subset in args.finemath:
             download_finemath(subset, args.finemath_shards, args.download_workers)
+        if args.common_pile:
+            download_common_pile(args.common_pile_shards, args.download_workers)
         return
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
