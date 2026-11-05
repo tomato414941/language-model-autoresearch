@@ -56,10 +56,10 @@ class Tokenizer(BaseTokenizer):
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 8
-    n_head: int = 4
-    n_kv_head: int = 4
-    n_embd: int = 512
+    n_layer: int = 10
+    n_head: int = 5
+    n_kv_head: int = 5
+    n_embd: int = 640
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
     float32_embedding_master: bool = True
@@ -739,7 +739,7 @@ TAIL_EMA_TAU = 0.075    # time constant as a fraction of the fixed training budg
 TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
 
 # Model size
-DEPTH = 8               # number of transformer layers
+DEPTH = 10              # number of transformer layers
 DEVICE_BATCH_SIZE = 64   # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
