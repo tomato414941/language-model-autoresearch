@@ -476,6 +476,71 @@ class TailEMA:
         return time.perf_counter() - started
 
 
+def _extra_training_document_batches(source, batch_size=128):
+    """Read every original document from one allowed extra source, repeating its file order."""
+    import gzip
+    import json
+    from itertools import islice
+    from pathlib import Path
+    import pyarrow.parquet as pq
+    from prepare import FINEMATH_DIR, COMMON_PILE_DIR
+
+    if batch_size <= 0:
+        raise ValueError("The document batch size must be positive.")
+    if source in ("finemath-3plus", "finemath-4plus"):
+        paths = sorted((Path(FINEMATH_DIR)/source).glob("*.parquet"))
+    elif source == "common-pile":
+        paths = sorted(Path(COMMON_PILE_DIR).glob("*.json.gz"))
+    else:
+        raise ValueError("Choose an allowed extra training source.")
+    if not paths:
+        raise ValueError("Prepare the selected extra training source before running this bundle.")
+
+    def texts():
+        for path in paths:
+            if path.suffix == ".parquet":
+                for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size, columns=["text"]):
+                    yield from batch.column("text").to_pylist()
+            else:
+                with gzip.open(path, "rt", encoding="utf-8") as stream:
+                    for line in stream:
+                        yield json.loads(line)["text"]
+
+    epoch = 1
+    while True:
+        rows = iter(texts())
+        emitted = False
+        while batch := list(islice(rows, batch_size)):
+            emitted = True
+            yield batch, epoch
+        if not emitted:
+            raise ValueError("The selected training source must contain original documents.")
+        epoch += 1
+
+
+def _training_document_batches(source_pattern=None):
+    """Consume source streams in their original order using a fixed document-batch cycle."""
+    if source_pattern is None:
+        yield from _document_batches("train")
+        return
+    pattern = tuple(source_pattern)
+    allowed = {"fineweb", "finemath-3plus", "finemath-4plus", "common-pile"}
+    if not pattern or not set(pattern) <= allowed:
+        raise ValueError("Use a nonempty cycle of allowed training sources.")
+    if set(pattern) == {"fineweb"}:
+        yield from _document_batches("train")
+        return
+    names = dict.fromkeys(pattern)
+    readers = {name: _document_batches("train") if name == "fineweb"
+               else _extra_training_document_batches(name) for name in names}
+    epochs = dict.fromkeys(names, 1)
+    while True:
+        for name in pattern:
+            batch, epoch = next(readers[name])
+            epochs[name] = epoch
+            yield batch, epochs.copy()
+
+
 class LengthIndexedDocuments:
     """Select the native best fit while preserving first-arrival ties."""
 
@@ -508,11 +573,11 @@ class LengthIndexedDocuments:
         return document
 
 
-def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
+def make_training_dataloader(tokenizer, B, T, buffer_size=1000, source_pattern=None):
     # Keep prepare.py's document stream, refill boundary, cropping and shifted targets.
     # Per-length FIFO queues preserve its first-match tie rule without scanning every document.
     row_capacity = T + 1
-    batches = _document_batches("train")
+    batches = _training_document_batches(source_pattern)
     bos_token = tokenizer.get_bos_token_id()
     documents = LengthIndexedDocuments()
     epoch = 1
@@ -723,6 +788,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=quarter context
 
 # Optimization
+TRAINING_SOURCES = ("fineweb",) * 8 + ("finemath-4plus", "common-pile") # document batches per cycle
 TOTAL_BATCH_SIZE = 2**17 # one device batch, ~131K tokens per optimizer step
 BATCH_REFERENCE_SIZE = 2**18 # parent batch for Adam variance, Muon decay and warmup
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
@@ -800,7 +866,8 @@ scale_adam_second_moments(optimizer, TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE)
 tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_training_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
+train_loader = make_training_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN,
+                                      source_pattern=TRAINING_SOURCES)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
