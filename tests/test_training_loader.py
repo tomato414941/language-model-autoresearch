@@ -187,6 +187,38 @@ class TrainingLoaderTests(unittest.TestCase):
                     self.assertTrue(torch.all(x[:, 0] == 0))
                 self.assertEqual(actual_tokenizer.calls, reference_tokenizer.calls)
 
+    def test_preserves_wide_token_ids_and_document_order_through_refills_and_cropping(self):
+        wide_ids = (65535, 65536, 2**24 + 1, 2**31, 2**32 - 1)
+
+        def wide_documents(split):
+            self.assertEqual(split, 'train')
+            for batch in range(100):
+                rows = [[wide_ids[(batch + offset + index) % len(wide_ids)] for index in range(size)]
+                        for offset, size in enumerate((0, 1, 2, 14, 15, 16, 17, 31, 65, 130))]
+                yield rows, batch // 3 + 1
+
+        source = (Path(__file__).resolve().parents[1] / 'train.py').read_text()
+        for batch, length, buffer in ((2, 17, 13), (3, 63, 19)):
+            with self.subTest(batch=batch, length=length, buffer=buffer):
+                namespace = load_model_namespace()
+                namespace['_document_batches'] = wide_documents
+                candidate = cpu_allocations('make_training_dataloader', source, namespace)
+                reference = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
+                                            dict(torch=torch, _document_batches=wide_documents))
+                tokenizer, reference_tokenizer = ToyTokenizer(), ToyTokenizer()
+                actual = candidate(tokenizer, batch, length, buffer_size=buffer)
+                expected = reference(reference_tokenizer, batch, length, 'train', buffer_size=buffer)
+                seen = set()
+                for _ in range(24):
+                    inputs, targets, epoch = next(actual)
+                    expected_inputs, expected_targets, expected_epoch = next(expected)
+                    torch.testing.assert_close(inputs, expected_inputs, rtol=0, atol=0)
+                    torch.testing.assert_close(targets, expected_targets, rtol=0, atol=0)
+                    self.assertEqual(epoch, expected_epoch)
+                    seen.update(targets.reshape(-1).tolist())
+                self.assertEqual(seen, {0, *wide_ids})
+                self.assertEqual(tokenizer.calls, reference_tokenizer.calls)
+
     def test_trains_the_current_model_from_packed_batches_and_returns_the_declared_average(self):
         namespace = load_model_namespace()
         namespace['_document_batches'] = documents

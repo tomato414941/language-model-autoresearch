@@ -574,6 +574,8 @@ class LengthIndexedDocuments:
 
 
 def make_training_dataloader(tokenizer, B, T, buffer_size=1000, source_pattern=None):
+    from array import array
+
     # Keep prepare.py's document stream, refill boundary, cropping and shifted targets.
     # Per-length FIFO queues preserve its first-match tie rule without scanning every document.
     row_capacity = T + 1
@@ -596,7 +598,8 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000, source_pattern=N
             while pos < row_capacity:
                 while len(documents) < buffer_size:
                     texts, epoch = next(batches)
-                    documents.extend(tokenizer.encode(texts, prepend=bos_token))
+                    # Dense token IDs widen to torch.long when copied into the packed rows.
+                    documents.extend(array("I", row) for row in tokenizer.encode(texts, prepend=bos_token))
                 remaining = row_capacity - pos
                 document = documents.pop_best(remaining)
                 if len(document) > remaining:
