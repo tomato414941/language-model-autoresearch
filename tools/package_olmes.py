@@ -55,6 +55,7 @@ def package_assets():
                                   cache_dir=assets / "hf-cache/hub", allow_patterns=[f"build/{build}/*"])
         assets_sha256 = pack(assets, artifacts / "gpu-assets-olmes.tar.gz")
     datasets_sha256 = native_datasets_identity(manifest["tasks"])
+    runtime.pop("transport", None)
     runtime.update(
         gpu_id=profile.identifier, sources={name: digest(ROOT / name) for name in source_files()},
         evaluation_metric="olmes_bpb", gpu_env_sha256=staged["gpu_env_sha256"],

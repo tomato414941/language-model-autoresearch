@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import prepare
 from gpu_config import active_gpu, source_files
+from tools.runtime_archives import archive_specs
 
 PYTHON_VERSION = "3.12.16"
 KERNEL_REPO = "varunneal/flash-attention-3"
@@ -80,8 +81,8 @@ def refresh_assets():
     for name in ("pyproject.toml", "uv.lock"):
         if digest(ROOT / name) != manifest["sources"][name]:
             raise RuntimeError("The dependencies changed; rebuild the locked runtime first.")
-    for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
-        if digest(artifacts / name) != manifest[field]:
+    for name, sha256 in archive_specs(manifest):
+        if digest(artifacts / name) != sha256:
             raise RuntimeError("A prepared runtime archive changed; retain its original provenance.")
     tokenizer = verify_tokenizer()
     history = artifacts / "history"
@@ -107,8 +108,8 @@ def refresh_source_hashes():
     for name in ("pyproject.toml", "uv.lock"):
         if hashes[name] != manifest["sources"][name]:
             raise RuntimeError("The dependencies changed; rebuild their runtime archive first.")
-    for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
-        if digest(artifacts / name) != manifest[field]:
+    for name, sha256 in archive_specs(manifest):
+        if digest(artifacts / name) != sha256:
             raise RuntimeError("A prepared runtime archive changed; rebuild it first.")
     manifest["sources"] = hashes
     temporary = path.with_suffix(".tmp")

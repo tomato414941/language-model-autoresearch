@@ -324,6 +324,39 @@ class RentalLifecycleTests(unittest.TestCase):
         sample = json.loads((self.root / 'results/runs/fixture/gpu-observations.jsonl').read_text())
         self.assertEqual(sample['error_type'], 'TimeoutExpired')
 
+    def test_deploys_a_verified_xz_runtime_with_its_separate_bootstrap_before_one_training_launch(self):
+        artifacts = self.root / 'artifacts'
+        artifacts.mkdir()
+        for name in ('gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz'):
+            (artifacts / name).write_bytes(b'archive fixture')
+        snapshot = rental.job_path('fixture').parent
+        (snapshot / 'source.tar.gz').write_bytes(b'source fixture')
+        (snapshot / 'runtime.json').write_text(json.dumps(dict(
+            python_version='3.12.16', gpu_env_sha256='canonical runtime',
+            transport=dict(format='python-xz', canonical_gpu_env_sha256='canonical runtime'))))
+        commands, uploads = [], []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            commands.append(text)
+            if 'stdin' in kwargs:
+                uploads.append(Path(kwargs['stdin'].name).name)
+            if text.startswith('nvidia-smi'):
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0, 0\n')
+            if 'kill -0' in text:
+                return subprocess.CompletedProcess(arguments, 0, stdout='exit 0')
+            if kwargs.get('stdout') is not None:
+                kwargs['stdout'].write(b'fixture artifact')
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        with patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run', side_effect=command):
+            rental.execute(self.job, {}, self.root / 'key')
+        self.assertEqual(uploads, ['gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz', 'source.tar.gz'])
+        self.assertTrue(any('.bootstrap/.python/' in text for text in commands))
+        self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+
     def collect_at_boundary(self, exit_bytes, observed=None, fail_refresh=False):
         identifier = f'collection-{self.collection_cases}'
         self.collection_cases += 1

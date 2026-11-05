@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
 from gpu_config import active_gpu, profile_for_job, source_files
+from tools.runtime_archives import archive_specs, deployment_names, UNPACK_XZ
 
 SOURCES = source_files()
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
@@ -247,8 +248,8 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     sources = source_files(profile)
     sources += OLMES_SOURCES if metric == 'olmes_bpb' else ()
     hashes = {name: digest(ROOT / name) for name in sources}
-    for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
-        if digest(artifacts / name) != manifest[field]:
+    for name, sha256 in archive_specs(manifest):
+        if digest(artifacts / name) != sha256:
             raise RuntimeError('A runtime archive is incomplete or changed.')
     identifier = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
     directory = job_path(identifier).parent
@@ -395,10 +396,23 @@ def execute(job, instance, key):
     job['transfer_started_at'] = time.time()
     save(job)
     artifacts = artifact_directory(job)
-    for path in [artifacts / 'gpu-env.tar.gz', artifacts / 'gpu-assets.tar.gz',
-                 job_path(job['id']).parent / 'source.tar.gz']:
+    runtime_path = job_path(job['id']).parent / 'runtime.json'
+    manifest = json.loads(runtime_path.read_text()) if runtime_path.exists() else {}
+    names = deployment_names(manifest)
+    for path in [*(artifacts / name for name in names), job_path(job['id']).parent / 'source.tar.gz']:
+        if path.name == 'gpu-bootstrap.tar.gz':
+            remote('mkdir -p autoresearch/.bootstrap')
+            unpack = 'tar -xzf - -C autoresearch/.bootstrap'
+        elif path.suffix == '.xz':
+            version = manifest['python_version']
+            if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+                raise ValueError('Invalid packaged Python version.')
+            interpreter = f'.bootstrap/.python/cpython-{version}-linux-x86_64-gnu/bin/python3.12'
+            unpack = 'cd autoresearch && ' + shlex.quote(interpreter) + ' -c ' + shlex.quote(UNPACK_XZ)
+        else:
+            unpack = 'tar -xzf - -C autoresearch'
         with path.open('rb') as source:
-            remote('tar -xzf - -C autoresearch', timeout=900, stdin=source)
+            remote(unpack, timeout=900, stdin=source)
     job['transfer_completed_at'] = time.time()
     save(job)
     require_execution_time(job)
@@ -481,8 +495,8 @@ def start(job):
     if digest(job_path(job['id']).parent / 'source.tar.gz') != job['source_archive_sha256']:
         raise RuntimeError('The prepared experiment sources changed.')
     manifest = json.loads(runtime_path.read_text())
-    for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
-        if digest(artifact_directory(job) / name) != manifest[field]:
+    for name, sha256 in archive_specs(manifest):
+        if digest(artifact_directory(job) / name) != sha256:
             raise RuntimeError('A prepared runtime archive changed; no rental was requested.')
     required_seconds = execution_budget(job)
     check_daily_budget(time.time())
