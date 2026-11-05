@@ -18,6 +18,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -46,6 +47,7 @@ class GPTConfig:
     narrow_first_layer: bool = True
     float32_embedding_master: bool = True
     value_silu: bool = True
+    training_loss_chunk_size: int = 16384
 
 
 def norm(x):
@@ -156,6 +158,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        assert config.training_loss_chunk_size >= 0
         self.window_sizes = self._compute_window_sizes(config)
         # Narrow input block: https://github.com/karpathy/nanochat/pull/807
         assert not config.narrow_first_layer or config.n_embd % 2 == 0
@@ -265,7 +268,9 @@ class GPT(nn.Module):
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * block.attn.n_head * block.attn.head_dim * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        head_recompute_flops = (2 * self.lm_head.weight.numel()
+                                if self.config.training_loss_chunk_size > 0 else 0)
+        return 6 * (nparams - nparams_exclude) + attn_flops + head_recompute_flops
 
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
@@ -315,6 +320,26 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _loss_sum(self, hidden, targets):
+        logits = self.lm_head(hidden).float()
+        logits = 15 * torch.tanh(logits / 15)
+        return F.cross_entropy(logits, targets, ignore_index=-1, reduction='sum')
+
+    def _training_loss(self, hidden, targets):
+        # Bound output-layer activations by recomputing one token chunk during backward.
+        # https://docs.pytorch.org/docs/2.9/checkpoint.html
+        hidden = hidden.reshape(-1, hidden.size(-1))
+        targets = targets.reshape(-1)
+        chunk_size = self.config.training_loss_chunk_size
+        loss = hidden.new_zeros((), dtype=torch.float32)
+        for start in range(0, hidden.size(0), chunk_size):
+            stop = start + chunk_size
+            loss = loss + torch.utils.checkpoint.checkpoint(
+                self._loss_sum, hidden[start:stop], targets[start:stop],
+                use_reentrant=False, preserve_rng_state=False,
+            )
+        return loss / (targets != -1).sum()
+
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
@@ -341,6 +366,10 @@ class GPT(nn.Module):
         if middle is not None:
             x = x - self.backout_gain.to(x.dtype) * middle
         x = norm(x)
+
+        if (targets is not None and reduction == 'mean' and self.training
+                and torch.is_grad_enabled() and self.config.training_loss_chunk_size > 0):
+            return self._training_loss(x, targets)
 
         softcap = 15
         logits = self.lm_head(x)

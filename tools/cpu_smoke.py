@@ -9,6 +9,7 @@ import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 torch.set_num_threads(2)
 
