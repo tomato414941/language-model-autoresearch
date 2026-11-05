@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — the fixed frame (allowed data, time budget, evaluation) and a default tokenizer and dataloader. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 2. **Rent the GPU**: experiments run on one rented H100 SXM, never on the machine you run on (see the rules at the end).
-3. **Prepare the data**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer. Bring the tokenizer when renting, then run `uv run prepare.py` on the rented machine to download the remaining training shards.
+3. **Prepare the data**: run `uv run prepare.py` to download the data and train the tokenizer.
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 5. **Confirm and go**: Confirm setup looks good.
 
@@ -21,14 +21,14 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 30 minutes** (wall clock training time, excluding startup/compilation): one run in each daily rental of at most 1 hour. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace. Save a replacement tokenizer where `prepare.py` reads it, in the same format, so that `evaluate_bpb` runs unchanged on it.
-- Prepare anything beforehand that needs only the CPU, such as a tokenizer, tables or statistics built from the allowed training data. Run it on the processing server; its code may live in files of its own. It does not count toward the 30-minute budget.
+- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
+- Prepare anything beforehand that needs only the CPU, from the allowed data. Its code may live in files of its own, and it does not count toward the 30-minute budget.
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed allowed data, time budget and evaluation.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation. The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb` (see the rules at the end).
-- Train on data that is not allowed. The allowed data is what `prepare.py` downloads: FineWeb-Edu, and FineMath's `finemath-3plus` and `finemath-4plus` subsets ([HuggingFaceTB/finemath](https://huggingface.co/datasets/HuggingFaceTB/finemath) at revision `e92b25a616738fe95dc186b64dfb19f9c8525594`, ODC-By 1.0), and Common Pile's openly licensed educational code ([common-pile/stackv2_edu_filtered](https://huggingface.co/datasets/common-pile/stackv2_edu_filtered) at revision `c354dbe88469a1153e97c6a63ac50591849654de`; each file keeps its own open license). Only the human adds data. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
+- Train on data that is not allowed. The allowed data is what `prepare.py` downloads: FineWeb-Edu, FineMath's `finemath-3plus` and `finemath-4plus`, and Common Pile's `stackv2_edu_filtered`, at the revisions pinned there. Only the human adds data. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
 - Use other models in training: no distillation from a teacher, and no other model's weights or outputs.
 
@@ -46,7 +46,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **Discarded is not forever**: An idea can return in a genuinely different bundle or configuration, or after the baseline changes. Describe the new hypothesis before running it.
 
-**Follow the latest work**: Between rentals, search the web for what is new: speedrun (modded-nanogpt) and nanochat records, recent arXiv papers on small-model pretraining, and other people's autoresearch results. Put the source of each idea in its description.
+**Follow the latest work**: Between rentals, search the web for what is new. Put the source of each idea in its description.
 
 ## Output format
 
@@ -127,10 +127,8 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 ## Rules of this repository
 
-- **Rentals.** Rent one H100 SXM at most once a day and for at most 1 hour, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's 30-minute training and its eval must fit in it. Delete it right after. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
-- **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiment as a ready-to-run commit so that rented time goes to training only, and make renting faster and cheaper.
-- **CPU work.** Rented GPU time is only for the training. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that the prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
-- **Source and secrets.** Edit source and configuration only in the local Git repository, then send them to the processing server; its copy is not a Git checkout. Keep keys in the ignored `.env`, and have tools read environment variables. Add `.env` to `.gitignore` before creating it.
-- **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Run them with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect them to the model and tokenizer; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. The user approved adding `olmes` as a dependency and implementing the suites in `prepare.py`; this and the data downloads below are the changes to `prepare.py` allowed now. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick.
-- **Data.** The user added FineMath and Common Pile's educational code. Implement their downloads in `prepare.py` at the pinned revisions, each into its own directory, so that the default dataloader still reads FineWeb-Edu only and the measured baseline stays unchanged.
+- **Rentals.** Rent one H100 SXM at most once a day and for at most 1 hour, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's 30-minute training and its eval must fit in it. Delete it right after.
+- **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental, even if it takes more than a day.
+- **CPU work.** Run work that needs no GPU on the processing server in your environment notes, never on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
+- **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Run them with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect them to the model and tokenizer; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. The user approved adding `olmes` as a dependency and implementing the suites and the data downloads in `prepare.py`. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPU, the time budget and the daily hour.
