@@ -108,6 +108,9 @@ def run(command, **kwargs):
 def recent_rentals(now):
     """Check live instances and actual contract start times in recent billing history."""
     rows = list_instances(timeout=10)
+    owned = [row for row in rows if str(row.get('label', '')).startswith(PROJECT_LABELS)]
+    if owned:
+        return owned
     invoices = api('GET', 'users/me/invoices', params={
         'owner': 'me', 'sdate': now - 86400, 'edate': now, 'inc_charges': 'true',
     })

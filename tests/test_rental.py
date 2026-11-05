@@ -145,6 +145,20 @@ class RentalLifecycleTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 rental.check_daily_budget(2000)
 
+    def test_counts_an_owned_live_instance_even_when_its_contract_is_more_than_a_day_old(self):
+        row = dict(id=42, label='autoresearch-h100-old', start_date=0, actual_status='running')
+        with patch.object(rental, 'list_instances', return_value=[row]):
+            with patch.object(rental, 'api', return_value={'invoices': []}):
+                self.assertEqual(rental.recent_rentals(100000), [row])
+
+    def test_counts_only_this_loops_recent_contracts_when_other_projects_are_running(self):
+        other = dict(id=90, label='another-project', start_date=0, actual_status='running')
+        owned = dict(id=42, label='autoresearch-h100-history', start_date=99000)
+        responses = [{'invoices': [{'instance_id': 42}]}, {'contracts': [owned, other]}]
+        with patch.object(rental, 'list_instances', return_value=[other]):
+            with patch.object(rental, 'api', side_effect=responses):
+                self.assertEqual(rental.recent_rentals(100000), [owned])
+
     def test_allows_a_fresh_request_after_a_provider_confirmed_rejection(self):
         rental.save(dict(id='fixture', creation_requested_at=1000, creation_rejected=True))
         with patch.object(rental, 'recent_rentals', return_value=[]):
