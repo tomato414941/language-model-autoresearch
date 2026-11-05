@@ -12,6 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+import prepare
 from tools.package_runtime import (KERNEL_REPO, KERNEL_REVISION, PYTHON_VERSION, digest,
                                    pack, verify_tokenizer)
 from tools.measurement import native_datasets_identity
@@ -28,7 +29,7 @@ def package_assets():
 
     profile = active_gpu()
     artifacts = profile.artifacts_directory(ROOT)
-    requests = profile.results_directory(ROOT) / "olmes-native-requests"
+    requests = Path(prepare.OLMES_REQUEST_DIR)
     manifest = json.loads((requests / "manifest.json").read_text())
     if not manifest["complete"]:
         raise ValueError("Prepare every native request before packaging the evaluation.")
@@ -46,7 +47,6 @@ def package_assets():
             shutil.copytree(cache, assets / "hf-cache", symlinks=True, copy_function=os.link)
         cache_root = assets / "autoresearch" / "gpus" / profile.identifier
         shutil.copytree(requests, cache_root / "olmes", copy_function=os.link)
-        import prepare
         shutil.copytree(prepare.TOKENIZER_DIR, cache_root / "tokenizer",
                         ignore=shutil.ignore_patterns("__pycache__"))
         if profile.values["attention_backend"] == "flash_attention_3":

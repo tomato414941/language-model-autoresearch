@@ -8,9 +8,26 @@ from unittest.mock import patch
 
 import prepare
 from evaluation.arc_macro import APPROVED_CONFIG_FIX
+from gpu_config import get_profile
 
 
 class OlmesEntrypointTests(unittest.TestCase):
+    def test_prepares_counts_and_requests_in_the_selected_gpus_own_locations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for identifier in ('h100', 'rtx5090'):
+                profile = get_profile(identifier)
+                requests = profile.cache_directory('olmes')
+                with patch.object(prepare, '__file__', str(root / 'prepare.py')), \
+                        patch.object(prepare, 'active_gpu', return_value=profile), \
+                        patch.object(prepare, 'OLMES_REQUEST_DIR', str(requests)), \
+                        patch.object(prepare.subprocess, 'run') as execute:
+                    self.assertEqual(prepare.prepare_olmes(), requests)
+                counts_call, requests_call = (call.args[0] for call in execute.call_args_list)
+                self.assertEqual(counts_call[counts_call.index('--output') + 1],
+                                 str(profile.results_directory(root) / 'olmes-token-counts'))
+                self.assertEqual(requests_call[requests_call.index('--output') + 1], str(requests))
+
     def evaluate_fixture(self, suites, repeats=1):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

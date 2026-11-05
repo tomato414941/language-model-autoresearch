@@ -1,11 +1,14 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import gpu_config
+import train as dispatcher
 from tools import rental
 
 
@@ -75,6 +78,27 @@ class GPUConfigurationTests(unittest.TestCase):
             with patch.object(rental, 'api', return_value={'offers': offers}) as api:
                 self.assertEqual(rental.choose_offer()['id'], 2)
         self.assertEqual(api.call_args.args[2]['gpu_name'], {'eq': 'RTX 5090'})
+
+    def test_exports_the_selected_model_source_when_launched_through_the_dispatcher(self):
+        import torch
+        selected = self.root / 'gpus/h100/train.py'
+        selected.parent.mkdir(parents=True)
+        checkpoint = self.root / 'model.pt'
+        selected.write_text(
+            'from dataclasses import dataclass\nimport torch\n'
+            'from evaluation.checkpoint import export_checkpoint\n'
+            '@dataclass\nclass Config:\n    width: int = 1\n'
+            'class GPT(torch.nn.Module):\n'
+            '    def __init__(self):\n        super().__init__()\n'
+            '        self.config = Config()\n'
+            '        self.weight = torch.nn.Parameter(torch.ones(1))\n'
+            f'export_checkpoint(GPT(), {str(checkpoint)!r})\n')
+        profile = SimpleNamespace(settings=lambda: {}, train_source=lambda: selected)
+        with patch.object(dispatcher, 'active_gpu', return_value=profile):
+            dispatcher.main()
+        payload = torch.load(checkpoint, weights_only=True)
+        self.assertEqual(payload['source'], selected.read_text())
+        self.assertEqual(payload['source_sha256'], hashlib.sha256(selected.read_bytes()).hexdigest())
 
 
 if __name__ == '__main__':

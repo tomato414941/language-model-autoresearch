@@ -552,7 +552,7 @@ def prepare_olmes(count_dir=None, request_dir=None):
     """Prepare every native suite request on the CPU using the isolated OLMES environment."""
     root = Path(__file__).resolve().parent
     executable = os.environ.get("OLMES_PYTHON", str(root / "evaluation/.venv/bin/python"))
-    count_dir = Path(count_dir) if count_dir is not None else root / "results/olmes-token-counts"
+    count_dir = Path(count_dir) if count_dir is not None else active_gpu().results_directory(root) / "olmes-token-counts"
     request_dir = Path(request_dir) if request_dir is not None else Path(OLMES_REQUEST_DIR)
     common = ["--tokenizer", str(Path(TOKENIZER_DIR) / "tokenizer.pkl")]
     environment = {name: value for name, value in os.environ.items()
