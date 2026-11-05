@@ -72,6 +72,25 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+@torch.compile(dynamic=True, fullgraph=True)
+def prepare_qk(q, k, cos, sin):
+    # Keep capture local to model calculations when prompt lengths vary.
+    # https://docs.pytorch.org/docs/2.9/torch.compiler_dynamic_shapes.html
+    q = norm(apply_rotary_emb(q, cos, sin)) * 1.2
+    k = norm(apply_rotary_emb(k, cos, sin)) * 1.2
+    return q, k
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def squared_relu(x):
+    return F.relu(x).square()
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def softcap_logits(logits):
+    return 15 * torch.tanh(logits.float() / 15)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx, n_embd=None):
         super().__init__()
@@ -115,9 +134,7 @@ class CausalSelfAttention(nn.Module):
             v = F.silu(v)
 
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-        q, k = q * 1.2, k * 1.2
+        q, k = prepare_qk(q, k, cos, sin)
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
@@ -134,7 +151,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = squared_relu(x)
         x = self.c_proj(x)
         return x
 
@@ -333,8 +350,7 @@ class GPT(nn.Module):
         return optimizer
 
     def _loss_sum(self, hidden, targets):
-        logits = self.lm_head(hidden).float()
-        logits = 15 * torch.tanh(logits / 15)
+        logits = softcap_logits(self.lm_head(hidden))
         return F.cross_entropy(logits, targets, ignore_index=-1, reduction='sum')
 
     def _training_loss(self, hidden, targets):
@@ -393,10 +409,7 @@ class GPT(nn.Module):
                 and torch.is_grad_enabled() and self.config.training_loss_chunk_size > 0):
             return self._training_loss(x, targets)
 
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
+        logits = softcap_logits(self.lm_head(x))
 
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
