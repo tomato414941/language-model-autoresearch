@@ -1,0 +1,9 @@
+[project]
+name = "autoresearch-olmes"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ai2-olmes @ git+https://github.com/allenai/olmes@5a51f502d463b8cdc4a2dcad7d7096c41ff1197e",
+    "pyarrow==21.0.0",
+    "setuptools==80.9.0",
+]
