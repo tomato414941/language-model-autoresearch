@@ -25,6 +25,11 @@ sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
 
 SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
+OLMES_SOURCES = tuple('evaluation/' + name for name in (
+    'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'model.py', 'prepare_requests.py',
+    'protocol.py', 'run_prepared.py', 'tokenizer_adapter.py', 'verify_requests.py',
+    'pyproject.toml', 'uv.lock', 'patches/olmes-arc-bpb-macro.patch',
+))
 LEASE_SECONDS = 3600
 CLEANUP_SECONDS = 60
 EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
@@ -200,7 +205,9 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     manifest = json.loads((ROOT / 'artifacts/runtime.json').read_text())
     if manifest['tokenizer'] != tokenizer_hashes:
         raise RuntimeError('The tokenizer differs from the packaged BPB assets.')
-    hashes = {name: digest(ROOT / name) for name in SOURCES}
+    metric = manifest.get('evaluation_metric', 'val_bpb')
+    sources = SOURCES + OLMES_SOURCES if metric == 'olmes_bpb' else SOURCES
+    hashes = {name: digest(ROOT / name) for name in sources}
     for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
         if digest(ROOT / 'artifacts' / name) != manifest[field]:
             raise RuntimeError('A runtime archive is incomplete or changed.')
@@ -212,7 +219,8 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     runtime_path.write_text(json.dumps(manifest, indent=2) + '\n')
     source_dir = directory / 'source'
     source_dir.mkdir()
-    for name in SOURCES:
+    for name in sources:
+        (source_dir / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, source_dir / name)
     shutil.copy2(ROOT / 'tools/gpu_run.sh', source_dir / 'gpu_run.sh')
     with tarfile.open(directory / 'source.tar.gz', 'w:gz') as archive:
@@ -222,7 +230,7 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
                description=description, phase='prepared', source_sha256=hashes,
                source_archive_sha256=digest(directory / 'source.tar.gz'),
                runtime_manifest_sha256=digest(runtime_path), max_hourly_cost=5.0,
-               expected_eval_seconds=expected_eval_seconds, metric='val_bpb')
+               expected_eval_seconds=expected_eval_seconds, metric=metric)
     save(job)
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
 
@@ -367,6 +375,9 @@ def execute(job, instance, key):
             connection = ssh_connection(instance, key, prefer_direct=False)
         time.sleep(min(30, max(0, observe_until - time.time())))
     artifacts = ('run.log', 'prepare.log', 'bootstrap.log')
+    if job.get('metric') == 'olmes_bpb':
+        artifacts += ('olmes.log', 'olmes-summary.json', 'olmes-metrics.jsonl',
+                      'olmes-details.tar.gz', 'final-model.pt')
 
     def collect(names):
         for name in names:

@@ -3,6 +3,7 @@
 import ast
 import hashlib
 import json
+import math
 from pathlib import Path
 import tarfile
 
@@ -16,13 +17,14 @@ MEASUREMENT_ROOTS = (
     "evaluate_bpb", "download_data", "train_tokenizer", "MAX_SEQ_LEN", "TIME_BUDGET",
     "BASE_URL", "MAX_SHARD", "VAL_SHARD", "VAL_FILENAME", "DATA_DIR",
 )
+OLMES_METRIC = "olmes_bpb"
 
 
 def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
-def prepare_semantics(source):
+def prepare_semantics(source, roots=MEASUREMENT_ROOTS):
     """Hash BPB, allowed data and budgets with their transitive module dependencies."""
     tree = ast.parse(source)
     bindings = {}
@@ -40,7 +42,7 @@ def prepare_semantics(source):
             bindings.setdefault(name, []).append(node)
     if not {"evaluate_bpb", "TIME_BUDGET"} <= bindings.keys():
         raise ValueError("The archived source must define BPB evaluation and its training budget.")
-    pending = list(MEASUREMENT_ROOTS)
+    pending = list(roots)
     selected = set()
     seen = set()
     while pending:
@@ -79,6 +81,35 @@ def from_snapshot(job, directory):
         gpu_name=job["gpu_name"], num_gpus=1,
         runtime={name: runtime[name] for name in RUNTIME_FIELDS},
     )
+    if job.get("metric") != OLMES_METRIC:
+        definition["runtime"]["gpu_env_sha256"] = runtime.get(
+            "training_gpu_env_sha256", runtime["gpu_env_sha256"])
+    if job.get("metric") == OLMES_METRIC:
+        evaluation = runtime["olmes"]
+        definition.update(version=3, metric=OLMES_METRIC,
+                          prepare_semantics_sha256=prepare_semantics(source, (
+                              "TIME_BUDGET", "download_data", "BASE_URL", "MAX_SHARD",
+                              "VAL_SHARD", "VAL_FILENAME", "DATA_DIR")),
+                          olmes={name: evaluation[name] for name in
+                                 ("revision", "suites", "approved_config_fix", "native_datasets_sha256")})
+        definition["dependencies"].update({name: job["source_sha256"][name] for name in
+                                           ("evaluation/pyproject.toml", "evaluation/uv.lock")})
     # The source archive retains the rules and model; tokenizer assets are a model choice.
     encoded = json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
     return dict(id=digest(encoded), definition=definition)
+
+
+def for_metric(job, directory, metric):
+    """Identify a shared evaluation, including the unchanged reference BPB runtime."""
+    return from_snapshot(dict(job, metric=metric), directory)
+
+
+def decision_helper(job, directory, name):
+    """Use the user's decision function saved before this experiment was measured."""
+    with tarfile.open(Path(directory) / "source.tar.gz", "r:gz") as archive:
+        source = archive.extractfile("prepare.py").read()
+    tree = ast.parse(source)
+    node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == name)
+    namespace = {"math": math}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "prepare.py", "exec"), namespace)
+    return namespace[name]

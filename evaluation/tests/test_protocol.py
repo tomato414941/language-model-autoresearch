@@ -1,5 +1,7 @@
 from copy import deepcopy
 import json
+import gzip
+import hashlib
 import tempfile
 from pathlib import Path
 import unittest
@@ -9,10 +11,12 @@ import torch
 from oe_eval import launch, run_eval
 from oe_eval.configs.task_suites import TASK_SUITE_CONFIGS
 from oe_eval.tasks.base_task import MultipleChoiceTask
+from oe_eval.components.instances import RequestInstance
+from oe_eval.components.requests import GenerateUntilAndLoglikelihoodRequest
 from oe_eval.utils import hash_dict
 
 from evaluation.count_tokens import SUITES
-from evaluation.protocol import aggregate_suites, score_task
+from evaluation.protocol import aggregate_suites, read_requests, score_task
 from evaluation.tests.test_count_tokens import ForwardProbe
 from evaluation.tokenizer_adapter import TokenizerAdapter
 
@@ -108,6 +112,31 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(suites["qa_bpb"], 1.0 + 2.0 / len(TASK_SUITE_CONFIGS[SUITES[0]]["tasks"]))
         self.assertEqual(suites["math_bpb"], 2.0)
         self.assertEqual(suites["code_bpb"], 4.0)
+
+    def test_restores_every_native_gold_bpb_request_field_and_score(self):
+        original = RequestInstance(
+            request_type="loglikelihood", doc={"choices": ["answer"], "gold": 0},
+            request=GenerateUntilAndLoglikelihoodRequest(
+                context="A question:", continuation=" answer", perplexity_context="original context",
+                stop_sequences=["\n"], generation_kwargs={"max_gen_toks": 12}),
+            idx=0, task_name="synthetic_gold_bpb", doc_id=0, native_id="fixture", label=0)
+        raw = original.to_dict()
+        payload = (json.dumps(raw) + "\n").encode()
+        compressed = gzip.compress(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "requests.jsonl.gz").write_bytes(compressed)
+            entry = dict(requests_file="requests.jsonl.gz", requests=1,
+                         requests_sha256=hashlib.sha256(compressed).hexdigest(),
+                         uncompressed_requests_sha256=hashlib.sha256(payload).hexdigest())
+            restored_raw, restored = read_requests(directory, entry)
+        self.assertEqual(restored_raw, [raw])
+        self.assertEqual(restored[0].to_dict(), raw)
+        task_config = {"metric_kwargs": {}}
+        native = run_eval.evaluate(ForwardProbe(self.tokenizer, max_length=64, batch_size=2),
+                                   [original], task_config, {})
+        actual = run_eval.evaluate(ForwardProbe(self.tokenizer, max_length=64, batch_size=2),
+                                   restored, task_config, {})
+        self.assertEqual(actual, native)
 
 
 if __name__ == "__main__":

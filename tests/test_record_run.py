@@ -1,6 +1,7 @@
 import contextlib
 import csv
 import io
+import inspect
 import json
 import math
 from pathlib import Path
@@ -29,23 +30,37 @@ class RecordedDecisionTests(unittest.TestCase):
         self.directory.cleanup()
 
     def make_run(self, identifier, bpb, baseline=False, *, rules='fixture rules',
-                 measurement_source=None, gpu_name='H100 SXM', runtime_changes=None):
+                 measurement_source=None, gpu_name='H100 SXM', runtime_changes=None,
+                 suites=None, metric='val_bpb'):
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
-                   gpu_name=gpu_name, phase='evaluated', exit_code=0)
+                   gpu_name=gpu_name, phase='evaluated', exit_code=0, metric=metric)
         snapshot = rental.job_path(identifier).parent
         source = snapshot / 'source'
         source.mkdir(parents=True)
         files = {'train.py': 'MODEL_WIDTH = 64\n', 'program.md': rules,
                  'prepare.py': measurement_source or SOURCE,
                  'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
+        if metric == measurement.OLMES_METRIC:
+            files['prepare.py'] += '\n' + inspect.getsource(record_run.prepare.suites_improve)
+            files.update({'evaluation/pyproject.toml': 'native dependency fixture\n',
+                          'evaluation/uv.lock': 'fixed native dependencies\n'})
         for name, content in files.items():
+            (source / name).parent.mkdir(parents=True, exist_ok=True)
             (source / name).write_text(content)
-        job['source_sha256'] = {name: rental.digest(source / name) for name in rental.SOURCES}
+        job['source_sha256'] = {name: rental.digest(source / name) for name in files}
         with tarfile.open(snapshot / 'source.tar.gz', 'w:gz') as archive:
-            for name in rental.SOURCES:
+            for name in files:
                 archive.add(source / name, arcname=name)
         job['source_archive_sha256'] = rental.digest(snapshot / 'source.tar.gz')
         runtime = dict.fromkeys(measurement.RUNTIME_FIELDS, 'fixed runtime')
+        if metric == measurement.OLMES_METRIC:
+            runtime.update(tokenizer={'tokenizer.pkl': 'fixture tokenizer'}, olmes=dict(
+                revision=record_run.prepare.OLMES_REVISION,
+                suites=['native qa', 'native math', 'native code'],
+                approved_config_fix={'arc:rc:bpb::olmes:full': {'primary_metric': 'macro'}},
+                native_datasets_sha256='fixed complete native datasets',
+                request_manifest_sha256='fixed full requests', leaf_tasks=109,
+                examples=99886, requests=654536))
         runtime.update(runtime_changes or {})
         (snapshot / 'runtime.json').write_text(json.dumps(runtime))
         job['runtime_manifest_sha256'] = rental.digest(snapshot / 'runtime.json')
@@ -55,6 +70,22 @@ class RecordedDecisionTests(unittest.TestCase):
         (directory / 'run.log').write_text(
             f'val_bpb: {bpb:.17g}\npeak_vram_mb: 45056.0\n'
             'training_seconds: 1800.2\ntotal_seconds: 2500.0\n')
+        if metric == measurement.OLMES_METRIC:
+            values = suites or dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0)
+            with (directory / 'run.log').open('a') as log:
+                for name, value in values.items():
+                    log.write(f'{name}: {value:.17g}\n')
+            (directory / 'final-model.pt').write_bytes(b'own model fixture')
+            (directory / 'olmes-metrics.jsonl').write_text('{"synthetic_native_metrics": true}\n')
+            summary = dict(complete=True, olmes_revision=runtime['olmes']['revision'],
+                           approved_config_fix=runtime['olmes']['approved_config_fix'],
+                           model_source_sha256=job['source_sha256']['train.py'],
+                           native_request_manifest_sha256=runtime['olmes']['request_manifest_sha256'],
+                           tokenizer_sha256=runtime['tokenizer']['tokenizer.pkl'],
+                           suites=values, leaf_tasks=109, examples=99886, requests=654536,
+                           metrics_all_sha256=rental.digest(directory / 'olmes-metrics.jsonl'),
+                           checkpoint_sha256=rental.digest(directory / 'final-model.pt'))
+            (directory / 'olmes-summary.json').write_text(json.dumps(summary))
         return job, directory
 
     def record(self, identifier):
@@ -241,6 +272,87 @@ class RecordedDecisionTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual((records[-1]['status'], records[-1]['val_bpb']), ('keep', 0.9))
         self.assertEqual(self.rows()[-1][6], 'keep')
+
+    def test_decides_by_the_mean_suite_improvement_rate_and_records_val_only_as_reference(self):
+        native = measurement.OLMES_METRIC
+        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
+        self.record('native-baseline')
+        self.make_run('native-gain', 2.0, metric=native,
+                      suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=105.0))
+        gained = self.record('native-gain')
+        self.assertEqual((gained['status'], gained['val_bpb']), ('keep', 2.0))
+        self.make_run('native-loss', 0.1, metric=native,
+                      suites=dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0))
+        self.assertEqual(self.record('native-loss')['status'], 'discard')
+        self.assertEqual([float(value) for value in self.rows()[-2][1:4]], [0.9, 0.9, 105])
+
+    def test_records_complete_native_results_with_an_unavailable_reference_val(self):
+        self.make_run('native-baseline', math.nan, baseline=True, metric=measurement.OLMES_METRIC)
+        record = self.record('native-baseline')
+        self.assertEqual((record['status'], record['val_bpb']), ('keep', None))
+        self.assertEqual(self.rows()[-1][4], '0.000000')
+
+    def test_requires_complete_native_artifacts_and_finite_positive_suite_values(self):
+        native = measurement.OLMES_METRIC
+        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
+        self.record('native-baseline')
+        for identifier, values in (
+            ('missing', dict(qa_bpb=0.9, math_bpb=0.9)),
+            ('nonfinite', dict(qa_bpb=0.9, math_bpb=math.nan, code_bpb=90)),
+            ('zero', dict(qa_bpb=0.9, math_bpb=0, code_bpb=90)),
+        ):
+            self.make_run(identifier, 0.5, metric=native, suites=values)
+            self.assertEqual(self.record(identifier)['status'], 'crash')
+        _, directory = self.make_run('partial', 0.5, metric=native,
+                                     suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        path = directory / 'olmes-summary.json'
+        summary = json.loads(path.read_text())
+        summary['complete'] = False
+        path.write_text(json.dumps(summary))
+        self.assertEqual(self.record('partial')['status'], 'crash')
+
+    def test_uses_the_suite_decision_saved_before_the_measurement(self):
+        native = measurement.OLMES_METRIC
+        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
+        self.record('native-baseline')
+        self.make_run('native-gain', 1.0, metric=native,
+                      suites=dict(qa_bpb=0.99, math_bpb=0.99, code_bpb=99))
+        with patch.object(record_run.prepare, 'suites_improve', return_value=False):
+            self.assertEqual(self.record('native-gain')['status'], 'keep')
+
+    def test_compares_the_first_native_candidates_on_their_shared_val_then_uses_all_suites(self):
+        self.make_run('old-baseline', 0.974083, baseline=True)
+        self.record('old-baseline')
+        native = measurement.OLMES_METRIC
+        runtime = {'gpu_env_sha256': 'combined training and isolated evaluation',
+                   'training_gpu_env_sha256': 'fixed runtime'}
+        self.make_run('first-native-loss', 0.98, metric=native, runtime_changes=runtime)
+        lost = self.record('first-native-loss')
+        self.assertEqual((lost['status'], lost['decision_metric']), ('discard', 'val_bpb'))
+        self.make_run('first-native-gain', 0.97, metric=native, runtime_changes=runtime)
+        gained = self.record('first-native-gain')
+        self.assertEqual((gained['status'], gained['decision_metric']), ('keep', 'val_bpb'))
+        self.make_run('second-native', 0.99, metric=native, runtime_changes=runtime,
+                      suites=dict(qa_bpb=0.99, math_bpb=0.99, code_bpb=99))
+        second = self.record('second-native')
+        self.assertEqual((second['status'], second['decision_metric']), ('keep', native))
+
+    def test_keeps_the_existing_baseline_when_only_native_evaluation_is_added(self):
+        self.make_run('old-baseline', 0.974083, baseline=True)
+        self.record('old-baseline')
+        self.make_run('duplicate-native', 0.97, baseline=True, metric=measurement.OLMES_METRIC)
+        with self.assertRaises(ValueError):
+            self.record('duplicate-native')
+
+    def test_requires_a_complete_native_evaluation_and_common_val_for_the_first_candidate(self):
+        self.make_run('old-baseline', 0.974083, baseline=True)
+        self.record('old-baseline')
+        for identifier, val, suites in (
+            ('missing-reference', math.nan, dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90)),
+            ('missing-suite', 0.9, dict(qa_bpb=0.9, math_bpb=0.9)),
+        ):
+            self.make_run(identifier, val, metric=measurement.OLMES_METRIC, suites=suites)
+            self.assertEqual(self.record(identifier)['status'], 'crash')
 
 
 if __name__ == '__main__':

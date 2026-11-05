@@ -159,6 +159,15 @@ def main():
         atomic_json(config_path, config)
     tasks = config["tasks_config"]
     tokenizer_path = Path(args.tokenizer)
+    tokenizer_sha256 = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
+    existing_report = output / "report.json"
+    if existing_report.exists():
+        recorded = json.loads(existing_report.read_text())
+        expected = {"tokenizer_sha256": tokenizer_sha256, "olmes_revision": OLMES_REVISION,
+                    "max_length": MAX_LENGTH, "batch_size": BATCH_SIZE,
+                    "native_configs_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
+        if any(recorded.get(key) != value for key, value in expected.items()):
+            raise ValueError("Use a separate count directory for different evaluation inputs.")
     tokenizer = TokenizerAdapter(tokenizer_path, MAX_LENGTH)
     observer = TokenObserver(tokenizer)
     report = {
@@ -166,7 +175,7 @@ def main():
         "olmes_revision": OLMES_REVISION,
         "suites": list(SUITES), "expected_leaf_tasks": len(tasks),
         "native_configs_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
-        "tokenizer_sha256": hashlib.sha256(tokenizer_path.read_bytes()).hexdigest(),
+        "tokenizer_sha256": tokenizer_sha256,
         "max_length": MAX_LENGTH, "batch_size": BATCH_SIZE,
         "add_bos_token": False, "logits_cache": True,
         "quality_evaluations": 0, "model_weights_loaded": False,

@@ -11,6 +11,7 @@ import time
 
 from oe_eval import run_eval
 from oe_eval.components.instances import RequestInstance
+from oe_eval.components.requests import GenerateUntilAndLoglikelihoodRequest
 from oe_eval.utils import hash_dict, save_jsonl
 
 from evaluation.count_tokens import OLMES_REVISION, SUITES
@@ -39,7 +40,17 @@ def read_requests(directory, entry):
             raw.append(json.loads(line))
     if digest.hexdigest() != entry["uncompressed_requests_sha256"] or len(raw) != entry["requests"]:
         raise ValueError("The native request payload differs from its CPU preparation.")
-    return raw, [RequestInstance.from_dict(instance) for instance in raw]
+    instances = []
+    for item in raw:
+        if item["request_type"] == "loglikelihood" and "perplexity_context" in item["request"]:
+            # Native gold-BPB tasks retain their richer generation request object.
+            # Restore that original class and every field while keeping its likelihood request type.
+            values = dict(item)
+            values["request"] = GenerateUntilAndLoglikelihoodRequest(**item["request"])
+            instances.append(RequestInstance(**values))
+        else:
+            instances.append(RequestInstance.from_dict(item))
+    return raw, instances
 
 
 def score_task(model, entry, raw_requests, instances, model_config, compute_config):

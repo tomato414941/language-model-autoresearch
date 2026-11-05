@@ -20,7 +20,9 @@ import pickle
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tempfile
+import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 
@@ -64,6 +66,9 @@ FINEMATH_DIR = os.path.join(CACHE_DIR, "finemath")
 COMMON_PILE_REPOSITORY = "common-pile/stackv2_edu_filtered"
 COMMON_PILE_REVISION = "c354dbe88469a1153e97c6a63ac50591849654de"
 COMMON_PILE_DIR = os.path.join(CACHE_DIR, "common_pile", "stackv2_edu_filtered")
+OLMES_REVISION = "5a51f502d463b8cdc4a2dcad7d7096c41ff1197e"
+OLMES_SUITE_FIELDS = ("qa_bpb", "math_bpb", "code_bpb")
+OLMES_REQUEST_DIR = os.path.join(CACHE_DIR, "olmes")
 
 # ---------------------------------------------------------------------------
 # Data download
@@ -540,6 +545,69 @@ def suites_improve(candidate, incumbent):
         rates.append((base - value) / base)
     return sum(rates) / len(rates) > 0
 
+
+def prepare_olmes(count_dir=None, request_dir=None):
+    """Prepare every native suite request on the CPU using the isolated OLMES environment."""
+    root = Path(__file__).resolve().parent
+    executable = os.environ.get("OLMES_PYTHON", str(root / "evaluation/.venv/bin/python"))
+    count_dir = Path(count_dir) if count_dir is not None else root / "results/olmes-token-counts"
+    request_dir = Path(request_dir) if request_dir is not None else Path(OLMES_REQUEST_DIR)
+    common = ["--tokenizer", str(Path(TOKENIZER_DIR) / "tokenizer.pkl")]
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.startswith(("VAST_", "PROCESSING_"))}
+    cache = root / "results/olmes-cache"
+    environment.update(HF_HOME=str(cache), HF_HUB_CACHE=str(cache / "hub"),
+                       HF_DATASETS_CACHE=str(cache / "datasets"))
+    subprocess.run([executable, "-m", "evaluation.count_tokens", "--output", str(count_dir), *common],
+                   cwd=root, env=environment, check=True)
+    subprocess.run([executable, "-m", "evaluation.prepare_requests", "--counts", str(count_dir),
+                    "--output", str(request_dir), *common], cwd=root, env=environment, check=True)
+    return request_dir
+
+
+def evaluate_olmes(model, tokenizer, output_dir="olmes-results"):
+    """Evaluate one fixed checkpoint once, using complete native OLMES scoring and macros."""
+    from evaluation.arc_macro import APPROVED_CONFIG_FIX
+    from evaluation.checkpoint import export_checkpoint
+
+    root = Path(__file__).resolve().parent
+    executable = os.environ.get("OLMES_PYTHON", str(root / "evaluation/.venv/bin/python"))
+    request_dir = Path(os.environ.get("OLMES_REQUEST_DIR", OLMES_REQUEST_DIR))
+    output_dir = Path(output_dir)
+    if not output_dir.is_absolute():
+        output_dir = root / output_dir
+    checkpoint = root / "final-model.pt"
+    if checkpoint.exists() or output_dir.exists():
+        raise FileExistsError("This experiment already has an OLMES evaluation attempt.")
+    source_sha256 = export_checkpoint(model, checkpoint)
+    torch.cuda.empty_cache()
+    parent_vram_mb = torch.cuda.memory_allocated() / 1024 ** 2
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.startswith(("VAST_", "PROCESSING_"))}
+    with (root / "olmes.log").open("x") as log:
+        try:
+            subprocess.run([
+                executable, "-m", "evaluation.run_prepared", "--checkpoint", str(checkpoint),
+                "--tokenizer", str(Path(TOKENIZER_DIR) / "tokenizer.pkl"),
+                "--requests", str(request_dir), "--output", os.path.relpath(output_dir, root),
+            ], cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
+        finally:
+            if output_dir.is_dir():
+                with tarfile.open(root / "olmes-details.tar.gz", "w:gz", compresslevel=1) as archive:
+                    archive.add(output_dir, arcname="olmes-results")
+    summary = json.loads((output_dir / "summary.json").read_text())
+    values = summary["suites"]
+    if (not summary["complete"] or summary["olmes_revision"] != OLMES_REVISION
+            or summary["approved_config_fix"] != APPROVED_CONFIG_FIX
+            or summary["model_source_sha256"] != source_sha256
+            or set(values) != set(OLMES_SUITE_FIELDS)
+            or not all(math.isfinite(value) and value > 0 for value in values.values())):
+        raise ValueError("All three complete native suite results are required.")
+    summary["combined_peak_vram_mb"] = parent_vram_mb + summary["peak_vram_mb"]
+    (root / "olmes-summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
+    shutil.copyfile(output_dir / "metrics-all.jsonl", root / "olmes-metrics.jsonl")
+    return summary
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -556,13 +624,19 @@ def main(argv=None):
                         help="Download Common Pile's educational code into its separate directory.")
     parser.add_argument("--common-pile-shards", type=int, default=1,
                         help="Common Pile training shards (-1 = all); preserve original file licenses.")
+    parser.add_argument("--olmes", action="store_true",
+                        help="Prepare all three pinned OLMES suites on the CPU before rental.")
+    parser.add_argument("--olmes-counts-dir", default=None,
+                        help="Reuse or write complete native CPU token counts in this directory.")
     args = parser.parse_args(argv)
 
-    if args.finemath or args.common_pile:
+    if args.finemath or args.common_pile or args.olmes:
         for subset in args.finemath:
             download_finemath(subset, args.finemath_shards, args.download_workers)
         if args.common_pile:
             download_common_pile(args.common_pile_shards, args.download_workers)
+        if args.olmes:
+            prepare_olmes(count_dir=args.olmes_counts_dir)
         return
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
