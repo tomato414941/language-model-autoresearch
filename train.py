@@ -28,13 +28,29 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import (
-    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb,
+    MAX_SEQ_LEN, TIME_BUDGET, Tokenizer as BaseTokenizer, evaluate_bpb,
     evaluate_core, save_core_results, verify_core_assets, _document_batches,
 )
 
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
+
+class Tokenizer(BaseTokenizer):
+    def encode(self, text, prepend=None, num_threads=8):
+        # Avoid per-call thread-pool setup for small inference batches.
+        # https://github.com/openai/tiktoken/blob/0.14.0/tiktoken/core.py
+        if isinstance(text, list) and len(text) <= 4 and num_threads == 8:
+            ids = [self.enc.encode_ordinary(item) for item in text]
+            if prepend is not None:
+                prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+                for row in ids:
+                    row.insert(0, prepend_id)
+            return ids
+        return super().encode(text, prepend=prepend, num_threads=num_threads)
+
+    __call__ = encode
+
 
 @dataclass
 class GPTConfig:
