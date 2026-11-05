@@ -267,19 +267,40 @@ def ssh_connection(instance, key, prefer_direct=True):
 
 def record_gpu_observation(remote, destination):
     observation = dict(observed_at=time.time())
+    sample_deadline = time.monotonic() + 5
     try:
-        result = remote(
-            'nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv,noheader,nounits',
-            timeout=5, capture_output=True, text=True,
-        )
+        try:
+            result = remote(
+                'nvidia-smi --query-gpu=name,memory.used,utilization.gpu,clocks.sm,clocks.max.sm,'
+                'clocks.mem,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits',
+                timeout=5, capture_output=True, text=True,
+            )
+        except (subprocess.SubprocessError, OSError) as error:
+            remaining = sample_deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            observation['extended_error_type'] = type(error).__name__
+            result = remote(
+                'nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv,noheader,nounits',
+                timeout=remaining, capture_output=True, text=True,
+            )
         rows = list(csv.reader(result.stdout.splitlines()))
-        if len(rows) != 1 or len(rows[0]) != 3:
+        if len(rows) != 1 or len(rows[0]) not in (3, 9):
             raise ValueError('Expected one GPU observation.')
-        name, memory, utilization = rows[0]
+        name, memory, utilization = rows[0][:3]
         memory, utilization = float(memory), float(utilization)
         if not (math.isfinite(memory) and memory >= 0 and 0 <= utilization <= 100):
             raise ValueError('Invalid GPU observation.')
         observation.update(gpu_name=name.strip(), memory_mib=memory, utilization_percent=utilization)
+        optional_fields = ('sm_clock_mhz', 'max_sm_clock_mhz', 'memory_clock_mhz',
+                           'power_draw_w', 'power_limit_w', 'temperature_c')
+        for index, field in enumerate(optional_fields, start=3):
+            try:
+                value = float(rows[0][index])
+                value = value if math.isfinite(value) and value >= 0 else None
+            except (IndexError, ValueError):
+                value = None
+            observation[field] = value
     except (subprocess.SubprocessError, OSError, ValueError) as error:
         # Optional telemetry never changes the training lifecycle or decision.
         observation['error_type'] = type(error).__name__

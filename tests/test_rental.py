@@ -355,6 +355,46 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(samples[0]['error_type'], 'ValueError')
         self.assertEqual(samples[1]['utilization_percent'], 90)
 
+    def test_records_gpu_clocks_power_limit_and_temperature_with_utilization(self):
+        remote = Mock(return_value=subprocess.CompletedProcess([], 0,
+            stdout='NVIDIA H100 80GB HBM3, 45060, 96, 1980, 1980, 2619, 420.5, 700, 61\n'))
+        rental.record_gpu_observation(remote, self.root)
+        sample = json.loads((self.root / 'gpu-observations.jsonl').read_text())
+        expected = dict(memory_mib=45060, utilization_percent=96, sm_clock_mhz=1980,
+                        max_sm_clock_mhz=1980, memory_clock_mhz=2619,
+                        power_draw_w=420.5, power_limit_w=700, temperature_c=61)
+        for field, value in expected.items():
+            self.assertEqual(sample[field], value)
+
+    def test_preserves_basic_measurements_when_optional_sensors_are_unavailable(self):
+        remote = Mock(return_value=subprocess.CompletedProcess([], 0,
+            stdout='NVIDIA H100 80GB HBM3, 45060, 96, N/A, N/A, nan, inf, -1, N/A\n'))
+        rental.record_gpu_observation(remote, self.root)
+        sample = json.loads((self.root / 'gpu-observations.jsonl').read_text())
+        self.assertEqual((sample['memory_mib'], sample['utilization_percent']), (45060, 96))
+        for field in ('sm_clock_mhz', 'max_sm_clock_mhz', 'memory_clock_mhz',
+                      'power_draw_w', 'power_limit_w', 'temperature_c'):
+            self.assertIsNone(sample[field])
+
+    def test_recovers_basic_telemetry_within_the_same_sample_budget_after_an_unsupported_query(self):
+        remote = Mock(side_effect=[subprocess.CalledProcessError(1, 'nvidia-smi'),
+                                  subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, 96\n')])
+        with patch.object(rental.time, 'monotonic', side_effect=[100, 102]):
+            rental.record_gpu_observation(remote, self.root)
+        sample = json.loads((self.root / 'gpu-observations.jsonl').read_text())
+        self.assertEqual(sample['extended_error_type'], 'CalledProcessError')
+        self.assertEqual((sample['memory_mib'], sample['utilization_percent']), (45060, 96))
+        self.assertIsNone(sample['power_draw_w'])
+        self.assertEqual(remote.call_args.kwargs['timeout'], 3)
+
+    def test_keeps_a_sample_timeout_when_its_fallback_budget_is_exhausted(self):
+        remote = Mock(side_effect=subprocess.TimeoutExpired('nvidia-smi', 5))
+        with patch.object(rental.time, 'monotonic', side_effect=[100, 105]):
+            rental.record_gpu_observation(remote, self.root)
+        sample = json.loads((self.root / 'gpu-observations.jsonl').read_text())
+        self.assertEqual(sample['error_type'], 'TimeoutExpired')
+        remote.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()
