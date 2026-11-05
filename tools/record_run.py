@@ -14,7 +14,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import prepare
-from tools import rental
+from tools import measurement, rental
 
 HEADER = ['commit', 'core_metric', 'val_bpb', 'memory_gb', 'status', 'description']
 
@@ -57,13 +57,24 @@ def read_metrics(job, directory):
 def decide(job, directory, incumbent):
     frame = {name: job['source_sha256'][name] for name in rental.FRAME_SOURCES}
     frame['gpu_name'] = job['gpu_name']
-    if incumbent and frame != incumbent['frame'] and not job['baseline']:
-        raise ValueError('A candidate requires a baseline measured under the same frame.')
-    if job['baseline'] and incumbent and frame == incumbent['frame']:
-        raise ValueError('This frame already has a baseline; do not replace it with another run.')
+    conditions = measurement.from_snapshot(job, rental.job_path(job['id']).parent)
+    previous = None
+    if incumbent:
+        previous_job = rental.load(incumbent['id'])
+        previous_frame = {name: previous_job['source_sha256'][name] for name in rental.FRAME_SOURCES}
+        previous_frame['gpu_name'] = previous_job['gpu_name']
+        if previous_frame != incumbent['frame']:
+            raise ValueError('The incumbent source provenance differs from its recorded frame.')
+        previous = measurement.from_snapshot(previous_job, rental.job_path(previous_job['id']).parent)
+        if incumbent.get('measurement', previous) != previous:
+            raise ValueError('The incumbent measurement differs from its recorded identity.')
+    if previous and conditions != previous and not job['baseline']:
+        raise ValueError('A candidate requires a baseline under the same measurement conditions.')
+    if job['baseline'] and previous and conditions == previous:
+        raise ValueError('This measurement already has a baseline; do not repeat it for a rule change.')
     if not job['baseline'] and incumbent is None:
         raise ValueError('Record a successful baseline before deciding on candidates.')
-    record = dict(id=job['id'], commit=job['commit'], frame=frame, recorded_at=time.time(),
+    record = dict(id=job['id'], commit=job['commit'], frame=frame, measurement=conditions, recorded_at=time.time(),
                   description=' '.join(job['description'].split()),
                   incumbent=None if job['baseline'] else incumbent['id'])
     try:

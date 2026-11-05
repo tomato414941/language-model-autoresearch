@@ -5,11 +5,12 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
 import prepare
-from tools import record_run, rental
+from tools import measurement, record_run, rental
 
 
 class RecordedDecisionTests(unittest.TestCase):
@@ -29,11 +30,28 @@ class RecordedDecisionTests(unittest.TestCase):
             item.stop()
         self.directory.cleanup()
 
-    def make_run(self, identifier, core, bpb, baseline=False):
+    def make_run(self, identifier, core, bpb, baseline=False, *, rules='fixture rules',
+                 measurement_source=None, gpu_name='H100 SXM', runtime_changes=None):
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
-                   source_sha256=dict.fromkeys(rental.FRAME_SOURCES, 'frozen'),
-                   gpu_name='H100 SXM', phase='evaluated', exit_code=0)
-        rental.job_path(identifier).parent.mkdir(parents=True)
+                   gpu_name=gpu_name, phase='evaluated', exit_code=0)
+        snapshot = rental.job_path(identifier).parent
+        source = snapshot / 'source'
+        source.mkdir(parents=True)
+        files = {'train.py': 'MODEL_WIDTH = 64\n', 'program.md': rules,
+                 'prepare.py': measurement_source or
+                 "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 22\n",
+                 'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
+        for name, text in files.items():
+            (source / name).write_text(text)
+        job['source_sha256'] = {name: rental.digest(source / name) for name in rental.SOURCES}
+        with tarfile.open(snapshot / 'source.tar.gz', 'w:gz') as archive:
+            for name in rental.SOURCES:
+                archive.add(source / name, arcname=name)
+        job['source_archive_sha256'] = rental.digest(snapshot / 'source.tar.gz')
+        runtime = dict.fromkeys(measurement.RUNTIME_FIELDS, 'fixed runtime')
+        runtime.update(runtime_changes or {})
+        (snapshot / 'runtime.json').write_text(json.dumps(runtime))
+        job['runtime_manifest_sha256'] = rental.digest(snapshot / 'runtime.json')
         rental.save(job)
         directory = self.root / 'results/runs' / identifier
         directory.mkdir(parents=True)
@@ -108,31 +126,80 @@ class RecordedDecisionTests(unittest.TestCase):
                     (directory / 'core.csv').write_text('incomplete\n')
                 self.assertEqual(self.record(job['id'])['status'], 'crash')
 
-    def test_requires_a_new_baseline_after_an_experiment_frame_change(self):
+    def test_requires_one_new_baseline_when_the_measurement_changes(self):
         self.make_run('baseline', 0.12, 1.0, baseline=True)
         self.record('baseline')
-        job, _ = self.make_run('candidate', 0.15, 0.9)
-        job['source_sha256']['program.md'] = 'changed frame'
-        rental.save(job)
+        changed = "DATA_REVISION = 'changed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 22\n"
+        self.make_run('candidate', 0.15, 0.9, measurement_source=changed)
         with self.assertRaises(ValueError):
             self.record('candidate')
 
-        job, _ = self.make_run('new-baseline', 0.11, 1.0, baseline=True)
-        job['source_sha256']['program.md'] = 'changed frame'
-        rental.save(job)
+        self.make_run('new-baseline', 0.11, 1.0, baseline=True, measurement_source=changed)
         self.assertEqual(self.record('new-baseline')['status'], 'keep')
-        job, _ = self.make_run('new-candidate', 0.1101, 1.5)
-        job['source_sha256']['program.md'] = 'changed frame'
-        rental.save(job)
+        self.make_run('new-candidate', 0.1101, 1.5, measurement_source=changed)
         record = self.record('new-candidate')
         self.assertEqual(record['status'], 'keep')
         self.assertEqual(record['incumbent'], 'new-baseline')
 
-        job, _ = self.make_run('duplicate-baseline', 0.13, 0.5, baseline=True)
-        job['source_sha256']['program.md'] = 'changed frame'
-        rental.save(job)
+        self.make_run('duplicate-baseline', 0.13, 0.5, baseline=True, measurement_source=changed)
         with self.assertRaises(ValueError):
             self.record('duplicate-baseline')
+
+    def test_keeps_the_existing_measurement_after_rule_and_adoption_policy_changes(self):
+        original = "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\nCORE_MIN_DELTA = 0.01\ndef core_improves(a, b):\n    return a - b >= CORE_MIN_DELTA\ndef evaluate_core():\n    return 22\n"
+        revised = "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef core_improves(a, b):\n    return a > b\ndef evaluate_core():\n    return 22\n"
+        self.make_run('baseline', 0.12, 1.0, baseline=True, measurement_source=original)
+        baseline = self.record('baseline')
+        ledger = self.root / 'results/decisions.json'
+        legacy = json.loads(ledger.read_text())
+        legacy[0].pop('measurement')
+        ledger.write_text(json.dumps(legacy))
+        self.make_run('candidate', 0.1201, 1.5, rules='measure once', measurement_source=revised)
+        candidate = self.record('candidate')
+        self.assertEqual(candidate['status'], 'keep')
+        self.assertEqual(candidate['incumbent'], 'baseline')
+        self.assertEqual(candidate['measurement'], baseline['measurement'])
+        self.assertEqual(json.loads(ledger.read_text())[0], legacy[0])
+        self.make_run('repeat-baseline', 0.14, 0.5, baseline=True,
+                      rules='more rule changes', measurement_source=revised)
+        with self.assertRaises(ValueError):
+            self.record('repeat-baseline')
+
+    def test_requires_matching_evaluation_time_gpu_and_runtime_for_candidate_comparisons(self):
+        self.make_run('baseline', 0.12, 1.0, baseline=True)
+        self.record('baseline')
+        variants = [
+            ('evaluation', {'measurement_source': "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 23\n"}),
+            ('time', {'measurement_source': "DATA_REVISION = 'fixed'\nTIME_BUDGET = 900\ndef evaluate_core():\n    return 22\n"}),
+            ('gpu', {'gpu_name': 'different GPU'}),
+            ('runtime', {'runtime_changes': {'kernel_revision': 'different kernel'}}),
+        ]
+        for name, changes in variants:
+            with self.subTest(name=name):
+                self.make_run(name, 0.13, 0.9, **changes)
+                with self.assertRaises(ValueError):
+                    self.record(name)
+
+    def test_accepts_tokenizer_asset_changes_as_a_model_choice_under_the_same_measurement(self):
+        self.make_run('baseline', 0.12, 1.0, baseline=True,
+                      runtime_changes={'gpu_assets_sha256': 'first tokenizer'})
+        baseline = self.record('baseline')
+        self.make_run('candidate', 0.1201, 1.5,
+                      runtime_changes={'gpu_assets_sha256': 'different tokenizer'})
+        candidate = self.record('candidate')
+        self.assertEqual(candidate['status'], 'keep')
+        self.assertEqual(candidate['measurement'], baseline['measurement'])
+
+    def test_checks_archived_source_and_runtime_against_their_recorded_hashes(self):
+        self.make_run('baseline', 0.12, 1.0, baseline=True)
+        self.record('baseline')
+        for name, filename in (('source', 'source.tar.gz'), ('runtime', 'runtime.json')):
+            with self.subTest(name=name):
+                self.make_run(name, 0.13, 0.9)
+                path = rental.job_path(name).parent / filename
+                path.write_bytes(path.read_bytes() + b'changed')
+                with self.assertRaises(ValueError):
+                    self.record(name)
 
     def test_observes_an_unfinished_job_without_prematurely_recording_a_failure(self):
         self.make_run('baseline', 0.12, 1.0, baseline=True)
