@@ -4,10 +4,38 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from tools.softmax_candidates import build_candidates
+from tools.softmax_candidates import build_candidate_batch, build_candidates
 
 
 class SoftmaxCandidateTests(unittest.TestCase):
+    def test_prepares_uniform_chunks_and_preserves_every_target_in_an_uneven_batch(self):
+        targets = np.array([[1, 7, -1, 3, 1], [7, 5, 2, -1, 5]])
+        result = build_candidate_batch(targets, 16, 8, chunk_size=3, offset=5)
+        self.assertFalse(result.fallback)
+        self.assertEqual(result.token_ids.shape, (4, 8))
+        self.assertEqual(result.target_positions.shape, targets.shape)
+        flat = targets.reshape(-1)
+        mapped = result.target_positions.reshape(-1)
+        for index, start in enumerate(range(0, len(flat), 3)):
+            values = flat[start:start + 3]
+            positions = mapped[start:start + 3]
+            valid = values != -1
+            np.testing.assert_array_equal(result.token_ids[index][positions[valid]], values[valid])
+            np.testing.assert_array_equal(positions[~valid], np.full((~valid).sum(), -1))
+
+    def test_uses_one_full_batch_mode_when_any_chunk_needs_the_full_vocabulary(self):
+        targets = np.array([1, 1, 1, 2, 3, 4, -1])
+        result = build_candidate_batch(targets, 8, 2, chunk_size=3, offset=5)
+        self.assertTrue(result.fallback)
+        self.assertIsNone(result.token_ids)
+        self.assertIsNone(result.target_positions)
+        np.testing.assert_array_equal(result.distinct_targets, [1, 3, 0])
+        self.assertEqual(result.next_offset, 5)
+        full = build_candidate_batch(targets, 8, 8, chunk_size=3, offset=5)
+        self.assertFalse(full.fallback)
+        self.assertIsNone(full.token_ids)
+        self.assertIsNone(full.target_positions)
+
     def test_includes_every_true_target_and_preserves_order_duplicates_and_ignored_positions(self):
         targets = np.array([[1, 7, -1], [3, 1, 7]], dtype=np.int64)
         result = build_candidates(targets, 16, 8, offset=5)
