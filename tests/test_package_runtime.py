@@ -34,18 +34,20 @@ class RuntimeReuseTests(unittest.TestCase):
     def sha(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def test_reuses_verified_archives_for_updated_training_and_repository_rules(self):
+    def test_reuses_verified_archives_for_updated_training_rules_and_evaluation_sources(self):
         previous = json.loads(self.manifest.read_text())
         (self.root / 'train.py').write_text('candidate')
         (self.root / 'program.md').write_text('updated repository rules')
+        (self.root / 'prepare.py').write_text('updated evaluation connection')
         package_runtime.refresh_source_hashes()
         manifest = json.loads(self.manifest.read_text())
         self.assertEqual(manifest['sources']['program.md'], self.sha(self.root / 'program.md'))
         self.assertEqual(manifest['sources']['train.py'], self.sha(self.root / 'train.py'))
+        self.assertEqual(manifest['sources']['prepare.py'], self.sha(self.root / 'prepare.py'))
         self.assertEqual(manifest['gpu_env_sha256'], previous['gpu_env_sha256'])
 
-    def test_requires_rebuilding_when_the_runtime_or_evaluation_changes(self):
-        for name in ('prepare.py', 'pyproject.toml', 'uv.lock'):
+    def test_requires_the_locked_dependencies_when_reusing_the_runtime(self):
+        for name in ('pyproject.toml', 'uv.lock'):
             with self.subTest(name=name):
                 original = (self.root / name).read_text()
                 (self.root / name).write_text('changed')

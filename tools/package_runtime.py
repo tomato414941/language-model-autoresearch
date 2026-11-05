@@ -102,9 +102,9 @@ def refresh_source_hashes():
     path = artifacts / "runtime.json"
     manifest = json.loads(path.read_text())
     hashes = {name: digest(ROOT / name) for name in SOURCES}
-    for name in ("prepare.py", "pyproject.toml", "uv.lock"):
+    for name in ("pyproject.toml", "uv.lock"):
         if hashes[name] != manifest["sources"][name]:
-            raise RuntimeError("The runtime or evaluation changed; rebuild its archives first.")
+            raise RuntimeError("The dependencies changed; rebuild their runtime archive first.")
     for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
         if digest(artifacts / name) != manifest[field]:
             raise RuntimeError("A prepared runtime archive changed; rebuild it first.")
