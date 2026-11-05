@@ -15,7 +15,7 @@ from torch._higher_order_ops import foreach_map
 torch.set_num_threads(2)
 
 
-def load_model_namespace(path=None):
+def load_model_namespace(path=None, extra_globals=None):
     if path is None:
         path = pathlib.Path(__file__).resolve().parent.parent / 'train.py'
     source = pathlib.Path(path).read_text()
@@ -28,6 +28,7 @@ def load_model_namespace(path=None):
     namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math, 'time': time,
                  'bisect': bisect, 'deque': deque, 'foreach_map': foreach_map,
                  'dataclass': dataclasses.dataclass, 'fa3': types.SimpleNamespace(flash_attn_func=attention)}
+    namespace.update(extra_globals or {})
     exec(compile(ast.fix_missing_locations(tree), 'train.py', 'exec'), namespace)
     return namespace
 
