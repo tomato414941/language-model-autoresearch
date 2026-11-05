@@ -339,6 +339,13 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(sample['error_type'], 'TimeoutExpired')
 
     def test_deploys_a_verified_xz_runtime_with_its_separate_bootstrap_before_one_training_launch(self):
+        self.deploy_xz_runtime('python-xz')
+
+    def test_deploys_the_parallel_bootstrap_decoder_before_one_training_launch(self):
+        commands = self.deploy_xz_runtime('python-xz-mt')
+        self.assertTrue(any('.bootstrap/runtime_unpack.py extract' in text for text in commands))
+
+    def deploy_xz_runtime(self, transport_format):
         artifacts = self.root / 'artifacts'
         artifacts.mkdir()
         for name in ('gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz'):
@@ -347,7 +354,7 @@ class RentalLifecycleTests(unittest.TestCase):
         (snapshot / 'source.tar.gz').write_bytes(b'source fixture')
         (snapshot / 'runtime.json').write_text(json.dumps(dict(
             python_version='3.12.16', gpu_env_sha256='canonical runtime',
-            transport=dict(format='python-xz', canonical_gpu_env_sha256='canonical runtime'))))
+            transport=dict(format=transport_format, canonical_gpu_env_sha256='canonical runtime'))))
         commands, uploads = [], []
 
         def command(arguments, **kwargs):
@@ -370,6 +377,7 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertTrue(any('.bootstrap/.python/' in text for text in commands))
         self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)
         self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+        return commands
 
     def collect_at_boundary(self, exit_bytes, observed=None, fail_refresh=False):
         identifier = f'collection-{self.collection_cases}'

@@ -15,7 +15,7 @@ def deployment_names(manifest):
     transport = manifest.get('transport')
     if transport is None:
         return ('gpu-env.tar.gz', 'gpu-assets.tar.gz')
-    if (transport.get('format') != 'python-xz'
+    if (transport.get('format') not in ('python-xz', 'python-xz-mt')
             or transport.get('canonical_gpu_env_sha256') != manifest['gpu_env_sha256']):
         raise ValueError('The compressed deployment must preserve the canonical runtime.')
     return ('gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz')

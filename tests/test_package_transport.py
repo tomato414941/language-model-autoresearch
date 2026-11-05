@@ -36,7 +36,7 @@ class RuntimeTransportTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def package(self):
+    def package(self, parallel_decoder=False):
         actual = package_transport.subprocess.check_output
 
         def execute(command, **kwargs):
@@ -46,7 +46,8 @@ class RuntimeTransportTests(unittest.TestCase):
 
         with patch.object(package_transport.subprocess, 'check_output', side_effect=execute):
             return package_transport.package(self.reference, self.output, manifest=self.manifest,
-                                             verification_directory=self.root / 'checks', relocation_check=True)
+                                             verification_directory=self.root / 'checks', relocation_check=True,
+                                             parallel_decoder=parallel_decoder)
 
     def test_preserves_all_canonical_bytes_modes_links_and_manifest_identity_after_transcoding(self):
         original_tree = package_transport.tree_identity(self.source)
@@ -64,6 +65,16 @@ class RuntimeTransportTests(unittest.TestCase):
         (self.output / 'gpu-env.tar.xz').write_bytes(b'incomplete transport')
         with self.assertRaisesRegex(ValueError, 'changed'):
             package_transport.attach(self.manifest, report)
+
+    def test_parallel_bootstrap_restores_the_same_runtime_and_records_its_decoder(self):
+        report = self.package(parallel_decoder=True)
+        self.assertEqual(report['runtime_tree'], package_transport.tree_identity(self.source))
+        manifest = json.loads(self.manifest.read_text())
+        self.assertEqual(manifest['gpu_env_sha256'], self.original['gpu_env_sha256'])
+        self.assertEqual(manifest['transport']['format'], 'python-xz-mt')
+        self.assertEqual(manifest['transport']['decoder_source_sha256'],
+                         package_transport.digest(package_transport.ROOT / 'tools/unpack_runtime.py'))
+        self.assertEqual(deployment_names(manifest), ('gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz'))
 
 
 if __name__ == '__main__':

@@ -411,7 +411,12 @@ def execute(job, instance, key):
             if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
                 raise ValueError('Invalid packaged Python version.')
             interpreter = f'.bootstrap/.python/cpython-{version}-linux-x86_64-gnu/bin/python3.12'
-            unpack = 'cd autoresearch && ' + shlex.quote(interpreter) + ' -c ' + shlex.quote(UNPACK_XZ)
+            command = [interpreter]
+            if manifest.get('transport', {}).get('format') == 'python-xz-mt':
+                command += ['.bootstrap/runtime_unpack.py', 'extract']
+            else:
+                command += ['-c', UNPACK_XZ]
+            unpack = 'cd autoresearch && ' + shlex.join(command)
         else:
             unpack = 'tar -xzf - -C autoresearch'
         with path.open('rb') as source:
