@@ -24,6 +24,16 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def native_datasets_identity(tasks):
+    """Identify the complete native task data independently of execution order and tokenizer."""
+    datasets = {entry["alias"]: {name: entry[name] for name in
+                               ("task_hash", "dataset_fingerprints", "examples")}
+                for entry in tasks}
+    if len(datasets) != len(tasks):
+        raise ValueError("Every native task alias must occur exactly once.")
+    return digest(json.dumps(datasets, sort_keys=True, separators=(",", ":")).encode())
+
+
 def prepare_semantics(source, roots=MEASUREMENT_ROOTS):
     """Hash BPB, allowed data and budgets with their transitive module dependencies."""
     tree = ast.parse(source)

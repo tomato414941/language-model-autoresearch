@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.package_runtime import (KERNEL_REPO, KERNEL_REVISION, PYTHON_VERSION, digest,
                                    pack, verify_tokenizer)
+from tools.measurement import native_datasets_identity
 
 
 def run(arguments, **kwargs):
@@ -48,11 +49,7 @@ def package_assets():
             snapshot_download(KERNEL_REPO, revision=KERNEL_REVISION,
                               cache_dir=assets / "hf-cache/hub", allow_patterns=[f"build/{build}/*"])
         assets_sha256 = pack(assets, artifacts / "gpu-assets-olmes.tar.gz")
-    datasets = [{name: entry[name] for name in
-                 ("alias", "task_hash", "dataset_fingerprints", "examples")}
-                for entry in manifest["tasks"]]
-    datasets_sha256 = hashlib.sha256(json.dumps(datasets, sort_keys=True,
-                                              separators=(",", ":")).encode()).hexdigest()
+    datasets_sha256 = native_datasets_identity(manifest["tasks"])
     runtime.update(
         evaluation_metric="olmes_bpb", gpu_env_sha256=staged["gpu_env_sha256"],
         training_gpu_env_sha256=runtime.get("training_gpu_env_sha256", runtime["gpu_env_sha256"]),

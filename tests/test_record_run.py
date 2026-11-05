@@ -364,6 +364,15 @@ class RecordedDecisionTests(unittest.TestCase):
         self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.95))
         self.assertEqual(self.rows()[-1][1:4], ['0.000000'] * 3)
 
+    def test_recognizes_the_same_native_task_data_in_a_different_execution_order(self):
+        tasks = [dict(alias=name, task_hash={'hash': name}, dataset_fingerprints={'test': 'fixed'},
+                      examples=100, requests_sha256='first tokenizer payload') for name in ('qa', 'math')]
+        first = measurement.native_datasets_identity(tasks)
+        changed_order = [dict(entry, requests_sha256='another tokenizer payload') for entry in reversed(tasks)]
+        self.assertEqual(measurement.native_datasets_identity(changed_order), first)
+        changed_data = [dict(entry, dataset_fingerprints={'test': 'different'}) for entry in tasks]
+        self.assertNotEqual(measurement.native_datasets_identity(changed_data), first)
+
 
 if __name__ == '__main__':
     unittest.main()
