@@ -21,6 +21,7 @@ class PromptPrepared(Exception):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'results/core-preflight.json')
+    parser.add_argument('--tokenizer-directory', type=Path)
     parser.add_argument('--inspect-spans', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(2)
@@ -28,7 +29,8 @@ def main():
     evaluator = prepare._load_nanochat_core()
     core_globals = evaluator.__globals__["evaluate_task"].__globals__
     evaluate_example = core_globals["evaluate_example"]
-    tokenizer = prepare.Tokenizer.from_directory()
+    tokenizer_directory = args.tokenizer_directory or Path(prepare.TOKENIZER_DIR)
+    tokenizer = prepare.Tokenizer.from_directory(tokenizer_directory)
     records = []
     active_record = [None]
     active_example = [None]
@@ -103,7 +105,7 @@ def main():
     report = dict(
         nanochat_revision=prepare.CORE_NANOCHAT_REVISION,
         bundle_sha256=prepare.CORE_BUNDLE_SHA256,
-        tokenizer_sha256=prepare._file_sha256(Path(prepare.TOKENIZER_DIR) / "tokenizer.pkl"),
+        tokenizer_sha256=prepare._file_sha256(tokenizer_directory / "tokenizer.pkl"),
         tasks=records,
         total_examples=sum(record["examples"] for record in records),
         total_input_sequences=sum(record['input_sequences'] for record in records),
