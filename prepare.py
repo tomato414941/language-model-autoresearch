@@ -15,15 +15,6 @@ import time
 import math
 import argparse
 import pickle
-import ast
-import csv
-import hashlib
-import importlib.util
-import json
-import random
-import tempfile
-import zipfile
-from decimal import Decimal
 from multiprocessing import Pool
 
 import requests
@@ -58,149 +49,6 @@ SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| 
 
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
-
-# The evaluation frame is pinned before the baseline and only changed by the user.
-CORE_DIR = os.path.join(CACHE_DIR, "core")
-CORE_NANOCHAT_REVISION = "92d63d4e8bb4df75c3b71618f31ddde2378b2bcd"
-CORE_SOURCE_SHA256 = {
-    "nanochat/core_eval.py": "9303997ff17fa48ad5e5730f33b7e79a687cc2a1fdad928666bb63dc3514c51d",
-    "scripts/base_eval.py": "644083a99ded710f677b25168ca76fd0416dc7ef3890d346a72f76a20bb522fe",
-    "LICENSE": "42bb09f339a8af8b90d3b4969b6f6e4ba4aff3b5c614103b031fccdf71c8f772",
-}
-CORE_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
-CORE_BUNDLE_SHA256 = "90a7c19e28ee7a52b4f6e1f87658deb9fde7f63deba2379045bdb1fe9ea5d200"
-
-
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _verify_core_file(path, expected):
-    if not os.path.isfile(path) or _file_sha256(path) != expected:
-        raise RuntimeError(f"CORE asset is missing or changed: {path}. Run prepare.py on the processing server.")
-
-
-def _download_core_file(url, path, expected):
-    if os.path.exists(path):
-        _verify_core_file(path, expected)
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp_path = path + ".tmp"
-    try:
-        with requests.get(url, stream=True, timeout=60) as response:
-            response.raise_for_status()
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-        _verify_core_file(temp_path, expected)
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def _core_source_dir():
-    return os.path.join(CORE_DIR, "nanochat", CORE_NANOCHAT_REVISION)
-
-
-def verify_core_assets():
-    import yaml
-
-    for name, expected in CORE_SOURCE_SHA256.items():
-        _verify_core_file(os.path.join(_core_source_dir(), name), expected)
-    bundle_path = os.path.join(CORE_DIR, "eval_bundle.zip")
-    _verify_core_file(bundle_path, CORE_BUNDLE_SHA256)
-    with zipfile.ZipFile(bundle_path) as archive:
-        tasks = yaml.safe_load(archive.read("eval_bundle/core.yaml"))["icl_tasks"]
-        if len(tasks) != 22 or len({task["label"] for task in tasks}) != 22:
-            raise RuntimeError("CORE requires all 22 upstream tasks.")
-        names = ["core.yaml", "eval_meta_data.csv"]
-        names.extend("eval_data/" + task["dataset_uri"] for task in tasks)
-        for name in names:
-            expected = hashlib.sha256(archive.read("eval_bundle/" + name)).hexdigest()
-            _verify_core_file(os.path.join(CORE_DIR, "eval_bundle", name), expected)
-    return tasks
-
-
-def prepare_core():
-    """Prepare the unchanged nanochat evaluator and its complete official bundle on CPU."""
-    source_url = f"https://raw.githubusercontent.com/karpathy/nanochat/{CORE_NANOCHAT_REVISION}"
-    for name, expected in CORE_SOURCE_SHA256.items():
-        _download_core_file(f"{source_url}/{name}", os.path.join(_core_source_dir(), name), expected)
-    bundle_path = os.path.join(CORE_DIR, "eval_bundle.zip")
-    _download_core_file(CORE_BUNDLE_URL, bundle_path, CORE_BUNDLE_SHA256)
-    bundle_dir = os.path.join(CORE_DIR, "eval_bundle")
-    if not os.path.exists(bundle_dir):
-        with tempfile.TemporaryDirectory(dir=CORE_DIR) as temp_dir:
-            with zipfile.ZipFile(bundle_path) as archive:
-                archive.extractall(temp_dir)
-            os.rename(os.path.join(temp_dir, "eval_bundle"), bundle_dir)
-    tasks = verify_core_assets()
-    print(f"CORE: all {len(tasks)} upstream tasks ready (nanochat {CORE_NANOCHAT_REVISION})")
-
-
-def _load_nanochat_core():
-    import yaml
-
-    source_dir = _core_source_dir()
-    core_path = os.path.join(source_dir, "nanochat", "core_eval.py")
-    spec = importlib.util.spec_from_file_location("_nanochat_core_eval", core_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    # Load the original aggregation function without importing nanochat's training stack.
-    # Both complete source files are byte-for-byte upstream files, verified before loading.
-    runner_path = os.path.join(source_dir, "scripts", "base_eval.py")
-    with open(runner_path, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename=runner_path)
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "evaluate_core")
-    namespace = dict(os=os, csv=csv, time=time, json=json, random=random, yaml=yaml,
-                     get_base_dir=lambda: CORE_DIR, print0=print, evaluate_task=module.evaluate_task)
-    exec(compile(ast.Module(body=[function], type_ignores=[]), runner_path, "exec"), namespace)
-    return namespace["evaluate_core"]
-
-
-@torch.no_grad()
-def evaluate_core(model, tokenizer, device):
-    """Run nanochat CORE once, with all examples, original prompts and original scoring."""
-    tasks = verify_core_assets()
-    evaluator = _load_nanochat_core()
-    # Eager execution avoids compiling a different graph for every evaluation prompt.
-    model = getattr(model, "_orig_mod", model)
-    result = evaluator(model, tokenizer, device, max_per_task=-1)
-    labels = {task["label"] for task in tasks}
-    if set(result["results"]) != labels or set(result["centered_results"]) != labels:
-        raise RuntimeError("CORE did not finish all 22 tasks.")
-    scores = [result["core_metric"], *result["results"].values(), *result["centered_results"].values()]
-    if not all(math.isfinite(score) for score in scores):
-        raise RuntimeError("CORE produced a non-finite score.")
-    return result
-
-
-def save_core_results(result, directory="results"):
-    """Preserve nanochat's result dictionary and its native per-task CSV format."""
-    os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "core.json"), "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, allow_nan=False)
-        f.write("\n")
-    with open(os.path.join(directory, "core.csv"), "w", encoding="utf-8", newline="") as f:
-        f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
-        for label in result["results"]:
-            acc = result["results"][label]
-            centered = result["centered_results"][label]
-            f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-        f.write(f"{'CORE':<35}, {'':<10}, {result['core_metric']:<10.6f}\n")
-
-
-def core_improves(candidate, incumbent):
-    """Adopt a candidate whose unrounded CORE score is higher than the incumbent's."""
-    if not math.isfinite(candidate) or not math.isfinite(incumbent):
-        raise ValueError("A CORE decision requires two finite scores.")
-    return Decimal(str(candidate)) > Decimal(str(incumbent))
 
 # ---------------------------------------------------------------------------
 # Data download
@@ -396,9 +244,6 @@ class Tokenizer:
     def decode(self, ids):
         return self.enc.decode(ids)
 
-    # nanochat calls the tokenizer directly; use the exact same encoding method.
-    __call__ = encode
-
 
 def get_token_bytes(device="cpu"):
     path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
@@ -519,6 +364,13 @@ def evaluate_bpb(model, tokenizer, batch_size):
         total_bytes += nbytes.sum().item()
     return total_nats / (math.log(2) * total_bytes)
 
+
+def bpb_improves(candidate, incumbent):
+    """Keep a candidate whose finite val_bpb is lower than the incumbent's."""
+    if not math.isfinite(candidate) or not math.isfinite(incumbent):
+        raise ValueError("A val_bpb decision requires two finite values.")
+    return candidate < incumbent
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -527,12 +379,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument("--num-shards", type=int, default=70, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    parser.add_argument("--core-only", action="store_true", help="Prepare only the pinned CORE evaluation assets")
     args = parser.parse_args()
-
-    if args.core_only:
-        prepare_core()
-        sys.exit(0)
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
@@ -545,9 +392,5 @@ if __name__ == "__main__":
 
     # Step 2: Train tokenizer
     train_tokenizer()
-    print()
-
-    # Step 3: Prepare the complete public CORE evaluation before renting the GPU.
-    prepare_core()
     print()
     print("Done! Ready to train.")
