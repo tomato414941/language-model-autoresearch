@@ -240,7 +240,7 @@ def choose_offer():
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
              'gpu_name': {'eq': 'H100 SXM'}, 'gpu_ram': {'gte': 79000},
              'cpu_ram': {'gte': 32000}, 'cpu_cores_effective': {'gte': 12}, 'disk_space': {'gte': 90},
-             'inet_down': {'gte': 800}, 'reliability2': {'gte': 0.98}, 'cuda_max_good': {'gte': 12.8},
+             'inet_down': {'gte': 800}, 'reliability2': {'gte': 0.93}, 'cuda_max_good': {'gte': 12.8},
              'order': [['dph_total', 'asc']], 'type': 'ondemand', 'allocated_storage': 90, 'limit': 20}
     offers = [row for row in api('POST', 'bundles/', query)['offers']
               if row.get('num_gpus') == 1 and row.get('gpu_name') == 'H100 SXM'
@@ -429,7 +429,8 @@ def start(job):
     if offer['dph_total'] > job['max_hourly_cost']:
         raise RuntimeError('The current H100 offer exceeds the prepared cost limit.')
     job.update(requested_at=time.time(), expires_at=time.time() + LEASE_SECONDS - CLEANUP_SECONDS,
-               phase='arming', gpu_name=offer['gpu_name'])
+               phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
+               hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'))
     save(job)
     arm_expiry(job)
     job.update(phase='creation_requested', creation_uncertain=True, creation_requested_at=time.time())
