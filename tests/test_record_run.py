@@ -65,16 +65,17 @@ class RecordedDecisionTests(unittest.TestCase):
         with (self.root / 'results.tsv').open(newline='') as source:
             return list(csv.reader(source, delimiter='\t'))
 
-    def test_records_one_complete_baseline_and_exports_round_trip_bpb_in_five_columns(self):
+    def test_records_one_complete_baseline_and_exports_reference_bpb_with_unmeasured_qa(self):
         self.make_run('baseline', 0.974083, baseline=True)
         first = self.record('baseline')
         self.assertEqual(first, self.record('baseline'))
         self.assertEqual(first['status'], 'keep')
         rows = self.rows()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0], ['commit', 'val_bpb', 'memory_gb', 'status', 'description'])
-        self.assertEqual(float(rows[1][1]), first['val_bpb'])
-        self.assertEqual(len(rows[1]), 5)
+        self.assertEqual(rows[0], ['commit', 'qa_bpb', 'val_bpb', 'memory_gb', 'status', 'description'])
+        self.assertEqual(rows[1][1], 'NA')
+        self.assertEqual(float(rows[1][2]), first['val_bpb'])
+        self.assertEqual(len(rows[1]), 6)
 
     def test_adopts_any_lower_bpb_and_discards_equal_or_higher_bpb(self):
         self.make_run('baseline', 0.974083, baseline=True)
@@ -239,7 +240,7 @@ class RecordedDecisionTests(unittest.TestCase):
         records = json.loads((self.root / 'results/decisions.json').read_text())
         self.assertEqual(len(records), 2)
         self.assertEqual((records[-1]['status'], records[-1]['val_bpb']), ('keep', 0.9))
-        self.assertEqual(self.rows()[-1][3], 'keep')
+        self.assertEqual(self.rows()[-1][4], 'keep')
 
 
 if __name__ == '__main__':

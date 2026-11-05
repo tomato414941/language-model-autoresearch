@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 import prepare
 from tools import measurement, rental
 
-HEADER = ['commit', 'val_bpb', 'memory_gb', 'status', 'description']
+HEADER = ['commit', 'qa_bpb', 'val_bpb', 'memory_gb', 'status', 'description']
 
 
 def read_metrics(job, directory):
@@ -104,7 +104,9 @@ def write_outputs(records):
     writer.writerow(HEADER)
     for row in records:
         writer.writerow([row['commit'][:7],
-                         '0.000000' if row['status'] == 'crash' else format(row['val_bpb'], '.17g'),
+                         ('0.000000' if row['status'] == 'crash' else
+                          'NA' if row.get('qa_bpb') is None else format(row['qa_bpb'], '.17g')),
+                         '0.000000' if row['val_bpb'] is None else format(row['val_bpb'], '.17g'),
                          format(row['memory_gb'], '.1f'), row['status'], row['description']])
     temporary = ROOT / 'results.tsv.tmp'
     temporary.write_text(stream.getvalue())
