@@ -824,7 +824,7 @@ FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
 TAIL_EMA_START = 0.80   # fraction of timed training before averaging begins
 TAIL_EMA_TAU = 0.075    # time constant as a fraction of the fixed training budget
 TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
-OLMES_BATCH_SIZE = 32   # native likelihood examples per inference batch
+OLMES_BATCH_SIZE = 8    # native likelihood examples per inference batch
 
 # Model size
 DEPTH = 8               # number of transformer layers
