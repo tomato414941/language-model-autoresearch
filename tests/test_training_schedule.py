@@ -2,13 +2,15 @@ import ast
 import math
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 
 class TrainingScheduleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
-        constants = {'WARMUP_RATIO', 'WARMDOWN_RATIO', 'FINAL_LR_FRAC', 'WEIGHT_DECAY'}
+        constants = {'WARMUP_RATIO', 'WARMDOWN_RATIO', 'FINAL_LR_FRAC', 'WEIGHT_DECAY',
+                     'TOTAL_BATCH_SIZE', 'BATCH_REFERENCE_SIZE'}
         functions = {'get_lr_multiplier', 'get_muon_momentum', 'get_weight_decay'}
         nodes = [node for node in tree.body if
                  (isinstance(node, ast.Assign) and len(node.targets) == 1 and
@@ -19,10 +21,30 @@ class TrainingScheduleTests(unittest.TestCase):
 
     def test_warms_momentum_before_holding_a_plateau(self):
         momentum = self.namespace['get_muon_momentum']
-        values = [momentum(step, 0.1) for step in (0, 100, 200, 399, 400)]
+        warmup_end = 104857600 // self.namespace['TOTAL_BATCH_SIZE']
+        values = [momentum(step, 0.1) for step in (0, 100, 200, warmup_end - 1, warmup_end)]
         self.assertEqual(values, sorted(values))
         self.assertLess(values[0], values[-1])
-        self.assertEqual(values[-1], momentum(1000, 0.1))
+        self.assertEqual(values[-1], momentum(2 * warmup_end, 0.1))
+
+    def test_keeps_momentum_warmup_at_the_same_processed_token_count(self):
+        momentum = self.namespace['get_muon_momentum']
+        tokens = (0, 26214400, 52428800, 78643200, 104857600, 131072000)
+        for progress in (0.1, 0.8, 1.0):
+            schedules = []
+            for batch in (262144, 131072):
+                with patch.dict(self.namespace, TOTAL_BATCH_SIZE=batch):
+                    schedules.append([momentum(count // batch, progress) for count in tokens])
+            self.assertEqual(schedules[0], schedules[1])
+
+    def test_keeps_nominal_matrix_decay_exposure_per_token(self):
+        decay = self.namespace['get_weight_decay']
+        for progress in (0.0, 0.2, 0.35, 0.8, 1.0):
+            exposures = []
+            for batch in (262144, 131072):
+                with patch.dict(self.namespace, TOTAL_BATCH_SIZE=batch):
+                    exposures.append(decay(progress) / batch)
+            self.assertEqual(exposures[0], exposures[1])
 
     def test_lowers_momentum_during_the_learning_rate_cooldown(self):
         momentum = self.namespace['get_muon_momentum']
@@ -51,7 +73,8 @@ class TrainingScheduleTests(unittest.TestCase):
 
     def test_smoothly_reduces_weight_decay_to_zero(self):
         decay = self.namespace['get_weight_decay']
-        peak = self.namespace['WEIGHT_DECAY']
+        peak = (self.namespace['WEIGHT_DECAY'] * self.namespace['TOTAL_BATCH_SIZE']
+                / self.namespace['BATCH_REFERENCE_SIZE'])
         values = [decay(part / 100) for part in range(101)]
         self.assertEqual(values, sorted(values, reverse=True))
         self.assertEqual(values[0], peak)

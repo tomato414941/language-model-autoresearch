@@ -50,6 +50,27 @@ class BatchSizeTests(unittest.TestCase):
                 torch.testing.assert_close(parent.state[parent_parameter]['exp_avg_sq'],
                     child.state[child_parameter]['exp_avg_sq'], rtol=1e-6, atol=1e-7)
 
+    def test_applies_the_batch_scaled_matrix_decay_with_zero_gradients(self):
+        initial = torch.linspace(-1, 1, 21).reshape(1, 3, 7)
+        results = {}
+        for name, decay, steps in (('parent', 0.28, 1), ('scaled', 0.14, 2), ('unscaled', 0.28, 2)):
+            parameters = initial.clone()
+            gradients = torch.zeros_like(parameters)
+            momentum = torch.zeros_like(parameters)
+            second_moment = torch.zeros(1, 1, 7)
+            for _ in range(steps):
+                self.namespace['muon_step_fused'](gradients, parameters, momentum, second_moment,
+                    torch.tensor(0.95), torch.tensor(0.04), torch.tensor(decay), torch.tensor(0.9), 5, -2)
+            coefficient = float(torch.tensor(0.04, dtype=torch.bfloat16)
+                                * torch.tensor(decay, dtype=torch.bfloat16))
+            torch.testing.assert_close(parameters, initial * (1 - coefficient)**steps,
+                                       rtol=1e-6, atol=1e-7)
+            results[name] = parameters
+        scaled_error = (results['parent'] - results['scaled']).abs().max()
+        unscaled_error = (results['parent'] - results['unscaled']).abs().max()
+        self.assertLess(scaled_error, unscaled_error / 100)
+        self.assertGreater(scaled_error, 0)
+
     def test_trains_one_device_batch_per_update_with_the_production_optimizer_recipe(self):
         namespace = load_model_namespace()
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())

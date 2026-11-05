@@ -695,12 +695,12 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=quarter context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # one device batch, ~131K tokens per optimizer step
-BATCH_REFERENCE_SIZE = 2**18 # parent batch for Adam second-moment token half-lives
+BATCH_REFERENCE_SIZE = 2**18 # parent batch for Adam variance, Muon decay and warmup
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.008  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.28     # cautious weight decay for Muon
+WEIGHT_DECAY = 0.28     # reference-batch cautious weight decay for Muon
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.65   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
@@ -765,7 +765,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
     matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
+    weight_decay=WEIGHT_DECAY * TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE,
 )
 scale_adam_second_moments(optimizer, TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE)
 
@@ -791,8 +791,10 @@ def get_lr_multiplier(progress):
 
 # Momentum recipe: https://github.com/karpathy/nanochat/commit/a825e63f81e62e2e9fd38655e9b2e39417620545
 def get_muon_momentum(step, progress):
-    if step < 400:
-        frac = step / 400
+    warmup_tokens = 400 * BATCH_REFERENCE_SIZE
+    processed_tokens = step * TOTAL_BATCH_SIZE
+    if processed_tokens < warmup_tokens:
+        frac = processed_tokens / warmup_tokens
         return (1 - frac) * 0.85 + frac * 0.97
     warmdown_start = 1.0 - WARMDOWN_RATIO
     if WARMDOWN_RATIO > 0 and progress >= warmdown_start:
@@ -801,7 +803,11 @@ def get_muon_momentum(step, progress):
     return 0.97
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * 0.5 * (1 + math.cos(math.pi * progress))
+    # Preserve nominal decay exposure per token at a fixed learning rate and progress.
+    # Cautious masks and the actual training trajectory can still change.
+    # https://arxiv.org/html/2610.08975v1
+    batch_ratio = TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE
+    return WEIGHT_DECAY * batch_ratio * 0.5 * (1 + math.cos(math.pi * progress))
 
 # ---------------------------------------------------------------------------
 # Training loop
