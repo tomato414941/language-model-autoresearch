@@ -27,7 +27,7 @@ def digest(path):
 
 
 def training_sources(name, count):
-    if count <= 0:
+    if count is not None and count <= 0:
         raise ValueError("Prepare a positive prefix of allowed training shards.")
     if name == "fineweb":
         paths = [Path(path) for path in prepare.list_parquet_files()
@@ -41,7 +41,9 @@ def training_sources(name, count):
         repository, revision = prepare.COMMON_PILE_REPOSITORY, prepare.COMMON_PILE_REVISION
     else:
         raise ValueError("Choose a source allowed by prepare.py.")
-    if len(paths) < count:
+    if count is None:
+        count = len(paths)
+    if not paths or len(paths) < count:
         raise ValueError("Download the requested training-shard prefix before preparing its cache.")
     return paths[:count], dict(name=name, repository=repository, revision=revision)
 
