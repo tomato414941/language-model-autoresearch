@@ -2,6 +2,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -60,17 +61,19 @@ class RecordedDecisionTests(unittest.TestCase):
         self.assertEqual(rows[0], record_run.HEADER)
         self.assertEqual(float(rows[1][1]), first['core_metric'])
 
-    def test_adopts_the_exact_core_boundary_and_discards_a_smaller_gain_regardless_of_reference_bpb(self):
+    def test_adopts_any_unrounded_core_gain_and_discards_ties_or_regressions_regardless_of_reference_bpb(self):
         self.make_run('baseline', 0.12, 1.0, baseline=True)
         self.record('baseline')
-        self.make_run('small-gain', 0.129, 0.5)
-        self.assertEqual(self.record('small-gain')['status'], 'discard')
-        self.make_run('threshold-gain', 0.13, 1.5)
-        self.assertEqual(self.record('threshold-gain')['status'], 'keep')
-        self.make_run('later', 0.135, 0.4)
+        improvement = math.nextafter(0.12, math.inf)
+        self.make_run('small-gain', improvement, 1.5)
+        self.assertEqual(self.record('small-gain')['status'], 'keep')
+        for identifier, core in (('tie', improvement), ('lower', 0.12)):
+            self.make_run(identifier, core, 0.5)
+            self.assertEqual(self.record(identifier)['status'], 'discard')
+        self.make_run('later', 0.1201, 2.0)
         later = self.record('later')
-        self.assertEqual(later['status'], 'discard')
-        self.assertEqual(later['incumbent'], 'threshold-gain')
+        self.assertEqual(later['status'], 'keep')
+        self.assertEqual(later['incumbent'], 'small-gain')
 
     def test_records_failed_attempts_when_native_task_results_are_incomplete_or_nonfinite(self):
         for identifier in ('incomplete', 'nonfinite'):
@@ -113,6 +116,23 @@ class RecordedDecisionTests(unittest.TestCase):
         rental.save(job)
         with self.assertRaises(ValueError):
             self.record('candidate')
+
+        job, _ = self.make_run('new-baseline', 0.11, 1.0, baseline=True)
+        job['source_sha256']['program.md'] = 'changed frame'
+        rental.save(job)
+        self.assertEqual(self.record('new-baseline')['status'], 'keep')
+        job, _ = self.make_run('new-candidate', 0.1101, 1.5)
+        job['source_sha256']['program.md'] = 'changed frame'
+        rental.save(job)
+        record = self.record('new-candidate')
+        self.assertEqual(record['status'], 'keep')
+        self.assertEqual(record['incumbent'], 'new-baseline')
+
+        job, _ = self.make_run('duplicate-baseline', 0.13, 0.5, baseline=True)
+        job['source_sha256']['program.md'] = 'changed frame'
+        rental.save(job)
+        with self.assertRaises(ValueError):
+            self.record('duplicate-baseline')
 
     def test_observes_an_unfinished_job_without_prematurely_recording_a_failure(self):
         self.make_run('baseline', 0.12, 1.0, baseline=True)
