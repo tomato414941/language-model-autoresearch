@@ -12,6 +12,8 @@ from tools import rental
 
 class RentalLifecycleTests(unittest.TestCase):
     def setUp(self):
+        self.hold_patch = patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD': '0'})
+        self.hold_patch.start()
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
         self.root_patch = patch.object(rental, 'ROOT', self.root)
@@ -27,6 +29,17 @@ class RentalLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self.root_patch.stop()
         self.directory.cleanup()
+        self.hold_patch.stop()
+
+    def test_honors_the_users_rental_hold_before_requesting_a_machine(self):
+        job = {**self.job, 'phase': 'prepared'}
+        with patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD': '1'}):
+            with patch.object(rental, 'api') as api:
+                with self.assertRaisesRegex(RuntimeError, 'on hold by user request'):
+                    rental.start(job)
+        api.assert_not_called()
+        self.assertEqual(job['phase'], 'prepared')
+        self.assertNotIn('creation_requested_at', job)
 
     def test_preserves_the_completed_run_when_expiry_updates_its_deletion_state(self):
         rental.save(dict(id='fixture', phase='evaluated', exit_code=0))

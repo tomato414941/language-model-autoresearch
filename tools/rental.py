@@ -492,6 +492,8 @@ def execute(job, instance, key):
 
 
 def start(job):
+    if os.environ.get('AUTORESEARCH_RENTAL_HOLD') == '1':
+        raise RuntimeError('GPU rentals are on hold by user request.')
     if job['phase'] != 'prepared':
         raise RuntimeError('This job already has a creation attempt; observe or expire it instead.')
     profile = profile_for_job(job)
