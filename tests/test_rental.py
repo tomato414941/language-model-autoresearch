@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -194,6 +195,69 @@ class RentalLifecycleTests(unittest.TestCase):
             with self.subTest(estimate=estimate):
                 with self.assertRaises(ValueError):
                     rental.execution_budget(dict(expected_eval_seconds=estimate))
+
+    def test_snapshots_current_sources_with_the_prepared_runtime(self):
+        artifacts = self.root / 'artifacts'
+        artifacts.mkdir()
+        manifest = {'tokenizer': {'fixture': 'tokenizer'}, 'sources': {}}
+        for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'),
+                            ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
+            (artifacts / name).write_bytes(name.encode())
+            manifest[field] = rental.digest(artifacts / name)
+        (artifacts / 'runtime.json').write_text(json.dumps(manifest))
+        for name in rental.SOURCES:
+            (self.root / name).write_text('current ' + name)
+        (self.root / 'tools').mkdir()
+        (self.root / 'tools/gpu_run.sh').write_text('fixture')
+        with patch('tools.package_runtime.verify_tokenizer', return_value=manifest['tokenizer']):
+            with patch('builtins.print'):
+                rental.prepare_job('a' * 40, False, 'fixture')
+        directories = [path for path in (self.root / 'queue').iterdir() if path.name != 'fixture']
+        self.assertEqual(len(directories), 1)
+        directory = directories[0]
+        job = json.loads((directory / 'job.json').read_text())
+        runtime = json.loads((directory / 'runtime.json').read_text())
+        self.assertEqual(runtime['sources'], job['source_sha256'])
+        with tarfile.open(directory / 'source.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('prepare.py').read(), b'current prepare.py')
+
+    def test_rents_the_prepared_snapshot_while_the_working_sources_advance(self):
+        directory = rental.job_path('fixture').parent
+        source = directory / 'source.tar.gz'
+        source.write_bytes(b'prepared experiment')
+        manifest = {'container_image': 'fixture-image'}
+        artifacts = self.root / 'artifacts'
+        artifacts.mkdir()
+        for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'),
+                            ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
+            (artifacts / name).write_bytes(name.encode())
+            manifest[field] = rental.digest(artifacts / name)
+        runtime = directory / 'runtime.json'
+        runtime.write_text(json.dumps(manifest))
+        (artifacts / 'runtime.json').write_text('{"container_image":"later-image"}')
+        for name in rental.SOURCES:
+            (self.root / name).write_text('later ' + name)
+        job = {**self.job, 'phase': 'prepared', 'source_archive_sha256': rental.digest(source),
+               'runtime_manifest_sha256': rental.digest(runtime), 'max_hourly_cost': 5.0}
+        rental.save(job)
+        offer = dict(id=7, gpu_name='H100 SXM', dph_total=4.0)
+        instance = dict(id=42, actual_status='running', ssh_host='fixture')
+        with patch.object(rental, 'check_daily_budget'), \
+                patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
+                patch.object(rental, 'choose_offer', return_value=offer), \
+                patch.object(rental, 'arm_expiry'), \
+                patch.object(rental, 'api', return_value={'success': True, 'new_contract': 42}) as api, \
+                patch.object(rental, 'list_instances', return_value=[instance]), \
+                patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run'), \
+                patch.object(rental, 'execute') as execute, \
+                patch.object(rental, 'finalize') as finalize, \
+                patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
+            rental.start(job)
+        request = api.call_args_list[0]
+        self.assertEqual(request.args[2]['image'], 'fixture-image')
+        execute.assert_called_once()
+        finalize.assert_called_once()
 
     def test_ends_setup_when_transfer_uses_the_time_needed_for_the_full_evaluation(self):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):

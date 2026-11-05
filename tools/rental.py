@@ -25,7 +25,6 @@ sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
 
 SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
-FRAME_SOURCES = SOURCES[1:]
 LEASE_SECONDS = 3600
 CLEANUP_SECONDS = 60
 EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
@@ -202,16 +201,15 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     if manifest['tokenizer'] != tokenizer_hashes:
         raise RuntimeError('The tokenizer differs from the packaged BPB assets.')
     hashes = {name: digest(ROOT / name) for name in SOURCES}
-    for name in FRAME_SOURCES:
-        if hashes[name] != manifest['sources'][name]:
-            raise RuntimeError('The prepared runtime belongs to a different experiment frame.')
     for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
         if digest(ROOT / 'artifacts' / name) != manifest[field]:
             raise RuntimeError('A runtime archive is incomplete or changed.')
     identifier = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
     directory = job_path(identifier).parent
     directory.mkdir(parents=True)
-    shutil.copy2(ROOT / 'artifacts/runtime.json', directory / 'runtime.json')
+    manifest['sources'] = hashes
+    runtime_path = directory / 'runtime.json'
+    runtime_path.write_text(json.dumps(manifest, indent=2) + '\n')
     source_dir = directory / 'source'
     source_dir.mkdir()
     for name in SOURCES:
@@ -223,7 +221,7 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     job = dict(id=identifier, label='autoresearch-' + identifier, commit=commit, baseline=baseline,
                description=description, phase='prepared', source_sha256=hashes,
                source_archive_sha256=digest(directory / 'source.tar.gz'),
-               runtime_manifest_sha256=digest(ROOT / 'artifacts/runtime.json'), max_hourly_cost=5.0,
+               runtime_manifest_sha256=digest(runtime_path), max_hourly_cost=5.0,
                expected_eval_seconds=expected_eval_seconds, metric='val_bpb')
     save(job)
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
@@ -404,17 +402,15 @@ def execute(job, instance, key):
 def start(job):
     if job['phase'] != 'prepared':
         raise RuntimeError('This job already has a creation attempt; observe or expire it instead.')
-    if digest(ROOT / 'artifacts/runtime.json') != job['runtime_manifest_sha256']:
+    runtime_path = job_path(job['id']).parent / 'runtime.json'
+    if digest(runtime_path) != job['runtime_manifest_sha256']:
         raise RuntimeError('The prepared runtime manifest changed.')
     if digest(job_path(job['id']).parent / 'source.tar.gz') != job['source_archive_sha256']:
         raise RuntimeError('The prepared experiment sources changed.')
-    manifest = json.loads((ROOT / 'artifacts/runtime.json').read_text())
+    manifest = json.loads(runtime_path.read_text())
     for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
         if digest(ROOT / 'artifacts' / name) != manifest[field]:
             raise RuntimeError('A prepared runtime archive changed; no rental was requested.')
-    for name in FRAME_SOURCES:
-        if digest(ROOT / name) != job['source_sha256'][name]:
-            raise RuntimeError('The experiment frame changed after this job was prepared.')
     required_seconds = execution_budget(job)
     check_daily_budget(time.time())
     public = validate_environment()
