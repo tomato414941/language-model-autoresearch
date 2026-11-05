@@ -1,0 +1,8 @@
+--- a/oe_eval/configs/task_suites.py
++++ b/oe_eval/configs/task_suites.py
+@@ -131,3 +131,4 @@
+ TASK_SUITE_CONFIGS["arc:rc:bpb::olmes:full"] = {
+-    "tasks": ["arc_easy:rc:bpb::olmes:full", "arc_challenge:rc:bpb::olmes:full"]
++    "tasks": ["arc_easy:rc:bpb::olmes:full", "arc_challenge:rc:bpb::olmes:full"],
++    "primary_metric": "macro",
+ }
