@@ -16,7 +16,8 @@ sys.path.insert(0, str(ROOT))
 import prepare
 from tools import measurement, rental
 
-HEADER = ['commit', 'qa_bpb', 'val_bpb', 'memory_gb', 'status', 'description']
+SUITE_METRICS = ('qa_bpb', 'math_bpb', 'code_bpb')
+HEADER = ['commit', *SUITE_METRICS, 'val_bpb', 'memory_gb', 'status', 'description']
 
 
 def read_metrics(job, directory):
@@ -103,9 +104,11 @@ def write_outputs(records):
     writer = csv.writer(stream, delimiter='\t', lineterminator='\n')
     writer.writerow(HEADER)
     for row in records:
+        suites = [('0.000000' if row['status'] == 'crash' else
+                   'NA' if row.get(name) is None else format(row[name], '.17g'))
+                  for name in SUITE_METRICS]
         writer.writerow([row['commit'][:7],
-                         ('0.000000' if row['status'] == 'crash' else
-                          'NA' if row.get('qa_bpb') is None else format(row['qa_bpb'], '.17g')),
+                         *suites,
                          '0.000000' if row['val_bpb'] is None else format(row['val_bpb'], '.17g'),
                          format(row['memory_gb'], '.1f'), row['status'], row['description']])
     temporary = ROOT / 'results.tsv.tmp'
