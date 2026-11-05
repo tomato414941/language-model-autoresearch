@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from prepare import MAX_SEQ_LEN, Tokenizer
 from package_runtime import KERNEL_BUILD, KERNEL_REVISION
+from gpu_config import active_gpu
 
 INTERFACE_SHA256 = "b7b5db2071bdce8f31160bb92d8d1765bf696d0dee3bd580a37efdc847c17ae5"
 
@@ -33,7 +34,10 @@ def attention_backward_shapes(*args, **kwargs):
 
 
 def load_attention_shapes():
-    snapshot = ROOT / "artifacts/gpu-assets/hf-cache/hub/models--varunneal--flash-attention-3/snapshots"
+    if active_gpu().values['attention_backend'] == 'sdpa':
+        from evaluation.checkpoint import sdpa_attention
+        return sdpa_attention
+    snapshot = active_gpu().artifacts_directory(ROOT) / "gpu-assets/hf-cache/hub/models--varunneal--flash-attention-3/snapshots"
     paths = list((snapshot / KERNEL_REVISION / "build" / KERNEL_BUILD).rglob("flash_attn_interface.py"))
     if len(paths) != 1:
         raise RuntimeError("The prepared, pinned FlashAttention interface is required.")

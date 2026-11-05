@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 """Verify the token geometry of the exact serialized native request bundle."""
 
 import argparse
@@ -14,7 +15,7 @@ def main():
     parser.add_argument("--requests", default="results/olmes-native-requests")
     parser.add_argument("--counts", default="results/olmes-token-counts/report.json")
     parser.add_argument("--output", default="results/olmes-frozen-request-token-counts.json")
-    parser.add_argument("--tokenizer", default=str(Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl"))
+    parser.add_argument("--tokenizer", default=str(active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"))
     args = parser.parse_args()
     directory = Path(args.requests)
     manifest = json.loads((directory / "manifest.json").read_text())

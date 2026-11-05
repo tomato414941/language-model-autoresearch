@@ -15,6 +15,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from gpu_config import active_gpu
 import prepare
 from tools.token_statistics import digest, training_snapshot
 
@@ -74,7 +75,7 @@ def main():
         parser.error("--vocab-size must include all byte values and special tokens")
     args.output.mkdir(parents=True, exist_ok=False)
     source_hashes = {name: digest(ROOT / name) for name in (
-        "prepare.py", "program.md", "train.py", "tools/token_statistics.py",
+        "prepare.py", "program.md", f"gpus/{active_gpu().identifier}/train.py", "tools/token_statistics.py",
         "tools/prepare_tokenizer.py",
     )}
     corpus = training_snapshot()

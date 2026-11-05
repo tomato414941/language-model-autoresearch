@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+from gpu_config import active_gpu
 
 from evaluation.count_tokens import TokenObserver, atomic_json, observe_instances
 from evaluation.gold_bpb import gold_request_indices
@@ -14,9 +15,9 @@ from evaluation.tokenizer_adapter import TokenizerAdapter
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--requests", default="results/olmes-native-requests")
-    parser.add_argument("--tokenizer", default=str(Path.home()/".cache/autoresearch/tokenizer/tokenizer.pkl"))
-    parser.add_argument("--output", default="results/olmes-gold-token-counts.json")
+    parser.add_argument("--requests", default=str(active_gpu().results_directory() / "olmes-native-requests"))
+    parser.add_argument("--tokenizer", default=str(active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"))
+    parser.add_argument("--output", default=str(active_gpu().results_directory() / "olmes-gold-token-counts.json"))
     args = parser.parse_args()
     directory = Path(args.requests)
     manifest = json.loads((directory/"manifest.json").read_text())

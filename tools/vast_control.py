@@ -79,8 +79,9 @@ def main():
         rows = result.get('invoices', [])
         print('Today billing:', json.dumps([compact(row, ['id', 'instance_id', 'label', 'description', 'type', 'amount', 'timestamp', 'start_time', 'end_time']) for row in rows]))
     elif command == 'search':
-        query = {'external': {'eq': False}, 'rentable': {'eq': True}, 'rented': {'eq': False}, 'num_gpus': {'eq': 1}, 'gpu_name': {'eq': 'H100 SXM'}, 'gpu_ram': {'gte': 79000}, 'cpu_ram': {'gte': 32000}, 'cpu_cores_effective': {'gte': 12}, 'disk_space': {'gte': 90}, 'inet_down': {'gte': 800}, 'reliability2': {'gte': 0.98}, 'cuda_max_good': {'gte': 12.8}, 'order': [['dph_total', 'asc']], 'type': 'ondemand', 'allocated_storage': 90, 'limit': 20}
-        result = api('POST', 'bundles/', query)
+        sys.path.insert(0, str(ROOT))
+        from tools.rental import choose_offer
+        result = {'offers': [choose_offer()]}
         (STATE_DIR / 'offers.json').write_text(json.dumps(result, indent=2))
         print(json.dumps([compact(row, ['id', 'gpu_name', 'num_gpus', 'gpu_ram', 'dph_total', 'inet_down', 'inet_down_cost', 'cpu_cores_effective', 'cpu_ram', 'cuda_max_good', 'driver_version', 'disk_space', 'reliability2', 'dlperf', 'duration', 'geolocation', 'storage_cost']) for row in result.get('offers', [])], indent=2))
     else:

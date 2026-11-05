@@ -3,18 +3,22 @@
 import argparse
 import csv
 import fcntl
+import hashlib
 import io
 import json
 import math
 from pathlib import Path
 import re
+import shutil
 import sys
+import tarfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import prepare
 from tools import measurement, rental
+from gpu_config import profile_for_job
 
 SUITE_METRICS = ('qa_bpb', 'math_bpb', 'code_bpb')
 FRAME_SOURCES = ('prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
@@ -37,7 +41,7 @@ def read_metrics(job, directory):
         raise ValueError('The summary metrics must be finite.')
     if values['peak_vram_mb'] < 0:
         raise ValueError('Peak memory must be nonnegative.')
-    if not prepare.TIME_BUDGET <= values['training_seconds'] <= values['total_seconds'] <= rental.LEASE_SECONDS:
+    if not rental.training_seconds(job) <= values['training_seconds'] <= values['total_seconds'] <= rental.lease_seconds(job):
         raise ValueError('The summary does not satisfy the fixed training and rental time budgets.')
     result = dict(val_bpb=values.get('val_bpb'), memory_gb=values['peak_vram_mb'] / 1024)
     if native:
@@ -56,7 +60,7 @@ def read_metrics(job, directory):
         expected = runtime['olmes']
         if (not summary['complete'] or summary['olmes_revision'] != expected['revision']
                 or summary['approved_config_fix'] != expected['approved_config_fix']
-                or summary['model_source_sha256'] != job['source_sha256']['train.py']
+                or summary['model_source_sha256'] != job['source_sha256'][job.get('model_source', 'train.py')]
                 or summary['native_request_manifest_sha256'] != expected['request_manifest_sha256']
                 or summary['tokenizer_sha256'] != runtime['tokenizer']['tokenizer.pkl']
                 or any(summary[name] != expected[name] for name in ('leaf_tasks', 'examples', 'requests'))
@@ -88,6 +92,8 @@ def decide(job, directory, incumbent):
     comparison = conditions
     if incumbent:
         previous_job = rental.load(incumbent['id'])
+        if profile_for_job(previous_job).identifier != profile_for_job(job).identifier:
+            raise ValueError('Compare a candidate only within its own GPU track.')
         previous_frame = {name: previous_job['source_sha256'][name] for name in FRAME_SOURCES}
         previous_frame['gpu_name'] = previous_job['gpu_name']
         if previous_frame != incumbent['frame']:
@@ -96,7 +102,7 @@ def decide(job, directory, incumbent):
         recorded = incumbent.get('measurement')
         if recorded and recorded['definition'].get('metric') in ('val_bpb', measurement.OLMES_METRIC) and recorded != previous:
             raise ValueError('The incumbent measurement differs from its recorded identity.')
-        previous_directory = ROOT / 'results/runs' / incumbent['id']
+        previous_directory = rental.results_directory(previous_job) / 'runs' / incumbent['id']
         verify_artifacts(incumbent, previous_directory)
         previous_log = (previous_directory / 'run.log').read_text()
         names = SUITE_METRICS if previous['definition']['metric'] == measurement.OLMES_METRIC else ('val_bpb',)
@@ -117,6 +123,7 @@ def decide(job, directory, incumbent):
     if not job['baseline'] and incumbent is None:
         raise ValueError('Record a successful baseline before deciding on candidates.')
     record = dict(id=job['id'], commit=job['commit'], frame=frame, measurement=conditions,
+                  gpu_id=profile_for_job(job).identifier,
                   metric=job.get('metric', 'val_bpb'), recorded_at=time.time(),
                   description=' '.join(job['description'].split()),
                   decision_metric=shared_metric, comparison_measurement=comparison,
@@ -155,7 +162,7 @@ def decide(job, directory, incumbent):
     return record
 
 
-def write_outputs(records):
+def write_outputs(records, destination=None):
     stream = io.StringIO(newline='')
     writer = csv.writer(stream, delimiter='\t', lineterminator='\n')
     writer.writerow(HEADER)
@@ -167,18 +174,54 @@ def write_outputs(records):
                          *suites,
                          '0.000000' if row['val_bpb'] is None else format(row['val_bpb'], '.17g'),
                          format(row['memory_gb'], '.1f'), row['status'], row['description']])
-    temporary = ROOT / 'results.tsv.tmp'
+    destination = ROOT / 'results.tsv' if destination is None else Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix('.tsv.tmp')
     temporary.write_text(stream.getvalue())
-    temporary.replace(ROOT / 'results.tsv')
+    temporary.replace(destination)
+
+
+def write_best(records, profile):
+    directory = profile.directory(ROOT)
+    directory.mkdir(parents=True, exist_ok=True)
+    best = next((row for row in reversed(records) if row['status'] == 'keep'), None)
+    if best is not None:
+        job = rental.load(best['id'])
+        if profile_for_job(job).identifier != profile.identifier:
+            raise ValueError('The current best must belong to its GPU track.')
+        archive = rental.job_path(job['id']).parent / 'source.tar.gz'
+        if rental.digest(archive) != job['source_archive_sha256']:
+            raise ValueError('The current best source archive differs from its recorded hash.')
+        own = directory / 'best'
+        own.mkdir(exist_ok=True)
+        temporary_archive = own / 'source.tar.gz.tmp'
+        shutil.copy2(archive, temporary_archive)
+        temporary_archive.replace(own / 'source.tar.gz')
+        model_source = job.get('model_source', 'train.py')
+        with tarfile.open(archive) as saved:
+            source = saved.extractfile(model_source).read()
+        if hashlib.sha256(source).hexdigest() != job['source_sha256'][model_source]:
+            raise ValueError('The current best training source differs from its recorded hash.')
+        temporary_source = own / 'train.py.tmp'
+        temporary_source.write_bytes(source)
+        temporary_source.replace(own / 'train.py')
+        best = dict(best, model_source=model_source, train_source=str((own / 'train.py').relative_to(ROOT)),
+                    source_archive=str((own / 'source.tar.gz').relative_to(ROOT)))
+    path = directory / 'best.json'
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(best, indent=2, allow_nan=False) + '\n')
+    temporary.replace(path)
 
 
 def record_run(identifier):
     job = rental.load(identifier)
     if job['phase'] not in ('evaluated', 'failed'):
         raise ValueError('The original job is still pending; observe it without recording a failed attempt.')
-    directory = ROOT / 'results/runs' / identifier
+    profile = profile_for_job(job)
+    results = rental.results_directory(job)
+    directory = results / 'runs' / identifier
     directory.mkdir(parents=True, exist_ok=True)
-    ledger = ROOT / 'results/decisions.json'
+    ledger = results / 'decisions.json'
     with ledger.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         records = json.loads(ledger.read_text()) if ledger.exists() else []
@@ -186,14 +229,19 @@ def record_run(identifier):
         if record is not None:
             verify_artifacts(record, directory)
         else:
-            incumbent = next((row for row in reversed(records) if row['status'] == 'keep'), None)
+            incumbent = next((row for row in reversed(records) if row['status'] == 'keep'
+                              and profile_for_job(rental.load(row['id'])).identifier == profile.identifier), None)
             record = decide(job, directory, incumbent)
             records.append(record)
             temporary = ledger.with_suffix('.tmp')
             temporary.write_text(json.dumps(records, indent=2, allow_nan=False) + '\n')
             temporary.replace(ledger)
         # The ledger is authoritative; rebuilding the TSV repairs an interrupted export.
-        write_outputs(records)
+        if results == profile.results_directory(ROOT):
+            write_outputs(records, profile.directory(ROOT) / 'results.tsv')
+            write_best(records, profile)
+        else:
+            write_outputs(records)
     print(json.dumps(record, indent=2, allow_nan=False))
     return record
 

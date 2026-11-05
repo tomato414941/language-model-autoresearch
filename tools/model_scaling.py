@@ -15,13 +15,14 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from gpu_config import active_gpu
 from prepare import MAX_SEQ_LEN, Tokenizer
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source', type=Path, default=ROOT / 'train.py')
-    parser.add_argument('--output', type=Path, default=ROOT / 'results/model-scaling.json')
+    parser.add_argument('--source', type=Path, default=active_gpu().train_source())
+    parser.add_argument('--output', type=Path, default=active_gpu().results_directory(ROOT) / 'model-scaling.json')
     args = parser.parse_args()
     source = args.source.read_text()
     tree = ast.parse(source)

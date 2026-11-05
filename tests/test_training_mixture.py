@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 import gzip
 from itertools import islice
 import json
@@ -69,7 +70,7 @@ class TrainingMixtureTests(unittest.TestCase):
                 yield batches[name], 1
         self.namespace['_document_batches'] = lambda split: stream("fineweb")
         self.namespace['_extra_training_document_batches'] = stream
-        source = (Path(__file__).resolve().parents[1]/"train.py").read_text()
+        source = active_gpu().train_source().read_text()
         loader_fn = cpu_allocations('make_training_dataloader', source, self.namespace)
         loader = loader_fn(ToyTokenizer(), 2, 17, buffer_size=5,
                            source_pattern=("fineweb","finemath-4plus","common-pile"))

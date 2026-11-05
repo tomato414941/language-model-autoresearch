@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 import ast
 import math
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import patch
 class TrainingScheduleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
+        tree = ast.parse(active_gpu().train_source().read_text())
         constants = {'WARMUP_RATIO', 'WARMDOWN_RATIO', 'FINAL_LR_FRAC', 'WEIGHT_DECAY',
                      'TOTAL_BATCH_SIZE', 'BATCH_REFERENCE_SIZE'}
         functions = {'get_lr_multiplier', 'get_muon_momentum', 'get_weight_decay'}

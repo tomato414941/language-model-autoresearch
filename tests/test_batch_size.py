@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 import ast
 import math
 from pathlib import Path
@@ -73,7 +74,7 @@ class BatchSizeTests(unittest.TestCase):
 
     def test_trains_one_device_batch_per_update_with_the_production_optimizer_recipe(self):
         namespace = load_model_namespace()
-        tree = ast.parse((Path(__file__).resolve().parents[1] / 'train.py').read_text())
+        tree = ast.parse(active_gpu().train_source().read_text())
         constants = {'TOTAL_BATCH_SIZE', 'BATCH_REFERENCE_SIZE', 'DEVICE_BATCH_SIZE', 'EMBEDDING_LR',
                      'UNEMBEDDING_LR', 'MATRIX_LR', 'SCALAR_LR', 'WEIGHT_DECAY',
                      'WARMUP_RATIO', 'WARMDOWN_RATIO', 'FINAL_LR_FRAC'}

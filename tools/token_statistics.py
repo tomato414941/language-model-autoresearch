@@ -11,6 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from gpu_config import active_gpu
 import prepare
 
 
@@ -98,7 +99,7 @@ def main():
     tokenizer = prepare.Tokenizer.from_directory(tokenizer_directory)
     args.output.mkdir(parents=True, exist_ok=False)
     source_hashes = {name: digest(ROOT / name) for name in
-                     ("prepare.py", "program.md", "train.py", "tools/token_statistics.py")}
+                     ("prepare.py", "program.md", f"gpus/{active_gpu().identifier}/train.py", "tools/token_statistics.py")}
     snapshot = training_snapshot()
     report = dict(
         started_at=datetime.now(timezone.utc).isoformat(), status="running",

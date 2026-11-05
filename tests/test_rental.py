@@ -19,6 +19,7 @@ class RentalLifecycleTests(unittest.TestCase):
         self.collection_cases = 0
         self.job = dict(id='fixture', label='autoresearch-fixture', instance_id=42,
                         phase='running', creation_uncertain=False, expires_at=time.time() + 3500,
+                        gpu_settings=dict(training_seconds=1800, rental_seconds=3600, max_hourly_cost=5),
                         expected_eval_seconds=900)
         rental.job_path(self.job['id']).parent.mkdir(parents=True)
         rental.save(self.job)
@@ -197,15 +198,16 @@ class RentalLifecycleTests(unittest.TestCase):
                     rental.execution_budget(dict(expected_eval_seconds=estimate))
 
     def test_snapshots_current_sources_with_the_prepared_runtime(self):
-        artifacts = self.root / 'artifacts'
-        artifacts.mkdir()
-        manifest = {'tokenizer': {'fixture': 'tokenizer'}, 'sources': {}}
+        artifacts = self.root / 'gpus/h100/artifacts'
+        artifacts.mkdir(parents=True)
+        manifest = {'gpu_id': 'h100', 'tokenizer': {'fixture': 'tokenizer'}, 'sources': {}}
         for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'),
                             ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
             (artifacts / name).write_bytes(name.encode())
             manifest[field] = rental.digest(artifacts / name)
         (artifacts / 'runtime.json').write_text(json.dumps(manifest))
         for name in rental.SOURCES:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text('current ' + name)
         (self.root / 'tools').mkdir()
         (self.root / 'tools/gpu_run.sh').write_text('fixture')
@@ -236,6 +238,7 @@ class RentalLifecycleTests(unittest.TestCase):
         runtime.write_text(json.dumps(manifest))
         (artifacts / 'runtime.json').write_text('{"container_image":"later-image"}')
         for name in rental.SOURCES:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text('later ' + name)
         job = {**self.job, 'phase': 'prepared', 'source_archive_sha256': rental.digest(source),
                'runtime_manifest_sha256': rental.digest(runtime), 'max_hourly_cost': 5.0}

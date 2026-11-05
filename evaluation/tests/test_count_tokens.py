@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 from collections import Counter
 import math
 from pathlib import Path
@@ -30,7 +31,7 @@ class ForwardProbe(TokenObserver):
 class NativeTokenCountingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        path = Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl"
+        path = active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"
         cls.tokenizer = TokenizerAdapter(path)
         torch.set_num_threads(2)
 

@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 from dataclasses import asdict
 from pathlib import Path
 import tempfile
@@ -6,15 +7,35 @@ import unittest
 import torch
 from oe_eval.components.requests import LoglikelihoodRequest
 
-from evaluation.checkpoint import export_checkpoint, load_checkpoint, load_definition
+from evaluation.checkpoint import export_checkpoint, load_checkpoint, load_definition, sdpa_attention
+from gpu_config import get_profile
 from evaluation.model import CheckpointModel
 from tools.cpu_smoke import attention
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_restores_the_independent_rtx_model_with_its_native_sdpa_backend(self):
+        torch.set_num_threads(2)
+        source = get_profile('rtx5090').train_source().read_text()
+        module = load_definition(source, sdpa_attention, compile_functions=False)
+        model = module.GPT(module.GPTConfig(vocab_size=64, n_layer=4, n_embd=32, n_head=2, n_kv_head=2))
+        model.init_weights()
+        model.eval()
+        inputs = torch.arange(24).reshape(2, 12) % 64
+        with torch.inference_mode():
+            expected = model(inputs)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'rtx-model.pt'
+            export_checkpoint(model, path, source)
+            restored, _ = load_checkpoint(path, 'cpu', compile_functions=False)
+            with torch.inference_mode():
+                actual = restored(inputs)
+        self.assertEqual(restored.config.attention_backend, 'sdpa')
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_transfers_the_model_definition_parameters_buffers_and_inference(self):
         torch.set_num_threads(2)
-        source = Path("train.py").read_text()
+        source = active_gpu().train_source().read_text()
         module = load_definition(source, attention, compile_functions=False)
         config = module.GPTConfig(vocab_size=64, n_layer=4, n_embd=32, n_head=2, n_kv_head=2)
         model = module.GPT(config)
@@ -41,7 +62,7 @@ class CheckpointTests(unittest.TestCase):
     def test_preserves_native_likelihoods_token_counts_and_cache_results_with_larger_batches(self):
         torch.manual_seed(42)
         torch.set_num_threads(2)
-        source = Path("train.py").read_text()
+        source = active_gpu().train_source().read_text()
         module = load_definition(source, attention, compile_functions=False)
         model = module.GPT(module.GPTConfig(vocab_size=8192, n_layer=4, n_embd=32,
                                            n_head=2, n_kv_head=2))
@@ -56,7 +77,7 @@ class CheckpointTests(unittest.TestCase):
             for index in range(73)]
         requests += [LoglikelihoodRequest("", "An answer."),
                      LoglikelihoodRequest("long context " * 100, "final answer")]
-        tokenizer = Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl"
+        tokenizer = active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"
         results, observed_shapes = [], []
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "random-model.pt"

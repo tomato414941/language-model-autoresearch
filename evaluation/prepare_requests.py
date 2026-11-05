@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+from gpu_config import active_gpu
 import shutil
 import time
 
@@ -26,9 +27,9 @@ def file_sha256(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--counts", default="results/olmes-token-counts")
-    parser.add_argument("--output", default="results/olmes-native-requests")
-    parser.add_argument("--tokenizer", default=str(Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl"))
+    parser.add_argument("--counts", default=str(active_gpu().results_directory() / "olmes-token-counts"))
+    parser.add_argument("--output", default=str(active_gpu().results_directory() / "olmes-native-requests"))
+    parser.add_argument("--tokenizer", default=str(active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"))
     args = parser.parse_args()
     counts_dir, output = Path(args.counts), Path(args.output)
     output.mkdir(parents=True, exist_ok=True)

@@ -13,13 +13,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import prepare
+from gpu_config import active_gpu, source_files
 
 PYTHON_VERSION = "3.12.16"
 KERNEL_REPO = "varunneal/flash-attention-3"
 KERNEL_REVISION = "de87b9b5af06dd9984df595bef90b2eba44b181a"
 KERNEL_BUILD = "torch29-cxx11-cu128-x86_64-linux"
 CUDA_IMAGE = "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66"
-SOURCES = ("train.py", "prepare.py", "program.md", "pyproject.toml", "uv.lock")
+SOURCES = source_files()
 
 
 def run(command, **kwargs):
@@ -62,16 +63,17 @@ def pack_runtime_assets(artifacts):
             os.link(previous, preserved)
     with tempfile.TemporaryDirectory(dir=artifacts, prefix=".bpb-assets-") as temporary:
         assets = Path(temporary)
-        shutil.copytree(Path(prepare.TOKENIZER_DIR), assets / "autoresearch" / "tokenizer",
+        shutil.copytree(Path(prepare.TOKENIZER_DIR), assets / "autoresearch" / "gpus" / active_gpu().identifier / "tokenizer",
                         ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copytree(artifacts / "gpu-assets" / "hf-cache", assets / "hf-cache",
-                        symlinks=True, copy_function=os.link)
+        cache = artifacts / "gpu-assets" / "hf-cache"
+        if cache.exists():
+            shutil.copytree(cache, assets / "hf-cache", symlinks=True, copy_function=os.link)
         return pack(assets, artifacts / "gpu-assets.tar.gz")
 
 
 def refresh_assets():
     """Repackage current tokenizer assets using the unchanged locked runtime and kernel cache."""
-    artifacts = ROOT / "artifacts"
+    artifacts = active_gpu().artifacts_directory(ROOT)
     path = artifacts / "runtime.json"
     original = path.read_bytes()
     manifest = json.loads(original)
@@ -89,7 +91,7 @@ def refresh_assets():
     manifest.pop("nanochat_revision", None)
     manifest.pop("core_bundle_sha256", None)
     manifest.update(evaluation_metric="val_bpb", tokenizer=tokenizer,
-                    sources={name: digest(ROOT / name) for name in SOURCES})
+                    sources={name: digest(ROOT / name) for name in source_files()})
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(manifest, indent=2) + "\n")
     temporary.replace(path)
@@ -98,10 +100,10 @@ def refresh_assets():
 
 def refresh_source_hashes():
     """Reuse verified runtime archives after changing only training or repository rules."""
-    artifacts = ROOT / "artifacts"
+    artifacts = active_gpu().artifacts_directory(ROOT)
     path = artifacts / "runtime.json"
     manifest = json.loads(path.read_text())
-    hashes = {name: digest(ROOT / name) for name in SOURCES}
+    hashes = {name: digest(ROOT / name) for name in source_files()}
     for name in ("pyproject.toml", "uv.lock"):
         if hashes[name] != manifest["sources"][name]:
             raise RuntimeError("The dependencies changed; rebuild their runtime archive first.")
@@ -131,7 +133,9 @@ def main():
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv must be available on the processing server.")
-    artifacts = ROOT / "artifacts"
+    profile = active_gpu()
+    profile.settings()
+    artifacts = profile.artifacts_directory(ROOT)
     runtime = artifacts / "gpu-env"
     assets = artifacts / "gpu-assets"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -165,20 +169,16 @@ def main():
              "import torch, kernels; print('Relocated runtime:', torch.__version__)"], cwd=relocated)
 
     os.environ["HF_HOME"] = str(assets / "hf-cache")
-    from huggingface_hub import snapshot_download
-    snapshot = snapshot_download(KERNEL_REPO, revision="main", cache_dir=assets / "hf-cache" / "hub",
-                                 allow_patterns=[f"build/{KERNEL_BUILD}/*"])
-    if Path(snapshot).name != KERNEL_REVISION:
-        raise RuntimeError("The upstream kernel changed; retain the prepared frame instead of silently updating it.")
-    run([str(environment / "bin" / "python"), "-c",
-         "import kernels; install=kernels.get_kernel.__globals__['install_kernel']; "
-         "print('Offline kernel assets:', install('varunneal/flash-attention-3', revision='main', local_files_only=True)[0])"],
-        env=dict(os.environ, HF_HUB_OFFLINE="1"))
+    if profile.values["attention_backend"] == "flash_attention_3":
+        from huggingface_hub import snapshot_download
+        snapshot_download(profile.values["kernel_repo"], revision=profile.values["kernel_revision"],
+                          cache_dir=assets / "hf-cache" / "hub", allow_patterns=[f"build/{KERNEL_BUILD}/*"])
 
     manifest = dict(
-        python_version=PYTHON_VERSION, kernel_repo=KERNEL_REPO, kernel_revision=KERNEL_REVISION,
+        gpu_id=profile.identifier, python_version=PYTHON_VERSION,
+        kernel_repo=profile.values["kernel_repo"], kernel_revision=profile.values["kernel_revision"],
         container_image=CUDA_IMAGE, evaluation_metric="val_bpb", tokenizer=tokenizer,
-        sources={name: digest(ROOT / name) for name in SOURCES},
+        sources={name: digest(ROOT / name) for name in source_files()},
     )
     manifest["gpu_env_sha256"] = pack(runtime, artifacts / "gpu-env.tar.gz")
     manifest["gpu_assets_sha256"] = pack_runtime_assets(artifacts)

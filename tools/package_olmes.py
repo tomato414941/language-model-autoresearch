@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from tools.package_runtime import (KERNEL_REPO, KERNEL_REVISION, PYTHON_VERSION, digest,
                                    pack, verify_tokenizer)
 from tools.measurement import native_datasets_identity
+from gpu_config import active_gpu, source_files
 
 
 def run(arguments, **kwargs):
@@ -25,8 +26,9 @@ def package_assets():
     from huggingface_hub import snapshot_download
     from evaluation.arc_macro import APPROVED_CONFIG_FIX
 
-    artifacts = ROOT / "artifacts"
-    requests = ROOT / "results/olmes-native-requests"
+    profile = active_gpu()
+    artifacts = profile.artifacts_directory(ROOT)
+    requests = profile.results_directory(ROOT) / "olmes-native-requests"
     manifest = json.loads((requests / "manifest.json").read_text())
     if not manifest["complete"]:
         raise ValueError("Prepare every native request before packaging the evaluation.")
@@ -34,23 +36,27 @@ def package_assets():
         if digest(requests / entry["requests_file"]) != entry["requests_sha256"]:
             raise ValueError("A prepared native request file is incomplete.")
     runtime = json.loads((artifacts / "runtime.json").read_text())
-    staged = json.loads((ROOT / "results/olmes-relocatable-runtime.json").read_text())
+    staged = json.loads((profile.results_directory(ROOT) / "olmes-relocatable-runtime.json").read_text())
     if digest(artifacts / "gpu-env-olmes.tar.gz") != staged["gpu_env_sha256"]:
         raise ValueError("The staged OLMES runtime is incomplete.")
     with tempfile.TemporaryDirectory(dir=artifacts, prefix=".olmes-assets-") as temporary:
         assets = Path(temporary)
-        shutil.copytree(artifacts / "gpu-assets/hf-cache", assets / "hf-cache",
-                        symlinks=True, copy_function=os.link)
-        shutil.copytree(requests, assets / "autoresearch/olmes", copy_function=os.link)
+        cache = artifacts / "gpu-assets/hf-cache"
+        if cache.exists():
+            shutil.copytree(cache, assets / "hf-cache", symlinks=True, copy_function=os.link)
+        cache_root = assets / "autoresearch" / "gpus" / profile.identifier
+        shutil.copytree(requests, cache_root / "olmes", copy_function=os.link)
         import prepare
-        shutil.copytree(prepare.TOKENIZER_DIR, assets / "autoresearch/tokenizer",
+        shutil.copytree(prepare.TOKENIZER_DIR, cache_root / "tokenizer",
                         ignore=shutil.ignore_patterns("__pycache__"))
-        for build in ("torch28-cxx11-cu128-x86_64-linux", "torch29-cxx11-cu128-x86_64-linux"):
-            snapshot_download(KERNEL_REPO, revision=KERNEL_REVISION,
-                              cache_dir=assets / "hf-cache/hub", allow_patterns=[f"build/{build}/*"])
+        if profile.values["attention_backend"] == "flash_attention_3":
+            for build in ("torch28-cxx11-cu128-x86_64-linux", "torch29-cxx11-cu128-x86_64-linux"):
+                snapshot_download(profile.values["kernel_repo"], revision=profile.values["kernel_revision"],
+                                  cache_dir=assets / "hf-cache/hub", allow_patterns=[f"build/{build}/*"])
         assets_sha256 = pack(assets, artifacts / "gpu-assets-olmes.tar.gz")
     datasets_sha256 = native_datasets_identity(manifest["tasks"])
     runtime.update(
+        gpu_id=profile.identifier, sources={name: digest(ROOT / name) for name in source_files()},
         evaluation_metric="olmes_bpb", gpu_env_sha256=staged["gpu_env_sha256"],
         training_gpu_env_sha256=runtime.get("training_gpu_env_sha256", runtime["gpu_env_sha256"]),
         gpu_assets_sha256=assets_sha256, tokenizer=verify_tokenizer(),
@@ -73,7 +79,9 @@ def main():
     if args.assets_only:
         package_assets()
         return
-    artifacts = ROOT / "artifacts"
+    profile = active_gpu()
+    artifacts = profile.artifacts_directory(ROOT)
+    profile.results_directory(ROOT).mkdir(parents=True, exist_ok=True)
     runtime = artifacts / "gpu-env-olmes"
     base = artifacts / "gpu-env"
     if not runtime.exists():
@@ -103,7 +111,7 @@ def main():
         target = runtime / "evaluation" / name
         target.unlink(missing_ok=True)
         shutil.copy2(ROOT / "evaluation" / name, target)
-    log_path = ROOT / "results/olmes-relocated-runtime-import.log"
+    log_path = profile.results_directory(ROOT) / "olmes-relocated-runtime-import.log"
     with log_path.open("w") as log:
         run([str(executable), "-c",
              "import torch,numpy,pyarrow,tiktoken,kernels;from oe_eval import run_eval;"
@@ -118,7 +126,7 @@ def main():
         "training_runtime_preserved": True, "prepared_rental_archives_preserved": True,
         "evaluation_lock_sha256": hashlib.sha256((ROOT / "evaluation/uv.lock").read_bytes()).hexdigest(),
     }
-    (ROOT / "results/olmes-relocatable-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
+    (profile.results_directory(ROOT) / "olmes-relocatable-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
 
 

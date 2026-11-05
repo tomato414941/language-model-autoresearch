@@ -17,7 +17,8 @@ torch.set_num_threads(2)
 
 def load_model_namespace(path=None, extra_globals=None):
     if path is None:
-        path = pathlib.Path(__file__).resolve().parent.parent / 'train.py'
+        from gpu_config import active_gpu
+        path = active_gpu().train_source()
     source = pathlib.Path(path).read_text()
     fragment = source[source.index('@dataclass'):source.index('# Hyperparameters')]
     tree = ast.parse(fragment)

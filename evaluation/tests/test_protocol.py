@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 from copy import deepcopy
 import json
 import gzip
@@ -62,7 +63,7 @@ class NativeProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
-        cls.tokenizer = TokenizerAdapter(Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl")
+        cls.tokenizer = TokenizerAdapter(active_gpu().cache_directory("tokenizer") / "tokenizer.pkl")
 
     def test_scores_prebuilt_requests_like_the_complete_native_runner(self):
         task_config = {"task_name": "synthetic_protocol", "metadata": {"alias": "synthetic_protocol"}}

@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 import ast
 from pathlib import Path
 import unittest
@@ -10,7 +11,7 @@ from tools.cpu_smoke import load_model_namespace
 from tests.test_training_loader import cpu_allocations
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "train.py"
+SOURCE = active_gpu().train_source()
 
 
 def tokenizer_type():

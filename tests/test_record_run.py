@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from tools import measurement, record_run, rental
+from gpu_config import read_config
 
 SOURCE = ("DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\nEVAL_TOKENS = 20971520\n"
           "def evaluate_bpb():\n    return DATA_REVISION, EVAL_TOKENS\n")
@@ -31,7 +32,7 @@ class RecordedDecisionTests(unittest.TestCase):
 
     def make_run(self, identifier, bpb, baseline=False, *, rules='fixture rules',
                  measurement_source=None, gpu_name='H100 SXM', runtime_changes=None,
-                 suites=None, metric='val_bpb'):
+                 suites=None, metric='val_bpb', gpu_id=None):
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
                    gpu_name=gpu_name, phase='evaluated', exit_code=0, metric=metric)
         snapshot = rental.job_path(identifier).parent
@@ -40,6 +41,18 @@ class RecordedDecisionTests(unittest.TestCase):
         files = {'train.py': 'MODEL_WIDTH = 64\n', 'program.md': rules,
                  'prepare.py': measurement_source or SOURCE,
                  'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
+        if gpu_id:
+            config = read_config()
+            config['active_gpu'] = gpu_id
+            if gpu_id == 'rtx5090':
+                config['gpus'][gpu_id].update(training_seconds=900, rental_seconds=2700, max_hourly_cost=0.8)
+            values = config['gpus'][gpu_id]
+            job.update(gpu_id=gpu_id, gpu_name=values['gpu_name'], model_source=f'gpus/{gpu_id}/train.py',
+                       gpu_settings={name: values[name] for name in
+                                     ('training_seconds', 'rental_seconds', 'max_hourly_cost')})
+            files['gpus.json'] = json.dumps(config)
+            files[job['model_source']] = files['train.py']
+            files['prepare.py'] = files['prepare.py'].replace('1800', str(values['training_seconds']))
         if metric == measurement.OLMES_METRIC:
             files['prepare.py'] += '\n' + inspect.getsource(record_run.prepare.suites_improve)
             files.update({'evaluation/pyproject.toml': 'native dependency fixture\n',
@@ -66,11 +79,13 @@ class RecordedDecisionTests(unittest.TestCase):
         (snapshot / 'runtime.json').write_text(json.dumps(runtime))
         job['runtime_manifest_sha256'] = rental.digest(snapshot / 'runtime.json')
         rental.save(job)
-        directory = self.root / 'results/runs' / identifier
+        results = rental.results_directory(job) if gpu_id else self.root / 'results'
+        directory = results / 'runs' / identifier
         directory.mkdir(parents=True)
         (directory / 'run.log').write_text(
             f'val_bpb: {bpb:.17g}\npeak_vram_mb: 45056.0\n'
-            'training_seconds: 1800.2\ntotal_seconds: 2500.0\n')
+            f'training_seconds: {rental.training_seconds(job) + 0.2}\n'
+            f'total_seconds: {rental.training_seconds(job) + 700:.1f}\n')
         if metric == measurement.OLMES_METRIC:
             values = suites or dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0)
             with (directory / 'run.log').open('a') as log:
@@ -97,6 +112,55 @@ class RecordedDecisionTests(unittest.TestCase):
     def rows(self):
         with (self.root / 'results.tsv').open(newline='') as source:
             return list(csv.reader(source, delimiter='\t'))
+
+    def test_compares_and_exports_each_gpu_against_only_its_own_incumbent(self):
+        self.make_run('h100-baseline', 0.9, baseline=True, gpu_id='h100')
+        self.make_run('rtx-baseline', 2.0, baseline=True, gpu_id='rtx5090')
+        self.record('h100-baseline')
+        self.record('rtx-baseline')
+        self.make_run('rtx-gain', 1.8, gpu_id='rtx5090')
+        gained = self.record('rtx-gain')
+        self.assertEqual((gained['status'], gained['incumbent']), ('keep', 'rtx-baseline'))
+        self.make_run('h100-loss', 1.0, gpu_id='h100')
+        discarded = self.record('h100-loss')
+        self.assertEqual((discarded['status'], discarded['incumbent']), ('discard', 'h100-baseline'))
+        for gpu, best, count in (('h100', 'h100-baseline', 2), ('rtx5090', 'rtx-gain', 2)):
+            folder = self.root / 'gpus' / gpu
+            self.assertEqual(json.loads((folder / 'best.json').read_text())['id'], best)
+            records = json.loads((folder / 'results/decisions.json').read_text())
+            self.assertEqual(len(records), count)
+            self.assertTrue(all(row['gpu_id'] == gpu for row in records))
+            with (folder / 'results.tsv').open() as stream:
+                self.assertEqual(len(list(csv.reader(stream, delimiter='\t'))), count + 1)
+
+    def test_imports_original_h100_logs_and_results_without_remeasuring_or_rewriting_history(self):
+        from tools import gpu_tracks
+        self.make_run('historical', 0.974083, baseline=True)
+        self.record('historical')
+        original = (self.root / 'results/decisions.json').read_bytes()
+        log = (self.root / 'results/runs/historical/run.log').read_bytes()
+        with patch.object(gpu_tracks, 'ROOT', self.root), contextlib.redirect_stdout(io.StringIO()):
+            gpu_tracks.initialize()
+            gpu_tracks.initialize()
+        self.assertEqual((self.root / 'results/decisions.json').read_bytes(), original)
+        self.assertEqual(json.loads((self.root / 'gpus/h100/results/decisions.json').read_text()), json.loads(original))
+        self.assertEqual((self.root / 'gpus/h100/results/runs/historical/run.log').read_bytes(), log)
+        self.assertEqual(json.loads((self.root / 'gpus/h100/best.json').read_text())['id'], 'historical')
+        self.assertEqual(json.loads((self.root / 'gpus/rtx5090/results/decisions.json').read_text()), [])
+        self.assertIsNone(json.loads((self.root / 'gpus/rtx5090/best.json').read_text()))
+
+    def test_recognizes_relocated_cache_and_resolved_budget_as_the_same_measurement(self):
+        old = ('import os\nCACHE_DIR = os.path.expanduser("~/.cache/autoresearch")\n'
+               'TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")\nTIME_BUDGET = 1800\n'
+               'def evaluate_bpb():\n    return TOKENIZER_DIR, 123\n')
+        new = old.replace('TIME_BUDGET = 1800', 'TIME_BUDGET = active_gpu().settings()["training_seconds"]')
+        new = 'from gpu_config import active_gpu\n' + new.replace(
+            'os.path.join(CACHE_DIR, "tokenizer")', 'str(active_gpu().cache_directory("tokenizer"))')
+        settings = dict(training_seconds=1800)
+        reference = measurement.prepare_semantics(old)
+        self.assertEqual(measurement.prepare_semantics(new, settings=settings), reference)
+        self.assertNotEqual(measurement.prepare_semantics(new.replace('123', '456'), settings=settings), reference)
+        self.assertNotEqual(measurement.prepare_semantics(new, settings=dict(training_seconds=900)), reference)
 
     def test_records_one_complete_baseline_and_exports_reference_bpb_with_unmeasured_suites(self):
         self.make_run('baseline', 0.974083, baseline=True)

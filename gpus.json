@@ -1,0 +1,41 @@
+{
+  "active_gpu": "h100",
+  "gpus": {
+    "h100": {
+      "gpu_name": "H100 SXM",
+      "device_name_pattern": "H100 (?:SXM|80GB HBM3)",
+      "training_seconds": 1800,
+      "rental_seconds": 3600,
+      "max_hourly_cost": 5,
+      "attention_backend": "flash_attention_3",
+      "kernel_repo": "varunneal/flash-attention-3",
+      "kernel_revision": "de87b9b5af06dd9984df595bef90b2eba44b181a",
+      "bf16_peak_flops": 989500000000000,
+      "minimum_gpu_ram_mb": 79000,
+      "minimum_cpu_ram_mb": 32000,
+      "minimum_cpu_cores": 12,
+      "minimum_download_mbps": 800,
+      "minimum_reliability": 0.93,
+      "disk_gb": 90,
+      "cuda_minimum": 12.8
+    },
+    "rtx5090": {
+      "gpu_name": "RTX 5090",
+      "device_name_pattern": "(?:GeForce )?RTX 5090",
+      "training_seconds": null,
+      "rental_seconds": null,
+      "max_hourly_cost": null,
+      "attention_backend": "sdpa",
+      "kernel_repo": null,
+      "kernel_revision": null,
+      "bf16_peak_flops": 209500000000000.0,
+      "minimum_gpu_ram_mb": 30000,
+      "minimum_cpu_ram_mb": 32000,
+      "minimum_cpu_cores": 8,
+      "minimum_download_mbps": 800,
+      "minimum_reliability": 0.93,
+      "disk_gb": 90,
+      "cuda_minimum": 12.8
+    }
+  }
+}

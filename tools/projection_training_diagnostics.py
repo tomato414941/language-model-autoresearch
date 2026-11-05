@@ -15,6 +15,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from gpu_config import active_gpu
 from tools.cpu_smoke import load_model_namespace
 
 
@@ -32,7 +33,7 @@ def relative_difference(actual, expected):
 
 def float32_muon_namespace():
     namespace = load_model_namespace()
-    tree = ast.parse((ROOT / 'train.py').read_text())
+    tree = ast.parse(active_gpu().train_source().read_text())
     node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'muon_step_fused')
     node.decorator_list = []
 
@@ -113,7 +114,7 @@ def main():
     reports = [inspect_updates(namespace, precision) for precision in ('float32', 'bfloat16')]
     reports.append(inspect_updates(float32_muon_namespace(), 'float32', muon_precision='float32'))
     report = dict(
-        diagnostic_only=True, training_source_sha256=hashlib.sha256((ROOT / 'train.py').read_bytes()).hexdigest(),
+        diagnostic_only=True, training_source_sha256=hashlib.sha256(active_gpu().train_source().read_bytes()).hexdigest(),
         seed=42, torch_version=torch.__version__, cases=reports,
         limitations=[
             'Synthetic CPU inputs and small random model states do not measure CORE or GPU throughput.',
@@ -123,7 +124,7 @@ def main():
             'GPU kernels and torch.compile may produce different numerical behavior from this CPU diagnostic.',
         ],
     )
-    destination = ROOT / 'results/projection-training-diagnostics.json'
+    destination = active_gpu().results_directory(ROOT) / 'projection-training-diagnostics.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     print(json.dumps({key: value for key, value in report.items() if key != 'cases'}, indent=2))

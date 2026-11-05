@@ -16,8 +16,9 @@ class RuntimeReuseTests(unittest.TestCase):
         self.root_patch = patch.object(package_runtime, 'ROOT', self.root)
         self.root_patch.start()
         for name in package_runtime.SOURCES:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(name)
-        artifacts = self.root / 'artifacts'
+        artifacts = self.root / 'gpus/h100/artifacts'
         artifacts.mkdir()
         manifest = {'sources': {name: self.sha(self.root / name) for name in package_runtime.SOURCES}}
         for name, field in [('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')]:
@@ -57,7 +58,7 @@ class RuntimeReuseTests(unittest.TestCase):
 
     def test_requires_intact_archives_before_refreshing_source_hashes(self):
         previous = self.manifest.read_text()
-        (self.root / 'artifacts/gpu-assets.tar.gz').write_bytes(b'incomplete')
+        (self.root / 'gpus/h100/artifacts/gpu-assets.tar.gz').write_bytes(b'incomplete')
         with self.assertRaises(RuntimeError):
             package_runtime.refresh_source_hashes()
         self.assertEqual(self.manifest.read_text(), previous)
@@ -68,7 +69,7 @@ class RuntimeReuseTests(unittest.TestCase):
         tokenizer.mkdir()
         for name in ('tokenizer.pkl', 'token_bytes.pt'):
             (tokenizer / name).write_bytes(name.encode())
-        cache = self.root / 'artifacts/gpu-assets/hf-cache'
+        cache = self.root / 'gpus/h100/artifacts/gpu-assets/hf-cache'
         cache.mkdir(parents=True)
         (cache / 'kernel.bin').write_bytes(b'locked kernel fixture')
         hashes = {name: self.sha(tokenizer / name) for name in ('tokenizer.pkl', 'token_bytes.pt')}
@@ -78,12 +79,12 @@ class RuntimeReuseTests(unittest.TestCase):
         manifest = json.loads(self.manifest.read_text())
         self.assertEqual(manifest['gpu_env_sha256'], original['gpu_env_sha256'])
         self.assertEqual(manifest['tokenizer'], hashes)
-        archive = self.root / 'artifacts/gpu-assets.tar.gz'
+        archive = self.root / 'gpus/h100/artifacts/gpu-assets.tar.gz'
         self.assertEqual(self.sha(archive), manifest['gpu_assets_sha256'])
         with tarfile.open(archive, 'r:gz') as packed:
-            self.assertEqual(packed.extractfile('./autoresearch/tokenizer/tokenizer.pkl').read(), b'tokenizer.pkl')
+            self.assertEqual(packed.extractfile('./autoresearch/gpus/h100/tokenizer/tokenizer.pkl').read(), b'tokenizer.pkl')
             self.assertEqual(packed.extractfile('./hf-cache/kernel.bin').read(), b'locked kernel fixture')
-        preserved = self.root / ('artifacts/history/gpu-assets-' + original['gpu_assets_sha256'] + '.tar.gz')
+        preserved = self.root / ('gpus/h100/artifacts/history/gpu-assets-' + original['gpu_assets_sha256'] + '.tar.gz')
         self.assertEqual(self.sha(preserved), original['gpu_assets_sha256'])
 
 

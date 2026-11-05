@@ -32,12 +32,14 @@ import rustbpe
 import tiktoken
 import torch
 
+from gpu_config import active_gpu
+
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 1800       # training time budget in seconds (30 minutes, one run in a rental of at most 1 hour)
+TIME_BUDGET = active_gpu().settings()["training_seconds"]
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
@@ -46,7 +48,7 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
+TOKENIZER_DIR = str(active_gpu().cache_directory("tokenizer"))
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/4c8f30d6756da75362432a4d5569e1b229263b71"
 MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_01822)
@@ -68,7 +70,7 @@ COMMON_PILE_REVISION = "c354dbe88469a1153e97c6a63ac50591849654de"
 COMMON_PILE_DIR = os.path.join(CACHE_DIR, "common_pile", "stackv2_edu_filtered")
 OLMES_REVISION = "5a51f502d463b8cdc4a2dcad7d7096c41ff1197e"
 OLMES_SUITE_FIELDS = ("qa_bpb", "math_bpb", "code_bpb")
-OLMES_REQUEST_DIR = os.path.join(CACHE_DIR, "olmes")
+OLMES_REQUEST_DIR = str(active_gpu().cache_directory("olmes"))
 
 # ---------------------------------------------------------------------------
 # Data download

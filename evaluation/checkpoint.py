@@ -18,6 +18,16 @@ KERNEL_REPOSITORY = "varunneal/flash-attention-3"
 KERNEL_REVISION = "de87b9b5af06dd9984df595bef90b2eba44b181a"
 
 
+def sdpa_attention(q, k, v, causal=True, window_size=(-1, 0)):
+    """Use the RTX track's full causal attention through the existing Torch backend."""
+    if window_size != (-1, 0):
+        raise ValueError("The SDPA model uses full causal attention.")
+    return F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        is_causal=causal, enable_gqa=q.shape[2] != k.shape[2],
+    ).transpose(1, 2)
+
+
 def export_checkpoint(model, destination, source=None):
     model = getattr(model, "_orig_mod", model)
     if source is None:
@@ -61,8 +71,11 @@ def load_checkpoint(path, device="cuda", attention=None, compile_functions=True)
     if hashlib.sha256(payload["source"].encode()).hexdigest() != payload["source_sha256"]:
         raise ValueError("The checkpoint's model definition is incomplete.")
     if attention is None:
-        from kernels import get_kernel
-        attention = get_kernel(KERNEL_REPOSITORY, revision=KERNEL_REVISION).flash_attn_interface.flash_attn_func
+        if payload["config"].get("attention_backend") == "sdpa":
+            attention = sdpa_attention
+        else:
+            from kernels import get_kernel
+            attention = get_kernel(KERNEL_REPOSITORY, revision=KERNEL_REVISION).flash_attn_interface.flash_attn_func
     module = load_definition(payload["source"], attention, compile_functions)
     config = module.GPTConfig(**payload["config"])
     with torch.device("meta"):

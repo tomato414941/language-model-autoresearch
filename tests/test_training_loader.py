@@ -1,3 +1,4 @@
+from gpu_config import active_gpu
 import ast
 import inspect
 from pathlib import Path
@@ -138,7 +139,7 @@ class TrainingLoaderTests(unittest.TestCase):
         for _ in range(4):
             x, y, epoch = next(reference)
             expected.append((x.clone(), y.clone(), epoch))
-        source = (Path(__file__).resolve().parents[1] / 'train.py').read_text()
+        source = active_gpu().train_source().read_text()
         actual = deferred_training_batches(source)
         self.assertEqual(len(actual), len(expected))
         for (inputs, targets, epoch), (expected_inputs, expected_targets, expected_epoch) in zip(
@@ -170,7 +171,7 @@ class TrainingLoaderTests(unittest.TestCase):
                 namespace = load_model_namespace()
                 namespace['_document_batches'] = documents
                 candidate = cpu_allocations('make_training_dataloader',
-                                            (Path(__file__).resolve().parents[1] / 'train.py').read_text(),
+                                            active_gpu().train_source().read_text(),
                                             namespace)
                 reference_namespace = dict(torch=torch, _document_batches=documents)
                 reference = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
@@ -197,7 +198,7 @@ class TrainingLoaderTests(unittest.TestCase):
                         for offset, size in enumerate((0, 1, 2, 14, 15, 16, 17, 31, 65, 130))]
                 yield rows, batch // 3 + 1
 
-        source = (Path(__file__).resolve().parents[1] / 'train.py').read_text()
+        source = active_gpu().train_source().read_text()
         for batch, length, buffer in ((2, 17, 13), (3, 63, 19)):
             with self.subTest(batch=batch, length=length, buffer=buffer):
                 namespace = load_model_namespace()
@@ -223,7 +224,7 @@ class TrainingLoaderTests(unittest.TestCase):
         namespace = load_model_namespace()
         namespace['_document_batches'] = documents
         candidate = cpu_allocations('make_training_dataloader',
-                                    (Path(__file__).resolve().parents[1] / 'train.py').read_text(),
+                                    active_gpu().train_source().read_text(),
                                     namespace)
         loader = candidate(ToyTokenizer(), 2, 17, buffer_size=23)
         torch.manual_seed(42)

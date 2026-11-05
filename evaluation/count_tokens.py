@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from gpu_config import active_gpu
 import shlex
 import time
 import traceback
@@ -145,8 +146,8 @@ def atomic_json(path, value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", default="results/olmes-token-counts")
-    parser.add_argument("--tokenizer", default=str(Path.home() / ".cache/autoresearch/tokenizer/tokenizer.pkl"))
+    parser.add_argument("--output", default=str(active_gpu().results_directory() / "olmes-token-counts"))
+    parser.add_argument("--tokenizer", default=str(active_gpu().cache_directory("tokenizer") / "tokenizer.pkl"))
     args = parser.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,7 @@
 """Run one prepared experiment, with a separate deletion timer and no training retries."""
 
 import argparse
+import ast
 import csv
 import datetime as dt
 import fcntl
@@ -23,14 +24,15 @@ import urllib.error
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
+from gpu_config import active_gpu, profile_for_job, source_files
 
-SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
+SOURCES = source_files()
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
     'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
     'protocol.py', 'run_prepared.py', 'tokenizer_adapter.py', 'verify_requests.py',
     'pyproject.toml', 'uv.lock', 'patches/olmes-arc-bpb-macro.patch',
 ))
-LEASE_SECONDS = 3600
+LEASE_SECONDS = 3600  # Immutable lease limit for pre-track historical jobs only.
 CLEANUP_SECONDS = 60
 EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
 COLLECTION_SECONDS = 45
@@ -64,6 +66,38 @@ def save(job):
 
 def load(identifier):
     return json.loads(job_path(identifier).read_text())
+
+
+def training_seconds(job):
+    if 'gpu_settings' in job:
+        return job['gpu_settings']['training_seconds']
+    if job.get('id'):
+        archive_path = job_path(job['id']).parent / 'source.tar.gz'
+        if archive_path.exists():
+            with tarfile.open(archive_path, 'r:gz') as archive:
+                tree = ast.parse(archive.extractfile('prepare.py').read())
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == 'TIME_BUDGET' for target in node.targets):
+                    return ast.literal_eval(node.value)
+    return active_gpu().settings()['training_seconds']
+
+
+def lease_seconds(job):
+    return job.get('gpu_settings', {}).get('rental_seconds', LEASE_SECONDS)
+
+
+def artifact_directory(job):
+    if job.get('gpu_id'):
+        return profile_for_job(job).artifacts_directory(ROOT)
+    return ROOT / 'artifacts'
+
+
+def results_directory(job):
+    directory = profile_for_job(job).results_directory(ROOT)
+    if job.get('gpu_id') or directory.exists():
+        return directory
+    return ROOT / 'results'
 
 
 def run(command, **kwargs):
@@ -178,13 +212,11 @@ def validate_environment():
 
 
 def execution_budget(job):
-    from prepare import TIME_BUDGET
-
     expected_eval = float(job['expected_eval_seconds'])
     if not math.isfinite(expected_eval) or expected_eval <= 0:
         raise ValueError('Reserve a positive finite duration for BPB evaluation.')
-    required = TIME_BUDGET + expected_eval + EXECUTION_SETUP_SECONDS + COLLECTION_SECONDS
-    if required >= LEASE_SECONDS - CLEANUP_SECONDS:
+    required = training_seconds(job) + expected_eval + EXECUTION_SETUP_SECONDS + COLLECTION_SECONDS
+    if required >= lease_seconds(job) - CLEANUP_SECONDS:
         raise ValueError('The prepared runtime estimate does not fit inside the rental.')
     return required
 
@@ -197,19 +229,26 @@ def require_execution_time(job):
 def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     import prepare
 
+    profile = active_gpu()
+    settings = profile.settings()
+    artifacts = profile.artifacts_directory(ROOT)
+
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('Pass the full commit from the local Git checkout.')
     from tools.package_runtime import verify_tokenizer
     tokenizer_hashes = verify_tokenizer()
-    execution_budget(dict(expected_eval_seconds=expected_eval_seconds))
-    manifest = json.loads((ROOT / 'artifacts/runtime.json').read_text())
+    execution_budget(dict(expected_eval_seconds=expected_eval_seconds, gpu_settings=settings))
+    manifest = json.loads((artifacts / 'runtime.json').read_text())
+    if manifest.get('gpu_id') != profile.identifier:
+        raise RuntimeError('Prepare the selected GPU track runtime before creating its job.')
     if manifest['tokenizer'] != tokenizer_hashes:
         raise RuntimeError('The tokenizer differs from the packaged BPB assets.')
     metric = manifest.get('evaluation_metric', 'val_bpb')
-    sources = SOURCES + OLMES_SOURCES if metric == 'olmes_bpb' else SOURCES
+    sources = source_files(profile)
+    sources += OLMES_SOURCES if metric == 'olmes_bpb' else ()
     hashes = {name: digest(ROOT / name) for name in sources}
     for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
-        if digest(ROOT / 'artifacts' / name) != manifest[field]:
+        if digest(artifacts / name) != manifest[field]:
             raise RuntimeError('A runtime archive is incomplete or changed.')
     identifier = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
     directory = job_path(identifier).parent
@@ -226,28 +265,45 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     with tarfile.open(directory / 'source.tar.gz', 'w:gz') as archive:
         for path in sorted(source_dir.iterdir()):
             archive.add(path, arcname=path.name)
-    job = dict(id=identifier, label='autoresearch-' + identifier, commit=commit, baseline=baseline,
+    ledger = profile.results_directory(ROOT) / 'decisions.json'
+    if not ledger.exists() and profile.identifier == 'h100':
+        ledger = ROOT / 'results/decisions.json'
+    records = json.loads(ledger.read_text()) if ledger.exists() else []
+    baseline = baseline or not any(row['status'] == 'keep'
+                                   and profile_for_job(load(row['id'])).identifier == profile.identifier
+                                   for row in records)
+    job = dict(id=identifier, label='autoresearch-' + profile.identifier + '-' + identifier,
+               gpu_id=profile.identifier, gpu_name=profile.gpu_name, gpu_settings=settings,
+               model_source=f'gpus/{profile.identifier}/train.py',
+               commit=commit, baseline=baseline,
                description=description, phase='prepared', source_sha256=hashes,
                source_archive_sha256=digest(directory / 'source.tar.gz'),
-               runtime_manifest_sha256=digest(runtime_path), max_hourly_cost=5.0,
+               runtime_manifest_sha256=digest(runtime_path), max_hourly_cost=settings['max_hourly_cost'],
                expected_eval_seconds=expected_eval_seconds, metric=metric)
     save(job)
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
 
 
-def choose_offer():
+def choose_offer(profile=None):
+    profile = active_gpu() if profile is None else profile
+    values = profile.values
     query = {'external': {'eq': False}, 'rentable': {'eq': True},
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
-             'gpu_name': {'eq': 'H100 SXM'}, 'gpu_ram': {'gte': 79000},
-             'cpu_ram': {'gte': 32000}, 'cpu_cores_effective': {'gte': 12}, 'disk_space': {'gte': 90},
-             'inet_down': {'gte': 800}, 'reliability2': {'gte': 0.93}, 'cuda_max_good': {'gte': 12.8},
-             'order': [['dph_total', 'asc']], 'type': 'ondemand', 'allocated_storage': 90, 'limit': 20}
+             'gpu_name': {'eq': profile.gpu_name}, 'gpu_ram': {'gte': values['minimum_gpu_ram_mb']},
+             'cpu_ram': {'gte': values['minimum_cpu_ram_mb']},
+             'cpu_cores_effective': {'gte': values['minimum_cpu_cores']},
+             'disk_space': {'gte': values['disk_gb']}, 'inet_down': {'gte': values['minimum_download_mbps']},
+             'reliability2': {'gte': values['minimum_reliability']},
+             'cuda_max_good': {'gte': values['cuda_minimum']},
+             'order': [['dph_total', 'asc']], 'type': 'ondemand',
+             'allocated_storage': values['disk_gb'], 'limit': 20}
     offers = [row for row in api('POST', 'bundles/', query)['offers']
-              if row.get('num_gpus') == 1 and row.get('gpu_name') == 'H100 SXM'
-              and float(row.get('gpu_ram', 0)) >= 79000 and float(row.get('cuda_max_good', 0)) >= 12.8
+              if row.get('num_gpus') == 1 and row.get('gpu_name') == profile.gpu_name
+              and float(row.get('gpu_ram', 0)) >= values['minimum_gpu_ram_mb']
+              and float(row.get('cuda_max_good', 0)) >= values['cuda_minimum']
               and math.isfinite(row['dph_total']) and row['dph_total'] >= 0]
     if not offers:
-        raise RuntimeError('No suitable single H100 SXM is available; no rental was requested.')
+        raise RuntimeError(f'No suitable single {profile.gpu_name} is available; no rental was requested.')
     return min(offers, key=lambda row: row['dph_total'])
 
 
@@ -317,7 +373,7 @@ def execute(job, instance, key):
     connection = ssh_connection(instance, key)
     deadline = job['expires_at'] - 5
     observe_until = job['expires_at'] - COLLECTION_SECONDS
-    destination = ROOT / 'results/runs' / job['id']
+    destination = results_directory(job) / 'runs' / job['id']
     destination.mkdir(parents=True, exist_ok=True)
 
     def remote(command, timeout=30, **kwargs):
@@ -330,13 +386,16 @@ def execute(job, instance, key):
                  capture_output=True, text=True).stdout.strip().splitlines()
     job['initial_gpu_observation'] = gpu
     save(job)
-    if (len(gpu) != 1 or not re.search(r'H100 (?:SXM|80GB HBM3)', gpu[0])
+    profile = profile_for_job(job)
+    pattern = profile.values.get('device_name_pattern', re.escape(profile.gpu_name))
+    if (len(gpu) != 1 or not re.search(pattern, gpu[0])
             or float(gpu[0].rsplit(',', 1)[1]) > 512):
-        raise RuntimeError('The rental does not provide one idle H100 SXM.')
+        raise RuntimeError(f'The rental does not provide one idle {profile.gpu_name}.')
     remote('mkdir -p autoresearch')
     job['transfer_started_at'] = time.time()
     save(job)
-    for path in [ROOT / 'artifacts/gpu-env.tar.gz', ROOT / 'artifacts/gpu-assets.tar.gz',
+    artifacts = artifact_directory(job)
+    for path in [artifacts / 'gpu-env.tar.gz', artifacts / 'gpu-assets.tar.gz',
                  job_path(job['id']).parent / 'source.tar.gz']:
         with path.open('rb') as source:
             remote('tar -xzf - -C autoresearch', timeout=900, stdin=source)
@@ -413,6 +472,9 @@ def execute(job, instance, key):
 def start(job):
     if job['phase'] != 'prepared':
         raise RuntimeError('This job already has a creation attempt; observe or expire it instead.')
+    profile = profile_for_job(job)
+    if profile.identifier != active_gpu().identifier:
+        raise RuntimeError('The prepared job belongs to an inactive GPU; only the user selects the GPU.')
     runtime_path = job_path(job['id']).parent / 'runtime.json'
     if digest(runtime_path) != job['runtime_manifest_sha256']:
         raise RuntimeError('The prepared runtime manifest changed.')
@@ -420,15 +482,15 @@ def start(job):
         raise RuntimeError('The prepared experiment sources changed.')
     manifest = json.loads(runtime_path.read_text())
     for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
-        if digest(ROOT / 'artifacts' / name) != manifest[field]:
+        if digest(artifact_directory(job) / name) != manifest[field]:
             raise RuntimeError('A prepared runtime archive changed; no rental was requested.')
     required_seconds = execution_budget(job)
     check_daily_budget(time.time())
     public = validate_environment()
-    offer = choose_offer()
+    offer = choose_offer(profile)
     if offer['dph_total'] > job['max_hourly_cost']:
-        raise RuntimeError('The current H100 offer exceeds the prepared cost limit.')
-    job.update(requested_at=time.time(), expires_at=time.time() + LEASE_SECONDS - CLEANUP_SECONDS,
+        raise RuntimeError('The current offer exceeds the prepared GPU cost limit.')
+    job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
                phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
                hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'))
     save(job)
@@ -437,7 +499,7 @@ def start(job):
     save(job)
     try:
         response = api('PUT', f"asks/{offer['id']}/", {
-            'client_id': 'me', 'image': manifest['container_image'], 'disk': 90,
+            'client_id': 'me', 'image': manifest['container_image'], 'disk': profile.values['disk_gb'],
             'label': job['label'], 'runtype': 'ssh_direc ssh_proxy', 'env': {}, 'cancel_unavail': True,
         })
         if response.get('success') is not True or not response.get('new_contract'):

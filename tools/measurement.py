@@ -34,9 +34,23 @@ def native_datasets_identity(tasks):
     return digest(json.dumps(datasets, sort_keys=True, separators=(",", ":")).encode())
 
 
-def prepare_semantics(source, roots=MEASUREMENT_ROOTS):
+def prepare_semantics(source, roots=MEASUREMENT_ROOTS, settings=None):
     """Hash BPB, allowed data and budgets with their transitive module dependencies."""
     tree = ast.parse(source)
+    if settings is not None:
+        # Resolve only the approved budget and cache relocation bindings. Everything
+        # that computes scores or selects data remains part of the original hash.
+        replacements = {
+            "TIME_BUDGET": ('active_gpu().settings()["training_seconds"]',
+                            repr(settings["training_seconds"])),
+            "TOKENIZER_DIR": ('str(active_gpu().cache_directory("tokenizer"))',
+                              'os.path.join(CACHE_DIR, "tokenizer")'),
+        }
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                replacement = replacements.get(node.targets[0].id)
+                if replacement and ast.dump(node.value) == ast.dump(ast.parse(replacement[0], mode="eval").body):
+                    node.value = ast.parse(replacement[1], mode="eval").body
     bindings = {}
     for node in tree.body:
         names = []
@@ -78,6 +92,18 @@ def from_snapshot(job, directory):
         if not member.isfile() or member.size > 2_000_000:
             raise ValueError("The archived measurement source is invalid.")
         source = archive.extractfile(member).read()
+        settings = None
+        if job.get("gpu_id"):
+            config = archive.extractfile("gpus.json").read()
+            if digest(config) != job["source_sha256"]["gpus.json"]:
+                raise ValueError("The archived GPU settings differ from their recorded hash.")
+            config = json.loads(config)
+            profile = config["gpus"][job["gpu_id"]]
+            settings = {name: profile[name] for name in
+                        ("training_seconds", "rental_seconds", "max_hourly_cost")}
+            if (config["active_gpu"] != job["gpu_id"] or settings != job["gpu_settings"]
+                    or profile["gpu_name"] != job["gpu_name"]):
+                raise ValueError("The frozen GPU settings differ from the prepared job.")
     if digest(source) != job["source_sha256"]["prepare.py"]:
         raise ValueError("The measurement source differs from its recorded hash.")
     runtime_bytes = (directory / "runtime.json").read_bytes()
@@ -85,7 +111,7 @@ def from_snapshot(job, directory):
         raise ValueError("The archived runtime differs from its recorded hash.")
     runtime = json.loads(runtime_bytes)
     definition = dict(
-        version=2, metric="val_bpb", prepare_semantics_sha256=prepare_semantics(source),
+        version=2, metric="val_bpb", prepare_semantics_sha256=prepare_semantics(source, settings=settings),
         dependencies={name: job["source_sha256"][name]
                       for name in ("pyproject.toml", "uv.lock")},
         gpu_name=job["gpu_name"], num_gpus=1,
@@ -99,7 +125,7 @@ def from_snapshot(job, directory):
         definition.update(version=3, metric=OLMES_METRIC,
                           prepare_semantics_sha256=prepare_semantics(source, (
                               "TIME_BUDGET", "download_data", "BASE_URL", "MAX_SHARD",
-                              "VAL_SHARD", "VAL_FILENAME", "DATA_DIR")),
+                              "VAL_SHARD", "VAL_FILENAME", "DATA_DIR"), settings=settings),
                           olmes={name: evaluation[name] for name in
                                  ("revision", "suites", "approved_config_fix", "native_datasets_sha256")})
         definition["dependencies"].update({name: job["source_sha256"][name] for name in
