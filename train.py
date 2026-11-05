@@ -919,6 +919,7 @@ total_training_time += tail_ema.apply()
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+print(f"reference_val_bpb: {val_bpb:.17g}", flush=True)
 olmes = evaluate_olmes(model, tokenizer)
 
 # Final summary

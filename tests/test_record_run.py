@@ -354,6 +354,16 @@ class RecordedDecisionTests(unittest.TestCase):
             self.make_run(identifier, val, metric=measurement.OLMES_METRIC, suites=suites)
             self.assertEqual(self.record(identifier)['status'], 'crash')
 
+    def test_preserves_the_reference_val_when_native_evaluation_fails(self):
+        self.make_run('old-baseline', 0.974083, baseline=True)
+        self.record('old-baseline')
+        _, directory = self.make_run('native-failure', 0.95, metric=measurement.OLMES_METRIC)
+        (directory / 'run.log').write_text('reference_val_bpb: 0.95\nNative evaluation failed.\n')
+        rental.save(dict(id='native-failure', phase='failed', exit_code=1))
+        failed = self.record('native-failure')
+        self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.95))
+        self.assertEqual(self.rows()[-1][1:4], ['0.000000'] * 3)
+
 
 if __name__ == '__main__':
     unittest.main()

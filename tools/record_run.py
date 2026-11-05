@@ -126,7 +126,7 @@ def decide(job, directory, incumbent):
         record.update(status='crash', val_bpb=None, memory_gb=0.0, validation_error=str(error))
         log_path = directory / 'run.log'
         if log_path.exists():
-            observed = re.findall(r'^val_bpb:\s+(\S+)', log_path.read_text(), flags=re.MULTILINE)
+            observed = re.findall(r'^(?:reference_)?val_bpb:\s+(\S+)', log_path.read_text(), flags=re.MULTILINE)
             if observed:
                 try:
                     value = float(observed[-1])
