@@ -30,6 +30,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Modify the evaluation harness, task set, examples, prompts, few-shot settings, scoring, aggregation, or acceptance threshold. CORE uses nanochat's unchanged implementation and official 22-task bundle, with every example (`max_per_task=-1`). `evaluate_bpb` stays unchanged as a reference metric.
 - Train on data that is not allowed. The allowed data is what `prepare.py` downloads, now FineWeb-Edu only. Only the human adds data, by adding it to `prepare.py`. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
+- Use other models in training: no distillation from a teacher, and no other model's weights or outputs.
 
 **The goal is simple: improve CORE.** A higher CORE score is better. Keep a candidate only when its unrounded CORE score exceeds the current best by **at least 0.01 absolute** (`candidate_core >= best_core + 0.01`). This threshold is fixed before the baseline; never change it after seeing results. `val_bpb` is recorded for reference only and never determines adoption. Every run still trains for 30 minutes and must finish, including both evaluations, within the 1-hour rental.
 
