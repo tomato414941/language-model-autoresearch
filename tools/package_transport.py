@@ -192,9 +192,11 @@ def package(reference, artifacts, verify_only=False, manifest=None, verification
         verify_command = ([str(boot / INTERPRETER), str(boot / 'runtime_unpack.py'), 'identity']
                           if parallel_decoder else
                           [str(boot / INTERPRETER), str(ROOT / 'tools/runtime_archives.py'), 'verify-stream'])
+        verification_started = time.monotonic()
         with payload.open('rb') as source:
             restored = json.loads(subprocess.check_output(
                 verify_command, stdin=source, text=True))
+        decoder_verification_seconds = time.monotonic() - verification_started
         if restored != original:
             raise ValueError('The compressed runtime must preserve every canonical file byte, mode and link.')
         if relocation_check:
@@ -224,7 +226,8 @@ def package(reference, artifacts, verify_only=False, manifest=None, verification
                   bootstrap_sha256=digest(bootstrap), gpu_env_xz_sha256=digest(payload),
                   bootstrap_bytes=bootstrap.stat().st_size, gpu_env_xz_bytes=payload.stat().st_size,
                   imports=imports, relocation_imports_checked=relocation_check,
-                  unchanged_runtime_verified=True, elapsed_seconds=time.time() - started)
+                  unchanged_runtime_verified=True, elapsed_seconds=time.time() - started,
+                  decoder_verification_seconds=decoder_verification_seconds)
     if parallel_decoder:
         report['decoder_source_sha256'] = decoder_sha256
     path = artifacts / 'transport.json'
