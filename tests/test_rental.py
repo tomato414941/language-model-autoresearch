@@ -15,6 +15,7 @@ class RentalLifecycleTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.root_patch = patch.object(rental, 'ROOT', self.root)
         self.root_patch.start()
+        self.collection_cases = 0
         self.job = dict(id='fixture', label='autoresearch-fixture', instance_id=42,
                         phase='running', creation_uncertain=False, expires_at=time.time() + 3500,
                         expected_core_seconds=900)
@@ -255,6 +256,81 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(rental.load('fixture')['exit_code'], 0)
         sample = json.loads((self.root / 'results/runs/fixture/gpu-observations.jsonl').read_text())
         self.assertEqual(sample['error_type'], 'TimeoutExpired')
+
+    def collect_at_boundary(self, exit_bytes, observed=None, fail_refresh=False):
+        identifier = f'collection-{self.collection_cases}'
+        self.collection_cases += 1
+        job = {**self.job, 'id': identifier, 'label': 'autoresearch-' + identifier, 'expires_at': 4500}
+        rental.job_path(identifier).parent.mkdir(parents=True)
+        rental.save(job)
+        for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):
+            path = self.root / 'artifacts' / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b'archive fixture')
+        (rental.job_path(identifier).parent / 'source.tar.gz').write_bytes(b'source fixture')
+        now = [1000]
+        launches, reads = [], {}
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            if text.startswith('nvidia-smi'):
+                fields = '0, 0' if 'utilization.gpu' in text else '0'
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, ' + fields + '\n')
+            if 'nohup bash gpu_run.sh' in text:
+                launches.append(text)
+            if 'kill -0' in text:
+                probe = 'running' if observed is None else f'exit {observed}'
+                return subprocess.CompletedProcess(arguments, 0, stdout=probe)
+            if text.startswith('cd autoresearch && cat '):
+                name = Path(text.split('cat ', 1)[1]).name
+                reads[name] = reads.get(name, 0) + 1
+                if name == 'run.exit':
+                    if exit_bytes is None:
+                        raise subprocess.CalledProcessError(1, arguments)
+                    kwargs['stdout'].write(exit_bytes)
+                elif name == 'run.log' and reads[name] == 1 and observed is None:
+                    kwargs['stdout'].write(b'snapshot-before-exit\n')
+                elif name == 'run.log' and fail_refresh:
+                    kwargs['stdout'].write(b'incomplete-transport-chunk')
+                    raise subprocess.TimeoutExpired(arguments, 5)
+                else:
+                    kwargs['stdout'].write(('final-' + name + '\n').encode())
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        def sleep(seconds):
+            now[0] = job['expires_at'] - rental.COLLECTION_SECONDS
+
+        with patch.object(rental, 'ssh_connection', return_value=['ssh']):
+            with patch.object(rental, 'run', side_effect=command):
+                with patch.object(rental.time, 'time', side_effect=lambda: now[0]):
+                    with patch.object(rental.time, 'sleep', side_effect=sleep):
+                        rental.execute(job, {}, self.root / 'key')
+        return rental.load(identifier), reads, launches
+
+    def test_observes_completion_during_collection_and_preserves_the_final_artifact_snapshot(self):
+        job, reads, launches = self.collect_at_boundary(b'0\n')
+        self.assertEqual((job['phase'], job['exit_code']), ('evaluated', 0))
+        self.assertTrue(job['exit_code_observed_in_collection'])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual((self.root / 'results/runs' / job['id'] / 'run.log').read_bytes(), b'final-run.log\n')
+        self.assertEqual(reads['run.log'], 2)
+
+    def test_keeps_failed_or_unconfirmed_collected_processes_failed(self):
+        for content, code in ((b'1\n', 1), (b'137\n', 137), (b'0 invalid\n', None), (b'', None), (None, None)):
+            with self.subTest(content=content):
+                job, reads, launches = self.collect_at_boundary(content)
+                self.assertEqual((job['phase'], job['exit_code']), ('failed', code))
+                self.assertEqual(len(launches), 1)
+
+    def test_preserves_the_previous_artifact_when_a_final_snapshot_copy_times_out(self):
+        job, reads, launches = self.collect_at_boundary(b'0\n', fail_refresh=True)
+        self.assertEqual(job['exit_code'], 0)
+        self.assertEqual((self.root / 'results/runs' / job['id'] / 'run.log').read_bytes(), b'snapshot-before-exit\n')
+        self.assertEqual(len(launches), 1)
+
+    def test_rejects_conflicting_exit_status_observations(self):
+        with self.assertRaisesRegex(RuntimeError, 'Exit status'):
+            self.collect_at_boundary(b'1\n', observed=0)
 
     def test_records_timestamped_gpu_memory_and_utilization_samples_in_order(self):
         results = [subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, 96\n'),

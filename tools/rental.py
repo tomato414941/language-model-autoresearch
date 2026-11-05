@@ -352,12 +352,33 @@ def execute(job, instance, key):
             print('Observation failed; rechecking the same rental:', type(error).__name__, flush=True)
             connection = ssh_connection(instance, key, prefer_direct=False)
         time.sleep(min(30, max(0, observe_until - time.time())))
-    for name in ('run.log', 'prepare.log', 'bootstrap.log', 'run.exit', 'results/core.json', 'results/core.csv'):
-        try:
-            with (destination / Path(name).name).open('wb') as output:
-                remote('cd autoresearch && cat ' + shlex.quote(name), stdout=output, stderr=subprocess.DEVNULL)
-        except (subprocess.SubprocessError, OSError, TimeoutError):
-            pass
+    artifacts = ('run.log', 'prepare.log', 'bootstrap.log', 'results/core.json', 'results/core.csv')
+
+    def collect(names):
+        for name in names:
+            path = destination / Path(name).name
+            temporary = path.with_name(path.name + '.tmp')
+            try:
+                with temporary.open('wb') as output:
+                    remote('cd autoresearch && cat ' + shlex.quote(name), stdout=output, stderr=subprocess.DEVNULL)
+                temporary.replace(path)
+            except (subprocess.SubprocessError, OSError, TimeoutError):
+                temporary.unlink(missing_ok=True)
+
+    collect((*artifacts, 'run.exit'))
+    try:
+        text = (destination / 'run.exit').read_text().strip()
+        collected_status = int(text) if re.fullmatch(r'[0-9]{1,3}', text) and int(text) <= 255 else None
+    except (OSError, UnicodeError):
+        collected_status = None
+    if status is not None and collected_status is not None and status != collected_status:
+        raise RuntimeError('Exit status changed between observation and collection.')
+    if status is None and collected_status is not None:
+        status = collected_status
+        job['exit_code_observed_in_collection'] = True
+        job['completed_observed_at'] = time.time()
+        # The process is now terminal; refresh its final files without restarting it.
+        collect(artifacts)
     job['exit_code'] = status
     job['phase'] = 'evaluated' if status == 0 else 'failed'
     job['collected_at'] = time.time()
