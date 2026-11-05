@@ -437,6 +437,7 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
     documents = LengthIndexedDocuments()
     epoch = 1
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    row_values = row_buffer.numpy()
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
@@ -455,7 +456,7 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
                 document = documents.pop_best(remaining)
                 if len(document) > remaining:
                     document = document[:remaining]
-                row_buffer[row_idx, pos:pos + len(document)] = torch.tensor(document, dtype=torch.long)
+                row_values[row_idx, pos:pos + len(document)] = document
                 pos += len(document)
         # Pinned host storage must remain unchanged until its prior H2D copy completes.
         if transfer_done is not None:
