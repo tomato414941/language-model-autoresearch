@@ -83,14 +83,16 @@ class NativeProtocolTests(unittest.TestCase):
             task.build_all_requests()
             raw = [instance.to_dict() for instance in task._instances]
             entry = {"index": 0, "native_config": task_config, "task_hash": task._task_hash,
-                     "resolved_task_config": deepcopy(task.task_config), "requests": len(raw)}
+                     "resolved_task_config": deepcopy(task.task_config), "requests": len(raw), "examples": 2}
             compute = deepcopy(config["compute_config"])
             compute["output_dir"] = str(Path(directory) / "prepared")
             Path(compute["output_dir"]).mkdir()
             with patch.object(run_eval, "load_task", side_effect=synthetic_task):
                 actual = score_task(ForwardProbe(self.tokenizer, max_length=64, batch_size=2),
                                     entry, raw, task._instances, config["model_config"], compute)
-            self.assertEqual(actual["metrics"], native_metrics["metrics"])
+            for name in ("bits_per_byte_corr", "primary_score"):
+                self.assertEqual(actual["metrics"][name], native_metrics["metrics"][name])
+            self.assertEqual(actual["computation"]["computed_requests"], 2)
             self.assertEqual(actual["num_instances"], native_metrics["num_instances"])
             self.assertEqual(actual["task_config"], native_metrics["task_config"])
 

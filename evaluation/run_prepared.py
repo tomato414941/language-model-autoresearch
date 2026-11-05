@@ -32,6 +32,7 @@ def main():
         "approved_config_fix": APPROVED_CONFIG_FIX,
         "suites": suites, "complete": True, "leaf_tasks": len(manifest["tasks"]),
         "examples": manifest["total_examples"], "requests": manifest["total_requests"],
+        "computation": "correct_answer_only", "computed_requests": manifest["computed_requests"],
         "checkpoint_sha256": sha256_file(args.checkpoint),
         "model_source_sha256": model.source_sha256,
         "tokenizer_sha256": sha256_file(args.tokenizer),

@@ -26,7 +26,7 @@ from tools.vast_control import api, list_instances
 
 SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
-    'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'model.py', 'prepare_requests.py',
+    'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
     'protocol.py', 'run_prepared.py', 'tokenizer_adapter.py', 'verify_requests.py',
     'pyproject.toml', 'uv.lock', 'patches/olmes-arc-bpb-macro.patch',
 ))

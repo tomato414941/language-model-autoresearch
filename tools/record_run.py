@@ -66,6 +66,9 @@ def read_metrics(job, directory):
         if (rental.digest(directory / 'olmes-metrics.jsonl') != summary['metrics_all_sha256']
                 or rental.digest(directory / 'final-model.pt') != summary['checkpoint_sha256']):
             raise ValueError('The native metrics or model checkpoint are incomplete.')
+        for name in ('computation', 'computed_requests'):
+            if name in expected and summary.get(name) != expected[name]:
+                raise ValueError('The computed correct-answer measurements differ from the prepared plan.')
         result.update({name: values[name] for name in SUITE_METRICS})
     return result
 

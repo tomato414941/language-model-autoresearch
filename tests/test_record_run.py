@@ -60,6 +60,7 @@ class RecordedDecisionTests(unittest.TestCase):
                 approved_config_fix={'arc:rc:bpb::olmes:full': {'primary_metric': 'macro'}},
                 native_datasets_sha256='fixed complete native datasets',
                 request_manifest_sha256='fixed full requests', leaf_tasks=109,
+                computation='correct_answer_only', computed_requests=99886,
                 examples=99886, requests=654536))
         runtime.update(runtime_changes or {})
         (snapshot / 'runtime.json').write_text(json.dumps(runtime))
@@ -83,6 +84,7 @@ class RecordedDecisionTests(unittest.TestCase):
                            native_request_manifest_sha256=runtime['olmes']['request_manifest_sha256'],
                            tokenizer_sha256=runtime['tokenizer']['tokenizer.pkl'],
                            suites=values, leaf_tasks=109, examples=99886, requests=654536,
+                           computation='correct_answer_only', computed_requests=99886,
                            metrics_all_sha256=rental.digest(directory / 'olmes-metrics.jsonl'),
                            checkpoint_sha256=rental.digest(directory / 'final-model.pt'))
             (directory / 'olmes-summary.json').write_text(json.dumps(summary))
@@ -372,6 +374,17 @@ class RecordedDecisionTests(unittest.TestCase):
         self.assertEqual(measurement.native_datasets_identity(changed_order), first)
         changed_data = [dict(entry, dataset_fingerprints={'test': 'different'}) for entry in tasks]
         self.assertNotEqual(measurement.native_datasets_identity(changed_data), first)
+
+    def test_requires_one_correct_answer_measurement_for_every_original_example(self):
+        native = measurement.OLMES_METRIC
+        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
+        self.record('native-baseline')
+        _, directory = self.make_run('missing-example', 0.9, metric=native)
+        path = directory / 'olmes-summary.json'
+        summary = json.loads(path.read_text())
+        summary['computed_requests'] -= 1
+        path.write_text(json.dumps(summary))
+        self.assertEqual(self.record('missing-example')['status'], 'crash')
 
 
 if __name__ == '__main__':

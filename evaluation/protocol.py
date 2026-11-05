@@ -16,6 +16,7 @@ from oe_eval.utils import hash_dict, save_jsonl
 
 from evaluation.count_tokens import OLMES_REVISION, SUITES
 from evaluation.arc_macro import configure_aggregation
+from evaluation.gold_bpb import GoldAnswerBPB, gold_request_indices
 
 SUITE_FIELDS = dict(zip(SUITES, ("qa_bpb", "math_bpb", "code_bpb"), strict=True))
 
@@ -60,19 +61,16 @@ def score_task(model, entry, raw_requests, instances, model_config, compute_conf
         raise ValueError("The native task configuration differs from its prepared requests.")
     task.task_config = deepcopy(entry["resolved_task_config"])
     task.set_model(model, model_config)
-    task._instances = instances
-    results = run_eval.evaluate(model, instances, task.task_config, model_config)
-    if len(results) != entry["requests"]:
-        raise ValueError("Native inference did not return every request.")
+    selected = gold_request_indices(instances, task.task_config)
+    if len(selected) != entry["examples"]:
+        raise ValueError("Every original example must retain its correct-answer measurement.")
+    task._instances = [instances[index] for index in selected]
+    results = run_eval.evaluate(model, task._instances, task.task_config, model_config)
+    if len(results) != len(selected):
+        raise ValueError("Inference did not return every correct-answer measurement.")
     task.model = None
-    # These are the native runner's metric initialization steps, including gold-answer BPB.
     task.make_metrics()
-    if task.task_config["primary_metric"] == "bits_per_byte_corr":
-        if not task.task_config["compute_gold_bpb"]:
-            raise ValueError("The native gold-answer BPB configuration is required.")
-        task._metrics = [run_eval.MCAccuracy(**task.task_config["metric_kwargs"])]
-    if not task._metrics or any(metric.deferred_metric for metric in task._metrics):
-        raise ValueError("These complete BPB suites require native immediate metrics.")
+    task._metrics = [GoldAnswerBPB(**(task.task_config["metric_kwargs"] or {}))]
     model_hash = hash_dict(model_config, run_eval.MODEL_DEFAULTS)
     full_config = {
         "task_name": task.task_name, "task_hash": task._task_hash["hash"],
@@ -81,9 +79,11 @@ def score_task(model, entry, raw_requests, instances, model_config, compute_conf
         "processing_time": time.monotonic() - started,
         "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "num_instances": 0, "beaker_info": {},
+        "computation": {"method": "correct_answer_only", "source_requests": entry["requests"],
+                        "computed_requests": len(selected)},
     }
     metrics = run_eval.compute_save_metrics(
-        entry["index"], task, full_config, compute_config, raw_requests, results)
+        entry["index"], task, full_config, compute_config, [raw_requests[index] for index in selected], results)
     value = metrics["metrics"]["primary_score"]
     if not math.isfinite(value) or value < 0:
         raise ValueError("A native task did not produce finite nonnegative BPB.")
@@ -124,6 +124,7 @@ def evaluate_prepared(model, directory, output):
     for entry in manifest["tasks"]:
         raw, instances = read_requests(directory, entry)
         metrics.append(score_task(model, entry, raw, instances, config["model_config"], compute))
+    manifest["computed_requests"] = sum(task["computation"]["computed_requests"] for task in metrics)
     suites, aggregates = aggregate_suites(metrics, [entry["alias"] for entry in manifest["tasks"]])
     save_jsonl(output / "metrics-all.jsonl", aggregates + metrics)
     return suites, manifest
