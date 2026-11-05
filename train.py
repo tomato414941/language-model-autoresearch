@@ -15,7 +15,6 @@ import math
 import time
 from dataclasses import dataclass, asdict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -370,45 +369,22 @@ class GPT(nn.Module):
         logits = softcap_logits(self.lm_head(hidden))
         return F.cross_entropy(logits, targets, ignore_index=-1, reduction='sum')
 
-    def _candidate_loss_sum(self, hidden, targets, candidate_ids):
-        weights = self.lm_head.weight.index_select(0, candidate_ids)
-        logits = softcap_logits(F.linear(hidden, weights))
-        return F.cross_entropy(logits, targets, ignore_index=-1, reduction='sum')
-
-    def _training_loss(self, hidden, targets, candidate_ids=None, candidate_targets=None):
+    def _training_loss(self, hidden, targets):
         # Bound output-layer activations by recomputing one token chunk during backward.
         # https://docs.pytorch.org/docs/2.9/checkpoint.html
         hidden = hidden.reshape(-1, hidden.size(-1))
         targets = targets.reshape(-1)
         chunk_size = self.config.training_loss_chunk_size
-        if candidate_ids is not None:
-            assert candidate_targets is not None
-            candidate_targets = candidate_targets.reshape(-1)
-            assert candidate_targets.shape == targets.shape
-            assert candidate_ids.ndim == 2 and candidate_ids.dtype == torch.long
-            assert candidate_ids.size(0) == (hidden.size(0) + chunk_size - 1) // chunk_size
-        else:
-            assert candidate_targets is None
         loss = hidden.new_zeros((), dtype=torch.float32)
-        for index, start in enumerate(range(0, hidden.size(0), chunk_size)):
+        for start in range(0, hidden.size(0), chunk_size):
             stop = start + chunk_size
-            if candidate_ids is None:
-                loss = loss + torch.utils.checkpoint.checkpoint(
-                    self._loss_sum, hidden[start:stop], targets[start:stop],
-                    use_reentrant=False, preserve_rng_state=False,
-                )
-            else:
-                loss = loss + torch.utils.checkpoint.checkpoint(
-                    self._candidate_loss_sum, hidden[start:stop], candidate_targets[start:stop],
-                    candidate_ids[index], use_reentrant=False, preserve_rng_state=False,
-                )
+            loss = loss + torch.utils.checkpoint.checkpoint(
+                self._loss_sum, hidden[start:stop], targets[start:stop],
+                use_reentrant=False, preserve_rng_state=False,
+            )
         return loss / (targets != -1).sum()
 
-    def forward(self, idx, targets=None, reduction='mean', candidate_ids=None, candidate_targets=None):
-        if candidate_ids is not None or candidate_targets is not None:
-            if not (targets is not None and reduction == 'mean' and self.training
-                    and torch.is_grad_enabled() and self.config.training_loss_chunk_size > 0):
-                raise ValueError('Candidate sets apply only to the chunked training mean loss.')
+    def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -447,7 +423,7 @@ class GPT(nn.Module):
 
         if (targets is not None and reduction == 'mean' and self.training
                 and torch.is_grad_enabled() and self.config.training_loss_chunk_size > 0):
-            return self._training_loss(x, targets, candidate_ids, candidate_targets)
+            return self._training_loss(x, targets)
 
         logits = softcap_logits(self.lm_head(x))
 
@@ -532,8 +508,7 @@ class LengthIndexedDocuments:
         return document
 
 
-def make_training_dataloader(tokenizer, B, T, buffer_size=1000, candidate_state=None,
-                             candidate_width=4096, head_chunk_size=16384):
+def make_training_dataloader(tokenizer, B, T, buffer_size=1000):
     # Keep prepare.py's document stream, refill boundary, cropping and shifted targets.
     # Per-length FIFO queues preserve its first-match tie rule without scanning every document.
     row_capacity = T + 1
@@ -549,15 +524,6 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000, candidate_state=
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
-    if candidate_state is not None:
-        vocabulary = tokenizer.get_vocab_size()
-        chunks = (B * T + head_chunk_size - 1) // head_chunk_size
-        candidate_cpu = torch.empty((chunks, candidate_width), dtype=torch.long, pin_memory=True)
-        mapped_cpu = torch.empty((B, T), dtype=torch.long, pin_memory=True)
-        candidate_values = candidate_cpu.numpy()
-        mapped_values = mapped_cpu.numpy()
-        candidate_gpu = torch.empty((chunks, candidate_width), dtype=torch.long, device="cuda")
-        mapped_gpu = torch.empty((B, T), dtype=torch.long, device="cuda")
     transfer_done = None
     while True:
         for row_idx in range(B):
@@ -572,33 +538,17 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000, candidate_state=
                     document = document[:remaining]
                 row_values[row_idx, pos:pos + len(document)] = document
                 pos += len(document)
-        plan = None
-        if candidate_state is not None and candidate_state['enabled']:
-            plan = build_candidate_batch(row_values[:, 1:], vocabulary, candidate_width,
-                                         head_chunk_size, candidate_state['offset'])
-            candidate_state['offset'] = plan.next_offset
-            candidate_state['fallback_batches'] += int(plan.fallback)
         # Pinned host storage must remain unchanged until its prior H2D copy completes.
         if transfer_done is not None:
             transfer_done.synchronize()
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
         gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        ids = mapped = None
-        if plan is not None and plan.token_ids is not None:
-            candidate_values[:] = plan.token_ids
-            mapped_values[:] = plan.target_positions
-            candidate_gpu.copy_(candidate_cpu, non_blocking=True)
-            mapped_gpu.copy_(mapped_cpu, non_blocking=True)
-            ids, mapped = candidate_gpu, mapped_gpu
         if gpu_buffer.is_cuda:
             if transfer_done is None:
                 transfer_done = torch.cuda.Event()
             transfer_done.record()
-        if candidate_state is None:
-            yield inputs, targets, epoch
-        else:
-            yield inputs, targets, epoch, ids, mapped
+        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
@@ -763,94 +713,6 @@ def scale_adam_second_moments(optimizer, batch_ratio):
             beta1, beta2 = group['betas']
             group['betas'] = (beta1, beta2 ** batch_ratio)
 
-@dataclass
-class CandidateSet:
-    token_ids: np.ndarray
-    target_positions: np.ndarray
-    distinct_targets: int
-    fallback: bool
-    next_offset: int
-
-
-def _validate(targets, vocabulary, width, stride):
-    if vocabulary <= 0 or not 0 < width <= vocabulary:
-        raise ValueError("The candidate width must lie within a positive vocabulary.")
-    if math.gcd(stride, vocabulary) != 1:
-        raise ValueError("The negative stride must be coprime with the vocabulary.")
-    targets = np.asarray(targets)
-    if not np.issubdtype(targets.dtype, np.integer):
-        raise ValueError("Targets must be integer token IDs.")
-    valid = targets != -1
-    if np.any(targets[valid] < 0) or np.any(targets[valid] >= vocabulary):
-        raise ValueError("Targets must be vocabulary IDs or the ignored-target value -1.")
-    return targets, valid
-
-
-def build_candidates(targets, vocabulary, width, offset=0, stride=20011):
-    """Include every true target, fill with rotating negatives, or use the full vocabulary."""
-    targets, valid = _validate(targets, vocabulary, width, stride)
-    positives = np.unique(targets[valid])
-    fallback = len(positives) > width
-    next_offset = offset % vocabulary
-    if fallback or width == vocabulary:
-        candidates = np.arange(vocabulary, dtype=np.int64)
-    else:
-        marked = np.zeros(vocabulary, dtype=bool)
-        marked[positives] = True
-        needed = width - len(positives)
-        if needed:
-            order = ((np.arange(vocabulary, dtype=np.int64) + next_offset) % vocabulary)
-            sweep = (order * stride) % vocabulary
-            eligible_positions = np.flatnonzero(~marked[sweep])[:needed]
-            negatives = sweep[eligible_positions]
-            next_offset = (next_offset + int(eligible_positions[-1]) + 1) % vocabulary
-            candidates = np.sort(np.concatenate((positives, negatives))).astype(np.int64)
-        else:
-            candidates = positives.astype(np.int64, copy=True)
-    positions = np.full(vocabulary, -1, dtype=np.int64)
-    positions[candidates] = np.arange(len(candidates))
-    mapped = np.full(targets.shape, -1, dtype=np.int64)
-    mapped[valid] = positions[targets[valid]]
-    if np.any(mapped[valid] < 0):
-        raise RuntimeError("Every true target must be present in the candidate set.")
-    return CandidateSet(candidates, mapped, len(positives), fallback, next_offset)
-
-
-@dataclass
-class CandidateBatch:
-    token_ids: np.ndarray | None
-    target_positions: np.ndarray | None
-    distinct_targets: np.ndarray
-    fallback: bool
-    next_offset: int
-
-
-def build_candidate_batch(targets, vocabulary, width, chunk_size, offset=0, stride=20011):
-    """Prepare uniform-width chunks, using the original full loss for an overflowing batch."""
-    targets, valid = _validate(targets, vocabulary, width, stride)
-    if chunk_size <= 0 or targets.size == 0:
-        raise ValueError("A batch needs targets and a positive head chunk size.")
-    flat = targets.reshape(-1)
-    chunks = [flat[start:start + chunk_size] for start in range(0, flat.size, chunk_size)]
-    counts = np.array([len(np.unique(chunk[chunk != -1])) for chunk in chunks], dtype=np.int64)
-    fallback = bool(np.any(counts > width))
-    if fallback or width == vocabulary:
-        return CandidateBatch(None, None, counts, fallback, offset % vocabulary)
-    ids = []
-    positions = []
-    for chunk in chunks:
-        result = build_candidates(chunk, vocabulary, width, offset, stride)
-        ids.append(result.token_ids)
-        positions.append(result.target_positions)
-        offset = result.next_offset
-    return CandidateBatch(np.stack(ids), np.concatenate(positions).reshape(targets.shape),
-                          counts, False, offset)
-
-
-def sampled_phase_active(step, elapsed, budget, end_fraction):
-    return step > 0 and elapsed < budget * end_fraction
-
-
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
@@ -875,8 +737,6 @@ FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
 TAIL_EMA_START = 0.80   # fraction of timed training before averaging begins
 TAIL_EMA_TAU = 0.075    # time constant as a fraction of the fixed training budget
 TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
-SAMPLED_CANDIDATES = 4096
-SAMPLED_END_FRACTION = 0.80
 
 # Model size
 DEPTH = 10              # number of transformer layers
@@ -928,7 +788,6 @@ print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-assert grad_accum_steps == 1, "The sampled pipeline requires one microbatch per update."
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -942,12 +801,8 @@ scale_adam_second_moments(optimizer, TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE)
 tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
 
-candidate_state = dict(enabled=False, offset=0, fallback_batches=0)
-train_loader = make_training_dataloader(
-    tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, candidate_state=candidate_state,
-    candidate_width=SAMPLED_CANDIDATES, head_chunk_size=config.training_loss_chunk_size,
-)
-x, y, epoch, candidate_ids, candidate_targets = next(train_loader)
+train_loader = make_training_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
+x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -990,33 +845,18 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
-timed_estimated_flops = 0
-sampled_timed_steps = dense_timed_steps = 0
-head_projection_flops = 8 * model.lm_head.weight.numel()
 step = 0
 
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
-    step_estimated_flops = 0
-    sampled_step = False
     for micro_step in range(grad_accum_steps):
-        use_candidates = sampled_phase_active(step, total_training_time, TIME_BUDGET,
-                                              SAMPLED_END_FRACTION)
-        active_ids = candidate_ids if use_candidates else None
-        active_targets = candidate_targets if active_ids is not None else None
-        active_width = vocab_size if active_ids is None else active_ids.size(1)
-        sampled_step = active_ids is not None
-        step_estimated_flops += (num_flops_per_token - head_projection_flops *
-                                (1 - active_width / vocab_size)) * tokens_per_fwdbwd
         with autocast_ctx:
-            loss = model(x, y, candidate_ids=active_ids, candidate_targets=active_targets)
+            loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        candidate_state['enabled'] = sampled_phase_active(
-            step + 1, total_training_time, TIME_BUDGET, SAMPLED_END_FRACTION)
-        x, y, epoch, candidate_ids, candidate_targets = next(train_loader)
+        x, y, epoch = next(train_loader)
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -1045,9 +885,6 @@ while True:
 
     if step > 10:
         total_training_time += dt
-        timed_estimated_flops += step_estimated_flops
-        sampled_timed_steps += int(sampled_step)
-        dense_timed_steps += int(not sampled_step)
 
     # Logging
     ema_beta = 0.9
@@ -1055,7 +892,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * step_estimated_flops / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -1089,7 +926,7 @@ save_core_results(core_results)
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * timed_estimated_flops / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
@@ -1099,9 +936,6 @@ print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"sampled_steps:    {sampled_timed_steps}")
-print(f"dense_steps:      {dense_timed_steps}")
-print(f"sampler_fallback_batches: {candidate_state['fallback_batches']}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
