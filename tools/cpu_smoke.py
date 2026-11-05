@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch._higher_order_ops import foreach_map
 
 torch.set_num_threads(2)
 
@@ -25,7 +26,7 @@ def load_model_namespace(path=None):
             node.decorator_list = [d for d in node.decorator_list if not (
                 isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == 'compile')]
     namespace = {'__name__': '__main__', 'torch': torch, 'nn': nn, 'F': F, 'math': math, 'time': time,
-                 'bisect': bisect, 'deque': deque,
+                 'bisect': bisect, 'deque': deque, 'foreach_map': foreach_map,
                  'dataclass': dataclasses.dataclass, 'fa3': types.SimpleNamespace(flash_attn_func=attention)}
     exec(compile(ast.fix_missing_locations(tree), 'train.py', 'exec'), namespace)
     return namespace
