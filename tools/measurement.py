@@ -9,7 +9,12 @@ import tarfile
 
 RUNTIME_FIELDS = (
     "python_version", "kernel_repo", "kernel_revision", "container_image",
-    "nanochat_revision", "core_bundle_sha256", "gpu_env_sha256",
+    "gpu_env_sha256",
+)
+
+MEASUREMENT_ROOTS = (
+    "evaluate_bpb", "download_data", "train_tokenizer", "MAX_SEQ_LEN", "TIME_BUDGET",
+    "BASE_URL", "MAX_SHARD", "VAL_SHARD", "VAL_FILENAME", "DATA_DIR",
 )
 
 
@@ -18,18 +23,36 @@ def digest(value):
 
 
 def prepare_semantics(source):
+    """Hash BPB, allowed data and budgets with their transitive module dependencies."""
     tree = ast.parse(source)
-    body = []
+    bindings = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "core_improves":
+        names = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [alias.asname or alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [value.id for target in targets for value in ast.walk(target)
+                     if isinstance(value, ast.Name) and isinstance(value.ctx, ast.Store)]
+        for name in names:
+            bindings.setdefault(name, []).append(node)
+    if not {"evaluate_bpb", "TIME_BUDGET"} <= bindings.keys():
+        raise ValueError("The archived source must define BPB evaluation and its training budget.")
+    pending = list(MEASUREMENT_ROOTS)
+    selected = set()
+    seen = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
             continue
-        targets = (node.targets if isinstance(node, ast.Assign) else
-                   [node.target] if isinstance(node, ast.AnnAssign) else [])
-        if targets and all(isinstance(target, ast.Name) and target.id == "CORE_MIN_DELTA"
-                           for target in targets):
-            continue
-        body.append(node)
-    tree.body = body
+        seen.add(name)
+        for node in bindings.get(name, ()):
+            selected.add(node)
+            pending.extend(value.id for value in ast.walk(node)
+                           if isinstance(value, ast.Name) and isinstance(value.ctx, ast.Load))
+    tree.body = [node for node in tree.body if node in selected]
     return digest(ast.dump(tree, include_attributes=False).encode())
 
 
@@ -50,7 +73,7 @@ def from_snapshot(job, directory):
         raise ValueError("The archived runtime differs from its recorded hash.")
     runtime = json.loads(runtime_bytes)
     definition = dict(
-        version=1, prepare_semantics_sha256=prepare_semantics(source),
+        version=2, metric="val_bpb", prepare_semantics_sha256=prepare_semantics(source),
         dependencies={name: job["source_sha256"][name]
                       for name in ("pyproject.toml", "uv.lock")},
         gpu_name=job["gpu_name"], num_gpus=1,

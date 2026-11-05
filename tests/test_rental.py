@@ -18,7 +18,7 @@ class RentalLifecycleTests(unittest.TestCase):
         self.collection_cases = 0
         self.job = dict(id='fixture', label='autoresearch-fixture', instance_id=42,
                         phase='running', creation_uncertain=False, expires_at=time.time() + 3500,
-                        expected_core_seconds=900)
+                        expected_eval_seconds=900)
         rental.job_path(self.job['id']).parent.mkdir(parents=True)
         rental.save(self.job)
 
@@ -183,7 +183,7 @@ class RentalLifecycleTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     rental.arm_expiry(self.job)
 
-    def test_reserves_time_for_thirty_minute_training_and_the_complete_core_evaluation(self):
+    def test_reserves_time_for_thirty_minute_training_and_bpb_evaluation(self):
         with patch.object(rental.time, 'time', return_value=1000):
             with self.assertRaises(TimeoutError):
                 rental.require_execution_time({**self.job, 'expires_at': 2900})
@@ -193,7 +193,7 @@ class RentalLifecycleTests(unittest.TestCase):
         for estimate in (0, -1, float('nan'), float('inf'), 2000):
             with self.subTest(estimate=estimate):
                 with self.assertRaises(ValueError):
-                    rental.execution_budget(dict(expected_core_seconds=estimate))
+                    rental.execution_budget(dict(expected_eval_seconds=estimate))
 
     def test_ends_setup_when_transfer_uses_the_time_needed_for_the_full_evaluation(self):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):

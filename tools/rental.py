@@ -28,7 +28,7 @@ SOURCES = ('train.py', 'prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
 FRAME_SOURCES = SOURCES[1:]
 LEASE_SECONDS = 3600
 CLEANUP_SECONDS = 60
-EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup, compilation and reference BPB estimate.
+EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
 COLLECTION_SECONDS = 45
 PROJECT_LABELS = ('autoresearch-',)
 
@@ -158,7 +158,7 @@ def finalize(job):
     if (current.get('creation_requested_at') is not None
             and not current.get('creation_rejected')
             and current['phase'] in ('evaluated', 'failed')):
-        # Record only after deletion; the existing ledger validates native artifacts and is idempotent.
+        # Record only after deletion; the existing ledger validates the log and is idempotent.
         run([sys.executable, str(ROOT / 'tools/record_run.py'), current['id']])
 
 
@@ -176,10 +176,10 @@ def validate_environment():
 def execution_budget(job):
     from prepare import TIME_BUDGET
 
-    expected_core = float(job['expected_core_seconds'])
-    if not math.isfinite(expected_core) or expected_core <= 0:
-        raise ValueError('Reserve a positive finite duration for the complete CORE evaluation.')
-    required = TIME_BUDGET + expected_core + EXECUTION_SETUP_SECONDS + COLLECTION_SECONDS
+    expected_eval = float(job['expected_eval_seconds'])
+    if not math.isfinite(expected_eval) or expected_eval <= 0:
+        raise ValueError('Reserve a positive finite duration for BPB evaluation.')
+    required = TIME_BUDGET + expected_eval + EXECUTION_SETUP_SECONDS + COLLECTION_SECONDS
     if required >= LEASE_SECONDS - CLEANUP_SECONDS:
         raise ValueError('The prepared runtime estimate does not fit inside the rental.')
     return required
@@ -190,22 +190,17 @@ def require_execution_time(job):
         raise TimeoutError('Insufficient time remains for training and the complete fixed evaluation.')
 
 
-def prepare_job(commit, baseline, description, expected_core_seconds=None):
+def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     import prepare
 
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('Pass the full commit from the local Git checkout.')
-    prepare.verify_core_assets()
-    preflight = json.loads((ROOT / 'results/core-preflight.json').read_text())
-    if (len(preflight['tasks']) != 22 or preflight['bundle_sha256'] != prepare.CORE_BUNDLE_SHA256
-            or preflight['nanochat_revision'] != prepare.CORE_NANOCHAT_REVISION):
-        raise RuntimeError('The complete prompt preflight is not ready for this frame.')
-    if preflight['tokenizer_sha256'] != digest(Path(prepare.TOKENIZER_DIR) / 'tokenizer.pkl'):
-        raise RuntimeError('The tokenizer differs from the completed prompt preflight.')
-    if expected_core_seconds is None:
-        expected_core_seconds = sum(task['seconds'] for task in preflight['tasks'])
-    execution_budget(dict(expected_core_seconds=expected_core_seconds))
+    from tools.package_runtime import verify_tokenizer
+    tokenizer_hashes = verify_tokenizer()
+    execution_budget(dict(expected_eval_seconds=expected_eval_seconds))
     manifest = json.loads((ROOT / 'artifacts/runtime.json').read_text())
+    if manifest['tokenizer'] != tokenizer_hashes:
+        raise RuntimeError('The tokenizer differs from the packaged BPB assets.')
     hashes = {name: digest(ROOT / name) for name in SOURCES}
     for name in FRAME_SOURCES:
         if hashes[name] != manifest['sources'][name]:
@@ -229,7 +224,7 @@ def prepare_job(commit, baseline, description, expected_core_seconds=None):
                description=description, phase='prepared', source_sha256=hashes,
                source_archive_sha256=digest(directory / 'source.tar.gz'),
                runtime_manifest_sha256=digest(ROOT / 'artifacts/runtime.json'), max_hourly_cost=5.0,
-               expected_core_seconds=expected_core_seconds)
+               expected_eval_seconds=expected_eval_seconds, metric='val_bpb')
     save(job)
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
 
@@ -373,7 +368,7 @@ def execute(job, instance, key):
             print('Observation failed; rechecking the same rental:', type(error).__name__, flush=True)
             connection = ssh_connection(instance, key, prefer_direct=False)
         time.sleep(min(30, max(0, observe_until - time.time())))
-    artifacts = ('run.log', 'prepare.log', 'bootstrap.log', 'results/core.json', 'results/core.csv')
+    artifacts = ('run.log', 'prepare.log', 'bootstrap.log')
 
     def collect(names):
         for name in names:
@@ -470,7 +465,7 @@ def start(job):
                     break
                 time.sleep(15)
             else:
-                raise TimeoutError('The rental did not become ready in time for training and the complete CORE suite.')
+                raise TimeoutError('The rental did not become ready in time for training and BPB evaluation.')
     except BaseException as error:
         if isinstance(error, urllib.error.HTTPError) and error.code in (400, 401, 402, 403, 404, 409, 410, 422, 429):
             if not job.get('instance_id'):
@@ -540,7 +535,7 @@ def main():
     preparation.add_argument('--commit', required=True)
     preparation.add_argument('--baseline', action='store_true')
     preparation.add_argument('--description', required=True)
-    preparation.add_argument('--expected-core-seconds', type=float)
+    preparation.add_argument('--expected-eval-seconds', type=float, default=180)
     sub.add_parser('check-expiry')
     for action in ('start', 'expire', 'status', 'cancel'):
         command = sub.add_parser(action)
@@ -550,7 +545,7 @@ def main():
     scheduling.add_argument('--at', required=True)
     args = parser.parse_args()
     if args.action == 'prepare':
-        prepare_job(args.commit, args.baseline, args.description, args.expected_core_seconds)
+        prepare_job(args.commit, args.baseline, args.description, args.expected_eval_seconds)
         return
     if args.action == 'check-expiry':
         check_expiry()

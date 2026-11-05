@@ -1,6 +1,7 @@
 """Prepare and package the GPU runtime and fixed evaluation assets on the processing server."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,25 +26,87 @@ def run(command, **kwargs):
     return subprocess.run(command, check=True, **kwargs)
 
 
+def digest(path):
+    value = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def verify_tokenizer():
+    tokenizer = prepare.Tokenizer.from_directory()
+    token_bytes = prepare.get_token_bytes("cpu")
+    if token_bytes.ndim != 1 or token_bytes.numel() != tokenizer.get_vocab_size():
+        raise RuntimeError("The tokenizer and BPB byte table disagree.")
+    if token_bytes.is_floating_point() or bool((token_bytes < 0).any()):
+        raise RuntimeError("The tokenizer byte table must contain nonnegative integers.")
+    return {name: digest(Path(prepare.TOKENIZER_DIR) / name)
+            for name in ("tokenizer.pkl", "token_bytes.pt")}
+
+
 def pack(directory, destination):
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     run(["tar", "-C", str(directory), "-I", "gzip -1", "-cf", str(temporary), "."])
     temporary.replace(destination)
-    return prepare._file_sha256(destination)
+    return digest(destination)
+
+
+def pack_runtime_assets(artifacts):
+    previous = artifacts / "gpu-assets.tar.gz"
+    if previous.exists():
+        history = artifacts / "history"
+        history.mkdir(exist_ok=True)
+        preserved = history / ("gpu-assets-" + digest(previous) + ".tar.gz")
+        if not preserved.exists():
+            os.link(previous, preserved)
+    with tempfile.TemporaryDirectory(dir=artifacts, prefix=".bpb-assets-") as temporary:
+        assets = Path(temporary)
+        shutil.copytree(Path(prepare.TOKENIZER_DIR), assets / "autoresearch" / "tokenizer",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(artifacts / "gpu-assets" / "hf-cache", assets / "hf-cache",
+                        symlinks=True, copy_function=os.link)
+        return pack(assets, artifacts / "gpu-assets.tar.gz")
+
+
+def refresh_assets():
+    """Repackage current tokenizer assets using the unchanged locked runtime and kernel cache."""
+    artifacts = ROOT / "artifacts"
+    path = artifacts / "runtime.json"
+    original = path.read_bytes()
+    manifest = json.loads(original)
+    for name in ("pyproject.toml", "uv.lock"):
+        if digest(ROOT / name) != manifest["sources"][name]:
+            raise RuntimeError("The dependencies changed; rebuild the locked runtime first.")
+    for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
+        if digest(artifacts / name) != manifest[field]:
+            raise RuntimeError("A prepared runtime archive changed; retain its original provenance.")
+    tokenizer = verify_tokenizer()
+    history = artifacts / "history"
+    history.mkdir(exist_ok=True)
+    (history / ("runtime-" + hashlib.sha256(original).hexdigest() + ".json")).write_bytes(original)
+    manifest["gpu_assets_sha256"] = pack_runtime_assets(artifacts)
+    manifest.pop("nanochat_revision", None)
+    manifest.pop("core_bundle_sha256", None)
+    manifest.update(evaluation_metric="val_bpb", tokenizer=tokenizer,
+                    sources={name: digest(ROOT / name) for name in SOURCES})
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary.replace(path)
+    print("Repackaged tokenizer and offline kernel assets; the locked runtime is unchanged.", flush=True)
 
 
 def refresh_source_hashes():
     """Reuse verified runtime archives after changing only training or repository rules."""
-    prepare.verify_core_assets()
     artifacts = ROOT / "artifacts"
     path = artifacts / "runtime.json"
     manifest = json.loads(path.read_text())
-    hashes = {name: prepare._file_sha256(ROOT / name) for name in SOURCES}
+    hashes = {name: digest(ROOT / name) for name in SOURCES}
     for name in ("prepare.py", "pyproject.toml", "uv.lock"):
         if hashes[name] != manifest["sources"][name]:
             raise RuntimeError("The runtime or evaluation changed; rebuild its archives first.")
     for name, field in (("gpu-env.tar.gz", "gpu_env_sha256"), ("gpu-assets.tar.gz", "gpu_assets_sha256")):
-        if prepare._file_sha256(artifacts / name) != manifest[field]:
+        if digest(artifacts / name) != manifest[field]:
             raise RuntimeError("A prepared runtime archive changed; rebuild it first.")
     manifest["sources"] = hashes
     temporary = path.with_suffix(".tmp")
@@ -54,12 +117,17 @@ def refresh_source_hashes():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--refresh-source-hashes", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--refresh-source-hashes", action="store_true")
+    mode.add_argument("--refresh-assets", action="store_true")
     args = parser.parse_args()
     if args.refresh_source_hashes:
         refresh_source_hashes()
         return
-    prepare.verify_core_assets()
+    if args.refresh_assets:
+        refresh_assets()
+        return
+    tokenizer = verify_tokenizer()
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv must be available on the processing server.")
@@ -96,10 +164,6 @@ def main():
         run([str(relocated / "uv"), "run", "--offline", "--frozen", "python", "-c",
              "import torch, kernels; print('Relocated runtime:', torch.__version__)"], cwd=relocated)
 
-    for name, source in (("tokenizer", Path(prepare.TOKENIZER_DIR)), ("core", Path(prepare.CORE_DIR))):
-        shutil.copytree(source, assets / "autoresearch" / name, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__"))
-
     os.environ["HF_HOME"] = str(assets / "hf-cache")
     from huggingface_hub import snapshot_download
     snapshot = snapshot_download(KERNEL_REPO, revision="main", cache_dir=assets / "hf-cache" / "hub",
@@ -113,14 +177,13 @@ def main():
 
     manifest = dict(
         python_version=PYTHON_VERSION, kernel_repo=KERNEL_REPO, kernel_revision=KERNEL_REVISION,
-        container_image=CUDA_IMAGE, nanochat_revision=prepare.CORE_NANOCHAT_REVISION,
-        core_bundle_sha256=prepare.CORE_BUNDLE_SHA256,
-        sources={name: prepare._file_sha256(ROOT / name) for name in SOURCES},
+        container_image=CUDA_IMAGE, evaluation_metric="val_bpb", tokenizer=tokenizer,
+        sources={name: digest(ROOT / name) for name in SOURCES},
     )
     manifest["gpu_env_sha256"] = pack(runtime, artifacts / "gpu-env.tar.gz")
-    manifest["gpu_assets_sha256"] = pack(assets, artifacts / "gpu-assets.tar.gz")
+    manifest["gpu_assets_sha256"] = pack_runtime_assets(artifacts)
     (artifacts / "runtime.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("GPU runtime and complete evaluation assets packaged.", flush=True)
+    print("GPU runtime, tokenizer and offline kernel assets packaged.", flush=True)
 
 
 if __name__ == "__main__":

@@ -9,15 +9,13 @@ import tarfile
 import unittest
 from unittest.mock import patch
 
-import prepare
 from tools import measurement, record_run, rental
+
+SOURCE = ("DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\nEVAL_TOKENS = 20971520\n"
+          "def evaluate_bpb():\n    return DATA_REVISION, EVAL_TOKENS\n")
 
 
 class RecordedDecisionTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.labels = [task['label'] for task in prepare.verify_core_assets()]
-
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -30,7 +28,7 @@ class RecordedDecisionTests(unittest.TestCase):
             item.stop()
         self.directory.cleanup()
 
-    def make_run(self, identifier, core, bpb, baseline=False, *, rules='fixture rules',
+    def make_run(self, identifier, bpb, baseline=False, *, rules='fixture rules',
                  measurement_source=None, gpu_name='H100 SXM', runtime_changes=None):
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
                    gpu_name=gpu_name, phase='evaluated', exit_code=0)
@@ -38,11 +36,10 @@ class RecordedDecisionTests(unittest.TestCase):
         source = snapshot / 'source'
         source.mkdir(parents=True)
         files = {'train.py': 'MODEL_WIDTH = 64\n', 'program.md': rules,
-                 'prepare.py': measurement_source or
-                 "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 22\n",
+                 'prepare.py': measurement_source or SOURCE,
                  'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
-        for name, text in files.items():
-            (source / name).write_text(text)
+        for name, content in files.items():
+            (source / name).write_text(content)
         job['source_sha256'] = {name: rental.digest(source / name) for name in rental.SOURCES}
         with tarfile.open(snapshot / 'source.tar.gz', 'w:gz') as archive:
             for name in rental.SOURCES:
@@ -55,11 +52,8 @@ class RecordedDecisionTests(unittest.TestCase):
         rental.save(job)
         directory = self.root / 'results/runs' / identifier
         directory.mkdir(parents=True)
-        result = dict(results=dict.fromkeys(self.labels, 0.5),
-                      centered_results=dict.fromkeys(self.labels, core), core_metric=core)
-        prepare.save_core_results(result, directory)
         (directory / 'run.log').write_text(
-            f'core_metric: {core:.17g}\nval_bpb: {bpb:.6f}\npeak_vram_mb: 45056.0\n'
+            f'val_bpb: {bpb:.17g}\npeak_vram_mb: 45056.0\n'
             'training_seconds: 1800.2\ntotal_seconds: 2500.0\n')
         return job, directory
 
@@ -67,189 +61,185 @@ class RecordedDecisionTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return record_run.record_run(identifier)
 
-    def test_records_one_complete_baseline_with_full_precision_and_exports_real_tsv(self):
-        self.make_run('baseline', 0.12345678901234566, 1.0, baseline=True)
-        first = self.record('baseline')
-        second = self.record('baseline')
-        self.assertEqual(first, second)
-        self.assertEqual(first['status'], 'keep')
+    def rows(self):
         with (self.root / 'results.tsv').open(newline='') as source:
-            rows = list(csv.reader(source, delimiter='\t'))
+            return list(csv.reader(source, delimiter='\t'))
+
+    def test_records_one_complete_baseline_and_exports_round_trip_bpb_in_five_columns(self):
+        self.make_run('baseline', 0.974083, baseline=True)
+        first = self.record('baseline')
+        self.assertEqual(first, self.record('baseline'))
+        self.assertEqual(first['status'], 'keep')
+        rows = self.rows()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0], record_run.HEADER)
-        self.assertEqual(float(rows[1][1]), first['core_metric'])
+        self.assertEqual(rows[0], ['commit', 'val_bpb', 'memory_gb', 'status', 'description'])
+        self.assertEqual(float(rows[1][1]), first['val_bpb'])
+        self.assertEqual(len(rows[1]), 5)
 
-    def test_adopts_any_unrounded_core_gain_and_discards_ties_or_regressions_regardless_of_reference_bpb(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_adopts_any_lower_bpb_and_discards_equal_or_higher_bpb(self):
+        self.make_run('baseline', 0.974083, baseline=True)
         self.record('baseline')
-        improvement = math.nextafter(0.12, math.inf)
-        self.make_run('small-gain', improvement, 1.5)
+        lower = math.nextafter(0.974083, -math.inf)
+        self.make_run('small-gain', lower)
         self.assertEqual(self.record('small-gain')['status'], 'keep')
-        for identifier, core in (('tie', improvement), ('lower', 0.12)):
-            self.make_run(identifier, core, 0.5)
+        for identifier, bpb in (('tie', lower), ('higher', 0.98)):
+            self.make_run(identifier, bpb)
             self.assertEqual(self.record(identifier)['status'], 'discard')
-        self.make_run('later', 0.1201, 2.0)
+        self.make_run('later', 0.97)
         later = self.record('later')
-        self.assertEqual(later['status'], 'keep')
-        self.assertEqual(later['incumbent'], 'small-gain')
+        self.assertEqual((later['status'], later['incumbent']), ('keep', 'small-gain'))
 
-    def test_records_failed_attempts_when_native_task_results_are_incomplete_or_nonfinite(self):
-        for identifier in ('incomplete', 'nonfinite'):
-            with self.subTest(identifier=identifier):
-                job, directory = self.make_run(identifier, 0.12, 1.0, baseline=True)
-                result = json.loads((directory / 'core.json').read_text())
-                if identifier == 'incomplete':
-                    result['results'].pop(self.labels[-1])
-                else:
-                    result['centered_results'][self.labels[-1]] = float('nan')
-                (directory / 'core.json').write_text(json.dumps(result))
-                record = self.record(job['id'])
-                self.assertEqual(record['status'], 'crash')
-                self.assertIsNone(record['core_metric'])
-                self.assertEqual(record['val_bpb'], 1.0)
-
-    def test_adopts_a_complete_core_improvement_when_reference_bpb_is_unavailable(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_records_missing_and_nonfinite_bpb_as_failed_attempts(self):
+        self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
-        self.make_run('candidate', 0.13, float('nan'))
-        record = self.record('candidate')
-        self.assertEqual(record['status'], 'keep')
-        self.assertIsNone(record['val_bpb'])
+        for identifier, bpb in (('nan', math.nan), ('inf', math.inf), ('missing', 0.5)):
+            _, directory = self.make_run(identifier, bpb)
+            if identifier == 'missing':
+                path = directory / 'run.log'
+                path.write_text(path.read_text().replace('val_bpb:', 'unavailable:'))
+            record = self.record(identifier)
+            self.assertEqual(record['status'], 'crash')
+            self.assertIsNone(record['val_bpb'])
+            self.assertEqual(self.rows()[-1][1], '0.000000')
 
-    def test_requires_a_successful_exit_and_intact_native_csv(self):
-        for identifier, bad_exit in [('failed-exit', True), ('bad-csv', False)]:
-            with self.subTest(identifier=identifier):
-                job, directory = self.make_run(identifier, 0.12, 1.0, baseline=True)
-                if bad_exit:
-                    rental.save(dict(id=identifier, phase='failed', exit_code=1))
-                else:
-                    (directory / 'core.csv').write_text('incomplete\n')
-                self.assertEqual(self.record(job['id'])['status'], 'crash')
-
-    def test_requires_one_new_baseline_when_the_measurement_changes(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_records_a_failed_exit_even_when_it_printed_a_lower_bpb(self):
+        self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
-        changed = "DATA_REVISION = 'changed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 22\n"
-        self.make_run('candidate', 0.15, 0.9, measurement_source=changed)
+        self.make_run('failed', 0.5)
+        rental.save(dict(id='failed', phase='failed', exit_code=1))
+        failed = self.record('failed')
+        self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.5))
+        self.assertEqual(self.rows()[-1][1], '0.000000')
+
+    def test_requires_complete_finite_summary_metrics_and_fixed_time_budgets(self):
+        cases = [
+            ('short', 'training_seconds: 1800.2', 'training_seconds: 1799.9'),
+            ('late', 'total_seconds: 2500.0', 'total_seconds: 3600.1'),
+            ('missing-memory', 'peak_vram_mb: 45056.0', 'unavailable: 45056.0'),
+            ('bad-memory', 'peak_vram_mb: 45056.0', 'peak_vram_mb: nan'),
+            ('duplicate', 'val_bpb: 1', 'val_bpb: 1\nval_bpb: 0.5'),
+        ]
+        for identifier, old, new in cases:
+            with self.subTest(identifier=identifier):
+                _, directory = self.make_run(identifier, 1.0, baseline=True)
+                path = directory / 'run.log'
+                path.write_text(path.read_text().replace(old, new))
+                self.assertEqual(self.record(identifier)['status'], 'crash')
+
+    def test_requires_a_new_baseline_when_data_changes_and_then_compares_to_it_once(self):
+        self.make_run('baseline', 1.0, baseline=True)
+        self.record('baseline')
+        changed = SOURCE.replace("'fixed'", "'changed'")
+        self.make_run('candidate', 0.9, measurement_source=changed)
         with self.assertRaises(ValueError):
             self.record('candidate')
-
-        self.make_run('new-baseline', 0.11, 1.0, baseline=True, measurement_source=changed)
+        self.make_run('new-baseline', 1.1, baseline=True, measurement_source=changed)
         self.assertEqual(self.record('new-baseline')['status'], 'keep')
-        self.make_run('new-candidate', 0.1101, 1.5, measurement_source=changed)
+        self.make_run('new-candidate', 1.0, measurement_source=changed)
         record = self.record('new-candidate')
-        self.assertEqual(record['status'], 'keep')
-        self.assertEqual(record['incumbent'], 'new-baseline')
-
-        self.make_run('duplicate-baseline', 0.13, 0.5, baseline=True, measurement_source=changed)
+        self.assertEqual((record['status'], record['incumbent']), ('keep', 'new-baseline'))
+        self.make_run('duplicate-baseline', 0.5, baseline=True, measurement_source=changed)
         with self.assertRaises(ValueError):
             self.record('duplicate-baseline')
 
-    def test_keeps_the_existing_measurement_after_rule_and_adoption_policy_changes(self):
-        original = "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\nCORE_MIN_DELTA = 0.01\ndef core_improves(a, b):\n    return a - b >= CORE_MIN_DELTA\ndef evaluate_core():\n    return 22\n"
-        revised = "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef core_improves(a, b):\n    return a > b\ndef evaluate_core():\n    return 22\n"
-        self.make_run('baseline', 0.12, 1.0, baseline=True, measurement_source=original)
-        baseline = self.record('baseline')
+    def test_reuses_historical_bpb_after_a_rule_change_while_preserving_the_original_record(self):
+        original = SOURCE + "CORE_MIN_DELTA = .01\ndef core_improves(a, b):\n    return a - b >= CORE_MIN_DELTA\ndef evaluate_core():\n    return 22\n"
+        self.make_run('baseline', 0.974083, baseline=True, measurement_source=original)
+        self.record('baseline')
         ledger = self.root / 'results/decisions.json'
         legacy = json.loads(ledger.read_text())
-        legacy[0].pop('measurement')
+        legacy[0].update(core_metric=0.10065166465157924, measurement={'id': 'legacy', 'definition': {'version': 1}})
+        historical = self.root / 'results/runs/baseline/core.json'
+        historical.write_text('{"historical": true}\n')
+        legacy[0]['artifacts']['core.json'] = rental.digest(historical)
         ledger.write_text(json.dumps(legacy))
-        self.make_run('candidate', 0.1201, 1.5, rules='measure once', measurement_source=revised)
+        preserved = ledger.read_bytes()
+        self.record('baseline')
+        self.assertEqual(ledger.read_bytes(), preserved)
+        self.make_run('candidate', 0.974082, rules='BPB only; measure once')
         candidate = self.record('candidate')
-        self.assertEqual(candidate['status'], 'keep')
-        self.assertEqual(candidate['incumbent'], 'baseline')
-        self.assertEqual(candidate['measurement'], baseline['measurement'])
+        self.assertEqual((candidate['status'], candidate['incumbent']), ('keep', 'baseline'))
         self.assertEqual(json.loads(ledger.read_text())[0], legacy[0])
-        self.make_run('repeat-baseline', 0.14, 0.5, baseline=True,
-                      rules='more rule changes', measurement_source=revised)
+        self.assertEqual(rental.digest(historical), legacy[0]['artifacts']['core.json'])
+        self.make_run('repeat-baseline', 0.5, baseline=True, rules='another rule change')
         with self.assertRaises(ValueError):
             self.record('repeat-baseline')
 
-    def test_requires_matching_evaluation_time_gpu_and_runtime_for_candidate_comparisons(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_requires_matching_evaluation_time_gpu_and_runtime(self):
+        self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
         variants = [
-            ('evaluation', {'measurement_source': "DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\ndef evaluate_core():\n    return 23\n"}),
-            ('time', {'measurement_source': "DATA_REVISION = 'fixed'\nTIME_BUDGET = 900\ndef evaluate_core():\n    return 22\n"}),
+            ('evaluation', {'measurement_source': SOURCE.replace('20971520', '10485760')}),
+            ('time', {'measurement_source': SOURCE.replace('1800', '900')}),
             ('gpu', {'gpu_name': 'different GPU'}),
             ('runtime', {'runtime_changes': {'kernel_revision': 'different kernel'}}),
         ]
         for name, changes in variants:
             with self.subTest(name=name):
-                self.make_run(name, 0.13, 0.9, **changes)
+                self.make_run(name, 0.9, **changes)
                 with self.assertRaises(ValueError):
                     self.record(name)
 
-    def test_accepts_tokenizer_asset_changes_as_a_model_choice_under_the_same_measurement(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True,
-                      runtime_changes={'gpu_assets_sha256': 'first tokenizer'})
+    def test_tracks_transitive_byte_counting_and_data_source_changes(self):
+        original = SOURCE.replace('return DATA_REVISION, EVAL_TOKENS',
+                                  'return DATA_REVISION, EVAL_TOKENS, byte_count()')
+        original += 'def byte_count():\n    return 1\n'
+        self.make_run('baseline', 1.0, baseline=True, measurement_source=original)
+        self.record('baseline')
+        self.make_run('candidate', 0.9, measurement_source=original.replace('return 1\n', 'return 2\n'))
+        with self.assertRaises(ValueError):
+            self.record('candidate')
+
+    def test_accepts_a_replacement_tokenizer_under_the_same_fixed_bpb_evaluation(self):
+        self.make_run('baseline', 1.0, baseline=True, runtime_changes={'gpu_assets_sha256': 'first tokenizer'})
         baseline = self.record('baseline')
-        self.make_run('candidate', 0.1201, 1.5,
-                      runtime_changes={'gpu_assets_sha256': 'different tokenizer'})
+        self.make_run('candidate', 0.9, runtime_changes={'gpu_assets_sha256': 'different tokenizer'})
         candidate = self.record('candidate')
         self.assertEqual(candidate['status'], 'keep')
         self.assertEqual(candidate['measurement'], baseline['measurement'])
 
     def test_checks_archived_source_and_runtime_against_their_recorded_hashes(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+        self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
         for name, filename in (('source', 'source.tar.gz'), ('runtime', 'runtime.json')):
             with self.subTest(name=name):
-                self.make_run(name, 0.13, 0.9)
+                self.make_run(name, 0.9)
                 path = rental.job_path(name).parent / filename
                 path.write_bytes(path.read_bytes() + b'changed')
                 with self.assertRaises(ValueError):
                     self.record(name)
 
-    def test_observes_an_unfinished_job_without_prematurely_recording_a_failure(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_checks_a_previously_recorded_log_before_exporting_it_again(self):
+        self.make_run('baseline', 1.0, baseline=True)
+        self.record('baseline')
+        (self.root / 'results/runs/baseline/run.log').write_text('altered log')
+        with self.assertRaises(ValueError):
+            self.record('baseline')
+
+    def test_observes_an_unfinished_job_without_recording_a_failure(self):
+        self.make_run('baseline', 1.0, baseline=True)
         rental.save(dict(id='baseline', phase='running', exit_code=None))
         with self.assertRaises(ValueError):
             self.record('baseline')
 
-    def test_finalizes_native_results_once_and_exports_the_fixed_core_decision(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
+    def test_finalizes_after_deletion_once_and_exports_the_bpb_decision(self):
+        self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
-        self.make_run('candidate', 0.13, 1.5)
+        self.make_run('candidate', 0.9)
         rental.save(dict(id='candidate', creation_requested_at=1000))
-
         def delete(job):
             rental.save(dict(id=job['id'], deleted_at=1100))
-
         def record(command):
             self.assertEqual(rental.load(command[-1])['deleted_at'], 1100)
             return self.record(command[-1])
-
         with patch.object(rental, 'delete_instances', side_effect=delete):
             with patch.object(rental, 'run', side_effect=record):
                 for _ in range(2):
                     rental.finalize(rental.load('candidate'))
         records = json.loads((self.root / 'results/decisions.json').read_text())
         self.assertEqual(len(records), 2)
-        self.assertEqual((records[-1]['status'], records[-1]['incumbent']), ('keep', 'baseline'))
-        self.assertEqual((records[-1]['core_metric'], records[-1]['val_bpb']), (0.13, 1.5))
-        with (self.root / 'results.tsv').open(newline='') as source:
-            rows = list(csv.reader(source, delimiter='\t'))
-        self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[-1][4], 'keep')
-
-    def test_finalizes_a_failed_attempt_with_its_reference_bpb_and_preserves_the_incumbent(self):
-        self.make_run('baseline', 0.12, 1.0, baseline=True)
-        self.record('baseline')
-        self.make_run('failed', 0.15, 0.5)
-        rental.save(dict(id='failed', phase='failed', exit_code=1, creation_requested_at=1000))
-
-        def delete(job):
-            rental.save(dict(id=job['id'], deleted_at=1100))
-
-        with patch.object(rental, 'delete_instances', side_effect=delete):
-            with patch.object(rental, 'run', side_effect=lambda command: self.record(command[-1])):
-                rental.finalize(rental.load('failed'))
-        records = json.loads((self.root / 'results/decisions.json').read_text())
-        self.assertEqual(records[-1]['status'], 'crash')
-        self.assertIsNone(records[-1]['core_metric'])
-        self.assertEqual(records[-1]['val_bpb'], 0.5)
-        self.assertEqual([row['id'] for row in records if row['status'] == 'keep'], ['baseline'])
+        self.assertEqual((records[-1]['status'], records[-1]['val_bpb']), ('keep', 0.9))
+        self.assertEqual(self.rows()[-1][3], 'keep')
 
 
 if __name__ == '__main__':

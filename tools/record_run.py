@@ -1,4 +1,4 @@
-"""Record completed attempts and apply the fixed CORE adoption rule to native artifacts."""
+"""Record completed attempts and apply the user's fixed BPB adoption rule."""
 
 import argparse
 import csv
@@ -16,42 +16,32 @@ sys.path.insert(0, str(ROOT))
 import prepare
 from tools import measurement, rental
 
-HEADER = ['commit', 'core_metric', 'val_bpb', 'memory_gb', 'status', 'description']
+HEADER = ['commit', 'val_bpb', 'memory_gb', 'status', 'description']
 
 
 def read_metrics(job, directory):
     if job.get('exit_code') != 0 or job['phase'] != 'evaluated':
         raise ValueError('The experiment did not exit successfully.')
-    result = json.loads((directory / 'core.json').read_text())
-    labels = [task['label'] for task in prepare.verify_core_assets()]
-    for name in ('results', 'centered_results'):
-        if list(result[name]) != labels or not all(math.isfinite(value) for value in result[name].values()):
-            raise ValueError('The native CORE result must contain all 22 finite task scores in order.')
-    core = result['core_metric']
-    if not math.isfinite(core):
-        raise ValueError('The aggregate CORE score must be finite.')
     log = (directory / 'run.log').read_text()
-    fields = dict(re.findall(r'^([a-z_]+):\s+(\S+)', log, flags=re.MULTILINE))
-    values = {name: float(fields[name]) for name in
-              ('core_metric', 'peak_vram_mb', 'training_seconds', 'total_seconds')}
-    if not all(math.isfinite(value) for value in values.values()) or values['core_metric'] != core:
-        raise ValueError('The summary must contain finite metrics and the full-precision native CORE score.')
+    values = {}
+    for name in ('val_bpb', 'peak_vram_mb', 'training_seconds', 'total_seconds'):
+        matches = re.findall(r'^' + name + r':\s+(\S+)', log, flags=re.MULTILINE)
+        if len(matches) != 1:
+            raise ValueError('The summary must contain one value for each required metric.')
+        values[name] = float(matches[0])
+    if not all(math.isfinite(value) for value in values.values()):
+        raise ValueError('The summary metrics must be finite.')
+    if values['peak_vram_mb'] < 0:
+        raise ValueError('Peak memory must be nonnegative.')
     if not prepare.TIME_BUDGET <= values['training_seconds'] <= values['total_seconds'] <= rental.LEASE_SECONDS:
         raise ValueError('The summary does not satisfy the fixed training and rental time budgets.')
-    with (directory / 'core.csv').open(newline='') as source:
-        rows = [[value.strip() for value in row] for row in csv.reader(source)]
-    expected = [['Task', 'Accuracy', 'Centered']]
-    expected.extend([[label, f"{result['results'][label]:.6f}",
-                      f"{result['centered_results'][label]:.6f}"] for label in labels])
-    expected.append(['CORE', '', f'{core:.6f}'])
-    if rows != expected:
-        raise ValueError('The native CSV is incomplete or differs from the native JSON.')
-    try:
-        reference = float(fields.get('val_bpb', 'nan'))
-        reference = reference if math.isfinite(reference) else None
-    except ValueError:
-        reference = None
-    return dict(core_metric=core, val_bpb=reference, memory_gb=values['peak_vram_mb'] / 1024)
+    return dict(val_bpb=values['val_bpb'], memory_gb=values['peak_vram_mb'] / 1024)
+
+
+def verify_artifacts(record, directory):
+    for name, sha in record['artifacts'].items():
+        if rental.digest(directory / name) != sha:
+            raise ValueError('A previously recorded artifact changed.')
 
 
 def decide(job, directory, incumbent):
@@ -66,37 +56,45 @@ def decide(job, directory, incumbent):
         if previous_frame != incumbent['frame']:
             raise ValueError('The incumbent source provenance differs from its recorded frame.')
         previous = measurement.from_snapshot(previous_job, rental.job_path(previous_job['id']).parent)
-        if incumbent.get('measurement', previous) != previous:
+        recorded = incumbent.get('measurement')
+        if recorded and recorded['definition'].get('metric') == 'val_bpb' and recorded != previous:
             raise ValueError('The incumbent measurement differs from its recorded identity.')
+        previous_directory = ROOT / 'results/runs' / incumbent['id']
+        verify_artifacts(incumbent, previous_directory)
+        logged = re.findall(r'^val_bpb:\s+(\S+)', (previous_directory / 'run.log').read_text(),
+                            flags=re.MULTILINE)
+        if len(logged) != 1 or float(logged[0]) != incumbent['val_bpb']:
+            raise ValueError('The incumbent BPB differs from its original log.')
     if previous and conditions != previous and not job['baseline']:
         raise ValueError('A candidate requires a baseline under the same measurement conditions.')
     if job['baseline'] and previous and conditions == previous:
         raise ValueError('This measurement already has a baseline; do not repeat it for a rule change.')
     if not job['baseline'] and incumbent is None:
         raise ValueError('Record a successful baseline before deciding on candidates.')
-    record = dict(id=job['id'], commit=job['commit'], frame=frame, measurement=conditions, recorded_at=time.time(),
+    record = dict(id=job['id'], commit=job['commit'], frame=frame, measurement=conditions,
+                  metric='val_bpb', recorded_at=time.time(),
                   description=' '.join(job['description'].split()),
                   incumbent=None if job['baseline'] else incumbent['id'])
     try:
         metrics = read_metrics(job, directory)
     except (OSError, KeyError, ValueError, TypeError) as error:
-        record.update(status='crash', core_metric=None, val_bpb=None, memory_gb=0.0,
-                      validation_error=str(error))
+        record.update(status='crash', val_bpb=None, memory_gb=0.0, validation_error=str(error))
         log_path = directory / 'run.log'
         if log_path.exists():
-            reference = re.findall(r'^val_bpb:\s+(\S+)', log_path.read_text(), flags=re.MULTILINE)
-            if reference:
+            observed = re.findall(r'^val_bpb:\s+(\S+)', log_path.read_text(), flags=re.MULTILINE)
+            if observed:
                 try:
-                    value = float(reference[-1])
+                    value = float(observed[-1])
                     if math.isfinite(value):
                         record['val_bpb'] = value
                 except ValueError:
                     pass
     else:
-        accepted = job['baseline'] or prepare.core_improves(metrics['core_metric'], incumbent['core_metric'])
+        accepted = job['baseline'] or prepare.bpb_improves(metrics['val_bpb'], incumbent['val_bpb'])
         record.update(metrics, status='keep' if accepted else 'discard')
-    record['artifacts'] = {name: rental.digest(directory / name)
-                           for name in ('run.log', 'core.json', 'core.csv') if (directory / name).exists()}
+    record['artifacts'] = {name: rental.digest(directory / name) for name in
+                           ('run.log', 'prepare.log', 'bootstrap.log', 'run.exit', 'gpu-observations.jsonl')
+                           if (directory / name).exists()}
     return record
 
 
@@ -106,8 +104,7 @@ def write_outputs(records):
     writer.writerow(HEADER)
     for row in records:
         writer.writerow([row['commit'][:7],
-                         'NA' if row['core_metric'] is None else format(row['core_metric'], '.17g'),
-                         'NA' if row['val_bpb'] is None else format(row['val_bpb'], '.6f'),
+                         '0.000000' if row['status'] == 'crash' else format(row['val_bpb'], '.17g'),
                          format(row['memory_gb'], '.1f'), row['status'], row['description']])
     temporary = ROOT / 'results.tsv.tmp'
     temporary.write_text(stream.getvalue())
@@ -126,9 +123,7 @@ def record_run(identifier):
         records = json.loads(ledger.read_text()) if ledger.exists() else []
         record = next((row for row in records if row['id'] == identifier), None)
         if record is not None:
-            for name, sha in record['artifacts'].items():
-                if rental.digest(directory / name) != sha:
-                    raise ValueError('A previously recorded native artifact changed.')
+            verify_artifacts(record, directory)
         else:
             incumbent = next((row for row in reversed(records) if row['status'] == 'keep'), None)
             record = decide(job, directory, incumbent)
