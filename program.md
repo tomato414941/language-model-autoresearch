@@ -8,7 +8,7 @@ To set up a new experiment, work with the user to:
 
 1. **Work on `main`**: do not create branches.
 2. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
+   - `prepare.py` — the fixed frame (allowed data, time budget, evaluation, acceptance threshold) and a default tokenizer and dataloader. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 3. **Rent the GPU**: experiments run on one rented H100 SXM, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
 4. **Prepare the data and evaluations**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer and prepare the complete pinned CORE evaluation. Bring the tokenizer and the entire CORE cache when renting, then run `uv run prepare.py` on the rented machine to download the remaining training shards. Finish the CORE integration and its CPU checks before measuring the baseline.
@@ -22,13 +22,13 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 30 minutes** (wall clock training time, excluding startup/compilation): one run in each daily rental of at most 1 hour. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace; CORE must run unchanged on whatever tokenizer you use.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
+- Modify `prepare.py`. It is read-only. It contains the fixed allowed data, time budget, evaluation and acceptance threshold.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness, task set, examples, prompts, few-shot settings, scoring, aggregation, or acceptance threshold. CORE uses nanochat's unchanged implementation and official 22-task bundle, with every example (`max_per_task=-1`). `evaluate_bpb` stays unchanged as a reference metric.
-- Train on data that is not allowed. The allowed data is what `prepare.py` downloads, now FineWeb-Edu only. Only the human adds data, by adding it to `prepare.py`.
+- Train on data that is not allowed. The allowed data is what `prepare.py` downloads, now FineWeb-Edu only. Only the human adds data, by adding it to `prepare.py`. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
 
 **The goal is simple: improve CORE.** A higher CORE score is better. Keep a candidate only when its unrounded CORE score exceeds the current best by **at least 0.01 absolute** (`candidate_core >= best_core + 0.01`). This threshold is fixed before the baseline; never change it after seeing results. `val_bpb` is recorded for reference only and never determines adoption. Every run still trains for 30 minutes and must finish, including both evaluations, within the 1-hour rental.
