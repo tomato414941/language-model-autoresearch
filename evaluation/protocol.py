@@ -114,12 +114,13 @@ def evaluate_prepared(model, directory, output):
     manifest = json.loads((directory / "manifest.json").read_text())
     if not manifest["complete"] or manifest["olmes_revision"] != OLMES_REVISION or tuple(manifest["suites"]) != SUITES:
         raise ValueError("A complete pinned native request bundle is required.")
-    if model.max_length != manifest["max_length"] or model.batch_size != manifest["batch_size"]:
-        raise ValueError("The model connection must match the CPU runtime estimate.")
+    if model.max_length != manifest["max_length"]:
+        raise ValueError("The model connection must preserve the prepared context window.")
     output.mkdir(parents=True, exist_ok=False)
     config = deepcopy(manifest["native_config"])
     compute = config["compute_config"]
     compute["output_dir"] = str(output)
+    compute["batch_size"] = str(model.batch_size)
     metrics = []
     for entry in manifest["tasks"]:
         raw, instances = read_requests(directory, entry)

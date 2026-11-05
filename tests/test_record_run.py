@@ -386,6 +386,22 @@ class RecordedDecisionTests(unittest.TestCase):
         path.write_text(json.dumps(summary))
         self.assertEqual(self.record('missing-example')['status'], 'crash')
 
+    def test_validates_the_inference_batch_recorded_for_a_complete_native_result(self):
+        job, directory = self.make_run('batch-plan', 1.0, baseline=True, metric=measurement.OLMES_METRIC)
+        runtime_path = rental.job_path(job['id']).parent / 'runtime.json'
+        runtime = json.loads(runtime_path.read_text())
+        runtime['olmes']['inference_batch_size'] = 32
+        runtime_path.write_text(json.dumps(runtime))
+        summary_path = directory / 'olmes-summary.json'
+        summary = json.loads(summary_path.read_text())
+        summary['inference_batch_size'] = 32
+        summary_path.write_text(json.dumps(summary))
+        self.assertEqual(record_run.read_metrics(job, directory)['qa_bpb'], 1.0)
+        summary['inference_batch_size'] = 8
+        summary_path.write_text(json.dumps(summary))
+        with self.assertRaisesRegex(ValueError, 'computation'):
+            record_run.read_metrics(job, directory)
+
 
 if __name__ == '__main__':
     unittest.main()

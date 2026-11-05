@@ -12,8 +12,11 @@ class CheckpointModel(TokenObserver):
     # Use native scoring, caching, masking, padding and result construction verbatim.
     _loglikelihood_tokens_verbose = HFLM_Verbose._loglikelihood_tokens_verbose
 
-    def __init__(self, checkpoint, tokenizer, device="cuda", attention=None, compile_functions=True):
-        super().__init__(TokenizerAdapter(tokenizer, MAX_LENGTH), MAX_LENGTH, BATCH_SIZE)
+    def __init__(self, checkpoint, tokenizer, device="cuda", attention=None, compile_functions=True,
+                 *, batch_size=BATCH_SIZE):
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("Use a positive fixed inference batch size.")
+        super().__init__(TokenizerAdapter(tokenizer, MAX_LENGTH), MAX_LENGTH, batch_size)
         self._device = torch.device(device)
         self._model, self.source_sha256 = load_checkpoint(
             checkpoint, device, attention=attention, compile_functions=compile_functions)

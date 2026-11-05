@@ -3,12 +3,14 @@
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import time
 
 import torch
 
 from evaluation.model import CheckpointModel
+from evaluation.count_tokens import BATCH_SIZE
 from evaluation.arc_macro import APPROVED_CONFIG_FIX
 from evaluation.protocol import evaluate_prepared, sha256_file
 
@@ -19,11 +21,13 @@ def main():
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--requests", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--batch-size", type=int,
+                        default=os.environ.get("OLMES_BATCH_SIZE", str(BATCH_SIZE)))
     args = parser.parse_args()
     started = time.monotonic()
     if not torch.cuda.is_available():
         raise RuntimeError("The complete quality evaluation runs on the rented GPU.")
-    model = CheckpointModel(args.checkpoint, args.tokenizer)
+    model = CheckpointModel(args.checkpoint, args.tokenizer, batch_size=args.batch_size)
     torch.cuda.reset_peak_memory_stats()
     suites, manifest = evaluate_prepared(model, args.requests, args.output)
     report = {
@@ -33,6 +37,7 @@ def main():
         "suites": suites, "complete": True, "leaf_tasks": len(manifest["tasks"]),
         "examples": manifest["total_examples"], "requests": manifest["total_requests"],
         "computation": "correct_answer_only", "computed_requests": manifest["computed_requests"],
+        "inference_batch_size": model.batch_size,
         "checkpoint_sha256": sha256_file(args.checkpoint),
         "model_source_sha256": model.source_sha256,
         "tokenizer_sha256": sha256_file(args.tokenizer),

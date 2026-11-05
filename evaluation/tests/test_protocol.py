@@ -15,8 +15,8 @@ from oe_eval.components.instances import RequestInstance
 from oe_eval.components.requests import GenerateUntilAndLoglikelihoodRequest
 from oe_eval.utils import hash_dict
 
-from evaluation.count_tokens import SUITES
-from evaluation.protocol import aggregate_suites, read_requests, score_task
+from evaluation.count_tokens import OLMES_REVISION, SUITES
+from evaluation.protocol import aggregate_suites, evaluate_prepared, read_requests, score_task
 from evaluation.tests.test_count_tokens import ForwardProbe
 from evaluation.tokenizer_adapter import TokenizerAdapter
 
@@ -114,6 +114,45 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(suites["qa_bpb"], 1.0 + 2.0 / len(TASK_SUITE_CONFIGS[SUITES[0]]["tasks"]))
         self.assertEqual(suites["math_bpb"], 2.0)
         self.assertEqual(suites["code_bpb"], 4.0)
+
+    def test_scores_prepared_inputs_with_a_new_batch_size_and_records_the_actual_computation(self):
+        task_config = {"task_name": "synthetic_batch", "metadata": {"alias": "synthetic_batch"}}
+        task = synthetic_task(task_config)
+        task.download()
+        task.build_all_requests()
+        raw = [instance.to_dict() for instance in task._instances]
+        payload = b"".join((json.dumps(item)+"\n").encode() for item in raw)
+        compressed = gzip.compress(payload)
+        args = vars(run_eval._parser.parse_args([
+            "--model", "autoresearch", "--task", json.dumps(task_config), "--batch-size", "8",
+        ]))
+        config = run_eval.process_eval_args(args)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests = root / "requests"
+            requests.mkdir()
+            (requests / "requests.jsonl.gz").write_bytes(compressed)
+            entry = dict(index=0, alias="synthetic_batch", native_config=task_config,
+                         task_hash=task._task_hash, resolved_task_config=deepcopy(task.task_config),
+                         requests=len(raw), examples=2, requests_file="requests.jsonl.gz",
+                         requests_sha256=hashlib.sha256(compressed).hexdigest(),
+                         uncompressed_requests_sha256=hashlib.sha256(payload).hexdigest())
+            manifest = dict(complete=True, olmes_revision=OLMES_REVISION, suites=list(SUITES),
+                            max_length=64, batch_size=8, native_config=config, tasks=[entry],
+                            total_examples=2, total_requests=len(raw))
+            (requests / "manifest.json").write_text(json.dumps(manifest))
+            expected = dict(qa_bpb=1., math_bpb=1., code_bpb=1.)
+            with patch.object(run_eval, "load_task", side_effect=synthetic_task), \
+                    patch("evaluation.protocol.aggregate_suites", return_value=(expected, [])):
+                suites, returned = evaluate_prepared(
+                    ForwardProbe(self.tokenizer, max_length=64, batch_size=32), requests, root / "output")
+            recorded = json.loads((root / "output/metrics-all.jsonl").read_text().splitlines()[0])
+        self.assertEqual(suites, expected)
+        self.assertEqual(returned["batch_size"], 8)
+        self.assertEqual(returned["computed_requests"], 2)
+        self.assertEqual(recorded["compute_config"]["batch_size"], "32")
+        self.assertEqual(recorded["computation"]["source_requests"], len(raw))
+        self.assertEqual(recorded["task_config"]["metadata"]["alias"], "synthetic_batch")
 
     def test_restores_every_native_gold_bpb_request_field_and_score(self):
         original = RequestInstance(
