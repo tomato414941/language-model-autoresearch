@@ -47,6 +47,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     narrow_first_layer: bool = True
     float32_embedding_master: bool = True
+    share_value_embeddings: bool = True
     value_silu: bool = True
     training_loss_chunk_size: int = 16384
 
@@ -179,10 +180,20 @@ class GPT(nn.Module):
         self.backout_gain = nn.Parameter(torch.full((1,), 0.2))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, block.attn.n_kv_head * block.attn.head_dim)
-            for i, block in enumerate(self.transformer.h) if has_ve(i, config.n_layer)
-        })
+        # Mirror the selected layers' value tables while keeping their projected values and gates.
+        # https://github.com/KellerJordan/modded-nanogpt/tree/4ea6b937337a4889b8cfe3f38a93d120048d8f71/records/track_1_short/2024-12-08_UNetValueEmbedsTweaks
+        ve_layers = [i for i in range(config.n_layer) if has_ve(i, config.n_layer)]
+        self.value_embed_keys = {}
+        self.value_embeds = nn.ModuleDict()
+        for position, layer in enumerate(ve_layers):
+            attention = self.transformer.h[layer].attn
+            width = attention.n_kv_head * attention.head_dim
+            pair = min(position, len(ve_layers) - 1 - position)
+            key = f"shared_{pair}_{width}" if config.share_value_embeddings else str(layer)
+            self.value_embed_keys[layer] = key
+            if key not in self.value_embeds:
+                self.value_embeds[key] = nn.Embedding(config.vocab_size, width)
+        self.value_embed_last_layer = {key: layer for layer, key in self.value_embed_keys.items()}
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -356,14 +367,24 @@ class GPT(nn.Module):
             x = torch.cat((x[:, :1], mixed), dim=1)
         x0 = x
         middle = None
+        value_cache = {}
         for i, block in enumerate(self.transformer.h):
             if x0.size(-1) < x.size(-1):
                 x0 = torch.cat((x0, x0), dim=-1)
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve_key = self.value_embed_keys.get(i)
+            ve = None
+            if ve_key is not None:
+                cache_key = (ve_key, x.dtype)
+                if cache_key not in value_cache:
+                    value_cache[cache_key] = self.value_embeds[ve_key](idx).to(x.dtype)
+                ve = value_cache[cache_key]
             x = block(x, ve, cos_sin, self.window_sizes[i])
+            if ve_key is not None and self.value_embed_last_layer[ve_key] == i:
+                value_cache.pop(cache_key)
             if i == self.config.n_layer // 2:
                 middle = x
+        value_cache.clear()
         if middle is not None:
             x = x - self.backout_gain.to(x.dtype) * middle
         x = norm(x)
