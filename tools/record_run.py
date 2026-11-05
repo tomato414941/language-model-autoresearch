@@ -17,6 +17,7 @@ import prepare
 from tools import measurement, rental
 
 SUITE_METRICS = ('qa_bpb', 'math_bpb', 'code_bpb')
+FRAME_SOURCES = ('prepare.py', 'program.md', 'pyproject.toml', 'uv.lock')
 HEADER = ['commit', *SUITE_METRICS, 'val_bpb', 'memory_gb', 'status', 'description']
 
 
@@ -46,13 +47,13 @@ def verify_artifacts(record, directory):
 
 
 def decide(job, directory, incumbent):
-    frame = {name: job['source_sha256'][name] for name in rental.FRAME_SOURCES}
+    frame = {name: job['source_sha256'][name] for name in FRAME_SOURCES}
     frame['gpu_name'] = job['gpu_name']
     conditions = measurement.from_snapshot(job, rental.job_path(job['id']).parent)
     previous = None
     if incumbent:
         previous_job = rental.load(incumbent['id'])
-        previous_frame = {name: previous_job['source_sha256'][name] for name in rental.FRAME_SOURCES}
+        previous_frame = {name: previous_job['source_sha256'][name] for name in FRAME_SOURCES}
         previous_frame['gpu_name'] = previous_job['gpu_name']
         if previous_frame != incumbent['frame']:
             raise ValueError('The incumbent source provenance differs from its recorded frame.')
