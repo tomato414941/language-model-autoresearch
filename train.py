@@ -652,6 +652,17 @@ class MuonAdamW(torch.optim.Optimizer):
             elif group['kind'] == 'muon':
                 self._step_muon(group)
 
+
+def scale_adam_second_moments(optimizer, batch_ratio):
+    """Keep Adam's nominal second-moment half-life in tokens after a batch change."""
+    # https://arxiv.org/abs/2507.07101v2
+    if not math.isfinite(batch_ratio) or batch_ratio <= 0:
+        raise ValueError("The batch ratio must be finite and positive.")
+    for group in optimizer.param_groups:
+        if group['kind'] == 'adamw':
+            beta1, beta2 = group['betas']
+            group['betas'] = (beta1, beta2 ** batch_ratio)
+
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
@@ -662,7 +673,8 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=quarter context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**17 # one device batch, ~131K tokens per optimizer step
+BATCH_REFERENCE_SIZE = 2**18 # parent batch for Adam second-moment token half-lives
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.008  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -734,6 +746,7 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
+scale_adam_second_moments(optimizer, TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE)
 
 tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
