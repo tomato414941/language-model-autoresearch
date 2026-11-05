@@ -32,31 +32,34 @@ def _validate(targets, vocabulary, width, stride):
 def build_candidates(targets, vocabulary, width, offset=0, stride=20011):
     """Include every true target, fill with rotating negatives, or use the full vocabulary."""
     targets, valid = _validate(targets, vocabulary, width, stride)
-    positives = np.unique(targets[valid])
-    fallback = len(positives) > width
+    marked = np.zeros(vocabulary, dtype=bool)
+    marked[targets[valid]] = True
+    count = int(np.count_nonzero(marked))
+    fallback = count > width
     next_offset = offset % vocabulary
     if fallback or width == vocabulary:
         candidates = np.arange(vocabulary, dtype=np.int64)
     else:
-        marked = np.zeros(vocabulary, dtype=bool)
-        marked[positives] = True
-        needed = width - len(positives)
-        if needed:
-            order = ((np.arange(vocabulary, dtype=np.int64) + next_offset) % vocabulary)
-            sweep = (order * stride) % vocabulary
-            eligible_positions = np.flatnonzero(~marked[sweep])[:needed]
-            negatives = sweep[eligible_positions]
-            next_offset = (next_offset + int(eligible_positions[-1]) + 1) % vocabulary
-            candidates = np.sort(np.concatenate((positives, negatives))).astype(np.int64)
-        else:
-            candidates = positives.astype(np.int64, copy=True)
+        sweep = (np.arange(vocabulary, dtype=np.int64) * stride) % vocabulary
+        candidates, next_offset = _fill_candidates(
+            marked, width - count, next_offset, np.concatenate((sweep, sweep)))
     positions = np.full(vocabulary, -1, dtype=np.int64)
     positions[candidates] = np.arange(len(candidates))
     mapped = np.full(targets.shape, -1, dtype=np.int64)
     mapped[valid] = positions[targets[valid]]
     if np.any(mapped[valid] < 0):
         raise RuntimeError("Every true target must be present in the candidate set.")
-    return CandidateSet(candidates, mapped, len(positives), fallback, next_offset)
+    return CandidateSet(candidates, mapped, count, fallback, next_offset)
+
+
+def _fill_candidates(marked, needed, offset, doubled_sweep):
+    """Fill one target bitmap in the declared circular negative order."""
+    if needed:
+        sweep = doubled_sweep[offset:offset + len(marked)]
+        eligible_positions = np.flatnonzero(~marked[sweep])[:needed]
+        marked[sweep[eligible_positions]] = True
+        offset = (offset + int(eligible_positions[-1]) + 1) % len(marked)
+    return np.flatnonzero(marked), offset
 
 
 @dataclass
@@ -74,17 +77,32 @@ def build_candidate_batch(targets, vocabulary, width, chunk_size, offset=0, stri
     if chunk_size <= 0 or targets.size == 0:
         raise ValueError("A batch needs targets and a positive head chunk size.")
     flat = targets.reshape(-1)
-    chunks = [flat[start:start + chunk_size] for start in range(0, flat.size, chunk_size)]
-    counts = np.array([len(np.unique(chunk[chunk != -1])) for chunk in chunks], dtype=np.int64)
+    flat_valid = valid.reshape(-1)
+    starts = range(0, flat.size, chunk_size)
+    marked = np.zeros((len(starts), vocabulary), dtype=bool)
+    for index, start in enumerate(starts):
+        chunk = flat[start:start + chunk_size]
+        chunk_valid = flat_valid[start:start + chunk_size]
+        marked[index, chunk[chunk_valid]] = True
+    counts = np.count_nonzero(marked, axis=1).astype(np.int64)
     fallback = bool(np.any(counts > width))
     if fallback or width == vocabulary:
         return CandidateBatch(None, None, counts, fallback, offset % vocabulary)
-    ids = []
-    positions = []
-    for chunk in chunks:
-        result = build_candidates(chunk, vocabulary, width, offset, stride)
-        ids.append(result.token_ids)
-        positions.append(result.target_positions)
-        offset = result.next_offset
-    return CandidateBatch(np.stack(ids), np.concatenate(positions).reshape(targets.shape),
-                          counts, False, offset)
+    sweep = (np.arange(vocabulary, dtype=np.int64) * stride) % vocabulary
+    doubled_sweep = np.concatenate((sweep, sweep))
+    offset %= vocabulary
+    ids = np.empty((len(starts), width), dtype=np.int64)
+    positions = np.full(flat.shape, -1, dtype=np.int64)
+    lookup = np.full(vocabulary, -1, dtype=np.int64)
+    for index, start in enumerate(starts):
+        candidates, offset = _fill_candidates(marked[index], width - int(counts[index]),
+                                              offset, doubled_sweep)
+        ids[index] = candidates
+        lookup.fill(-1)
+        lookup[candidates] = np.arange(width)
+        chunk = flat[start:start + chunk_size]
+        chunk_valid = flat_valid[start:start + chunk_size]
+        positions[start:start + chunk_size][chunk_valid] = lookup[chunk[chunk_valid]]
+    if np.any(positions[flat_valid] < 0):
+        raise RuntimeError("Every true target must be present in the candidate set.")
+    return CandidateBatch(ids, positions.reshape(targets.shape), counts, False, offset)

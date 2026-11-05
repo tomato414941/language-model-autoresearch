@@ -8,6 +8,39 @@ from tools.softmax_candidates import build_candidate_batch, build_candidates
 
 
 class SoftmaxCandidateTests(unittest.TestCase):
+    def test_follows_the_circular_negative_order_through_strided_targets_and_ignored_chunks(self):
+        storage = np.array([[99, 2, 7, 0], [99, 0, -1, -1]])
+        targets = storage[:, 1:]
+        original = storage.copy()
+        result = build_candidate_batch(targets, 8, 4, chunk_size=2, offset=14, stride=3)
+        np.testing.assert_array_equal(result.token_ids, [[0, 2, 5, 7], [0, 1, 3, 6], [2, 4, 5, 7]])
+        np.testing.assert_array_equal(result.target_positions, [[1, 3, 0], [0, -1, -1]])
+        np.testing.assert_array_equal(result.distinct_targets, [2, 1, 0])
+        self.assertEqual(result.next_offset, 0)
+        self.assertFalse(result.fallback)
+        np.testing.assert_array_equal(storage, original)
+
+    def test_advances_the_negative_cursor_only_when_it_fills_unused_candidates(self):
+        result = build_candidate_batch(np.array([[1, 3], [-1, -1]]), 8, 2, 2,
+                                       offset=11, stride=3)
+        np.testing.assert_array_equal(result.token_ids, [[1, 3], [1, 4]])
+        np.testing.assert_array_equal(result.target_positions, [[0, 1], [-1, -1]])
+        np.testing.assert_array_equal(result.distinct_targets, [2, 0])
+        self.assertEqual(result.next_offset, 5)
+
+    def test_returns_independent_batch_results_for_reused_input_buffers(self):
+        targets = np.array([0, 1, -1, 2, 3])
+        first = build_candidate_batch(targets, 8, 4, 3, offset=-2)
+        saved_ids = first.token_ids.copy()
+        saved_positions = first.target_positions.copy()
+        first.token_ids[:] = 7
+        first.target_positions[:] = -1
+        first.distinct_targets[:] = 0
+        repeated = build_candidate_batch(targets, 8, 4, 3, offset=-2)
+        np.testing.assert_array_equal(repeated.token_ids, saved_ids)
+        np.testing.assert_array_equal(repeated.target_positions, saved_positions)
+        np.testing.assert_array_equal(repeated.distinct_targets, [2, 2])
+
     def test_prepares_uniform_chunks_and_preserves_every_target_in_an_uneven_batch(self):
         targets = np.array([[1, 7, -1, 3, 1], [7, 5, 2, -1, 5]])
         result = build_candidate_batch(targets, 16, 8, chunk_size=3, offset=5)
