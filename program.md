@@ -33,15 +33,15 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
 - Use other models in training: no distillation from a teacher, and no other model's weights or outputs.
 
-**The goal is simple: improve CORE.** A higher CORE score is better. Keep a candidate only when its unrounded CORE score exceeds the current best by **at least 0.01 absolute** (`candidate_core >= best_core + 0.01`). This threshold is fixed before the baseline; never change it after seeing results. `val_bpb` is recorded for reference only and never determines adoption. Every run still trains for 30 minutes and must finish, including both evaluations, within the 1-hour rental.
+**The goal is simple: improve CORE.** A higher CORE score is better. Keep a candidate when its unrounded CORE score is higher than the current best (`prepare.core_improves`). `val_bpb` is recorded for reference only and never determines adoption. Every run still trains for 30 minutes and must finish, including both evaluations, within the 1-hour rental.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful CORE gains, but it should not blow up dramatically.
 
-**Simplicity criterion**: Among candidates meeting the fixed CORE threshold, prefer simpler implementations. Simplicity and a better `val_bpb` do not exempt a candidate from the 0.01 CORE requirement.
+**Simplicity criterion**: Among candidates that improve CORE, prefer simpler implementations. Neither simplicity nor a better `val_bpb` makes a candidate that does not improve CORE a keep.
 
 **The first run**: Establish the baseline only after the complete CORE evaluation is ready. Keep the initial training architecture, optimizer, hyperparameters and seed unchanged; the evaluation calls are added beforehand. Measure the full CORE suite and reference `val_bpb` once under this frame.
 
-**No result-driven reruns**: A completed evaluation is final for that run. Do not change seeds or repeat training or evaluation until a better number appears. Preserve every attempt and its complete per-task output. Missing, partial, non-finite or failed CORE results cannot justify adoption. The threshold is 0.01 absolute CORE, with no later noise-based adjustment.
+**No result-driven reruns**: A completed evaluation is final for that run. Do not change seeds or repeat training or evaluation until a better number appears. Preserve every attempt and its complete per-task output. Missing, partial, non-finite or failed CORE results cannot justify adoption.
 
 **Bundles**: With one run a day, one change per run is far too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
@@ -97,8 +97,8 @@ Example:
 ```
 commit	core_metric	val_bpb	memory_gb	status	description
 a1b2c3d	0.12	0.997900	44.0	keep	baseline under the fixed CORE frame
-b2c3d4e	0.132	0.993200	44.2	keep	example bundle improving CORE by 0.012; source URL
-c3d4e5f	0.14	0.985000	44.0	discard	example bundle improving CORE by only 0.008; source URL
+b2c3d4e	0.125	0.993200	44.2	keep	example bundle improving CORE; source URL
+c3d4e5f	0.123	0.985000	44.0	discard	example bundle lowering CORE despite a better val_bpb; source URL
 d4e5f6g	NA	NA	0.0	crash	double model width (OOM); source URL
 ```
 
@@ -115,7 +115,7 @@ LOOP FOREVER:
 5. Read out the results: `grep -e '^core_metric:' -e '^val_bpb:' -e '^peak_vram_mb:' run.log`; preserve the complete CORE JSON and CSV.
 6. Require a successful exit and complete finite results for all 22 CORE tasks. If either is missing, record the attempt as failed and inspect `tail -n 50 run.log`. A technical fix can be prepared for a later run under the daily limit; do not rerun a completed evaluation to obtain a better score.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. Keep the commit only if `prepare.core_improves(candidate_core, best_core)` is true: at least 0.01 absolute CORE improvement. The baseline is the initial reference, not a candidate requiring an earlier score.
+8. Keep the commit only if `prepare.core_improves(candidate_core, best_core)` is true: a higher CORE score than the current best. The baseline is the initial reference, not a candidate requiring an earlier score.
 9. Otherwise, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).

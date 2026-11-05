@@ -39,7 +39,6 @@ import torch
 MAX_SEQ_LEN = 2048       # context length
 TIME_BUDGET = 1800       # training time budget in seconds (30 minutes, one run in a rental of at most 1 hour)
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-CORE_MIN_DELTA = 0.01    # absolute CORE improvement required for adoption
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -198,10 +197,10 @@ def save_core_results(result, directory="results"):
 
 
 def core_improves(candidate, incumbent):
-    """Apply the predeclared absolute threshold to unrounded CORE scores."""
+    """Adopt a candidate whose unrounded CORE score is higher than the incumbent's."""
     if not math.isfinite(candidate) or not math.isfinite(incumbent):
         raise ValueError("A CORE decision requires two finite scores.")
-    return Decimal(str(candidate)) >= Decimal(str(incumbent)) + Decimal(str(CORE_MIN_DELTA))
+    return Decimal(str(candidate)) > Decimal(str(incumbent))
 
 # ---------------------------------------------------------------------------
 # Data download

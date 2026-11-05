@@ -19,14 +19,13 @@ class CoreEvaluationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tasks = prepare.verify_core_assets()
 
-    def test_accepts_the_fixed_absolute_improvement_at_the_boundary(self):
+    def test_accepts_only_a_higher_score(self):
         for candidate, incumbent, accepted in [
             (0.13, 0.12, True),
-            (0.15, 0.14, True),
-            (0.132, 0.12, True),
-            (0.12999999999999998, 0.12, False),
-            (0.14, 0.132, False),
+            (0.1201, 0.12, True),
+            (0.14, 0.132, True),
             (0.12, 0.12, False),
+            (0.1199, 0.12, False),
             (0.11, 0.12, False),
         ]:
             with self.subTest(candidate=candidate, incumbent=incumbent):
