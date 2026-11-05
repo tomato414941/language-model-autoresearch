@@ -6,14 +6,13 @@ This is an experiment to have the LLM do its own research.
 
 To set up a new experiment, work with the user to:
 
-1. **Work on `main`**: do not create branches.
-2. **Read the in-scope files**: The repo is small. Read these files for full context:
+1. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `prepare.py` — the fixed frame (allowed data, time budget, evaluation) and a default tokenizer and dataloader. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-3. **Rent the GPU**: experiments run on one rented H100 SXM, never on the machine you run on (see the rules at the end). Never write hosts, keys or IP addresses into the repository.
-4. **Prepare the data**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer. Bring the tokenizer when renting, then run `uv run prepare.py` on the rented machine to download the remaining training shards.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+2. **Rent the GPU**: experiments run on one rented H100 SXM, never on the machine you run on (see the rules at the end).
+3. **Prepare the data**: on the processing server (see the rules at the end), run `uv run prepare.py --num-shards 10` to train the tokenizer. Bring the tokenizer when renting, then run `uv run prepare.py` on the rented machine to download the remaining training shards.
+4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+5. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -45,7 +44,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **Bundles**: With one run a day, one change per run is far too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
-**Discarded is not forever**: An idea can return in a genuinely different bundle or configuration, or after the baseline changes. Describe the new hypothesis before running it. Never repeat an unchanged experiment to replace an unfavorable completed result.
+**Discarded is not forever**: An idea can return in a genuinely different bundle or configuration, or after the baseline changes. Describe the new hypothesis before running it.
 
 **Follow the latest work**: Between rentals, search the web for what is new: speedrun (modded-nanogpt) and nanochat records, recent arXiv papers on small-model pretraining, and other people's autoresearch results. Put the source of each idea in its description.
 
@@ -131,7 +130,7 @@ The idea is that you are a completely autonomous researcher trying things out. I
 - **Rentals.** Rent one H100 SXM at most once a day and for at most 1 hour, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's 30-minute training and its eval must fit in it. Delete it right after. When you rent, set a timer that deletes it at 1 hour, in case you stop responding.
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental. If you think something will be needed later, do it, even if it takes more than a day. For example: analyze the results, search for the latest work, prepare the next experiment as a ready-to-run commit so that rented time goes to training only, and make renting faster and cheaper.
 - **CPU work.** Rented GPU time is only for the training. Everything that needs no GPU runs beforehand on the processing server in your environment notes: preparing the tokenizer, installing and checking code (for example, that the prepared experiment builds and takes a training step with a small model on the CPU), and analysis. Never run such work on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
-- **Source and secrets.** Edit source and configuration only in the local Git repository, then send them to the processing server; its copy is not a Git checkout. Keep keys in the ignored `.env`, and have tools read environment variables. Add `.env` to `.gitignore` before creating it. Never commit secrets or machine-specific connection details.
-- **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Run them with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect them to the model and tokenizer; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. The user approved adding `olmes` as a dependency and implementing the suites in `prepare.py`; this and the data downloads below are the changes to `prepare.py` allowed now. Before using them, count their tokens on the CPU and estimate whether a run with the complete suites fits within the rental; if it does not, tell the user instead of dropping tasks or examples. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick. Never rerun until numbers improve. Only the user changes the evaluation.
-- **Data.** The user added FineMath and Common Pile's educational code. Implement their downloads in `prepare.py` at the pinned revisions, each into its own directory, so that the default dataloader still reads FineWeb-Edu only and the measured baseline stays unchanged. Whether and how much of each a candidate reads is up to `train.py`.
+- **Source and secrets.** Edit source and configuration only in the local Git repository, then send them to the processing server; its copy is not a Git checkout. Keep keys in the ignored `.env`, and have tools read environment variables. Add `.env` to `.gitignore` before creating it.
+- **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Run them with AI2's `olmes` at a pinned revision, with every task, example, prompt and scoring unchanged; only connect them to the model and tokenizer; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. The user approved adding `olmes` as a dependency and implementing the suites in `prepare.py`; this and the data downloads below are the changes to `prepare.py` allowed now. Before using them, count their tokens on the CPU and estimate whether a run with the complete suites fits within the rental; if it does not, tell the user instead of dropping tasks or examples. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick.
+- **Data.** The user added FineMath and Common Pile's educational code. Implement their downloads in `prepare.py` at the pinned revisions, each into its own directory, so that the default dataloader still reads FineWeb-Edu only and the measured baseline stays unchanged.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPU, the time budget and the daily hour. Never re-measure an earlier model when the measurement changes. A new evaluation is measured from the next run on and starts deciding once the current best has it. If a change leaves no shared evaluation comparable (for example a new time budget or GPU), the next run becomes the new baseline without a comparison.
