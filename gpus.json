@@ -1,5 +1,5 @@
 {
-  "active_gpu": "h100",
+  "active_gpu": "rtx5090",
   "gpus": {
     "h100": {
       "gpu_name": "H100 SXM",
@@ -22,9 +22,9 @@
     "rtx5090": {
       "gpu_name": "RTX 5090",
       "device_name_pattern": "(?:GeForce )?RTX 5090",
-      "training_seconds": null,
-      "rental_seconds": null,
-      "max_hourly_cost": null,
+      "training_seconds": 3600,
+      "rental_seconds": 6300,
+      "max_hourly_cost": 1,
       "attention_backend": "sdpa",
       "kernel_repo": null,
       "kernel_revision": null,

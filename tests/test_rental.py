@@ -12,7 +12,9 @@ from tools import rental
 
 class RentalLifecycleTests(unittest.TestCase):
     def setUp(self):
-        self.hold_patch = patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD': '0'})
+        self.hold_patch = patch.dict(rental.os.environ, {
+            'AUTORESEARCH_GPU': 'h100', 'AUTORESEARCH_RENTAL_HOLD_H100': '0',
+            'AUTORESEARCH_RENTAL_HOLD_RTX5090': '0'})
         self.hold_patch.start()
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -33,13 +35,39 @@ class RentalLifecycleTests(unittest.TestCase):
 
     def test_honors_the_users_rental_hold_before_requesting_a_machine(self):
         job = {**self.job, 'phase': 'prepared'}
-        with patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD': '1'}):
+        with patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD_H100': '1'}):
             with patch.object(rental, 'api') as api:
                 with self.assertRaisesRegex(RuntimeError, 'on hold by user request'):
                     rental.start(job)
         api.assert_not_called()
         self.assertEqual(job['phase'], 'prepared')
         self.assertNotIn('creation_requested_at', job)
+
+    def test_keeps_a_hold_on_one_gpu_from_blocking_the_other_gpus_preflight(self):
+        job = {**self.job, 'phase': 'prepared'}
+        with patch.dict(rental.os.environ, {'AUTORESEARCH_RENTAL_HOLD_RTX5090': '1'}):
+            with patch.object(rental, 'digest', side_effect=RuntimeError('reached H100 preflight')):
+                with self.assertRaisesRegex(RuntimeError, 'reached H100 preflight'):
+                    rental.start(job)
+
+    def test_starts_the_named_gpu_with_its_own_environment_and_lock(self):
+        for identifier in ('h100', 'rtx5090'):
+            job = dict(self.job, gpu_id=identifier)
+            with self.subTest(gpu=identifier):
+                with patch.object(rental.sys, 'argv', ['rental.py', '--gpu', identifier, 'start', 'fixture']):
+                    with patch.object(rental, 'load', return_value=job):
+                        with patch.object(rental, 'start') as start:
+                            rental.main()
+                            start.assert_called_once_with(job)
+                            self.assertEqual(rental.os.environ['AUTORESEARCH_GPU'], identifier)
+                self.assertTrue(rental.rental_lock(rental.get_profile(identifier)).exists())
+
+    def test_checks_the_gpu_identity_before_starting_an_existing_job(self):
+        with patch.object(rental.sys, 'argv', ['rental.py', '--gpu', 'rtx5090', 'start', 'fixture']):
+            with patch.object(rental, 'start') as start, patch.object(rental.sys, 'stderr'):
+                with self.assertRaises(SystemExit):
+                    rental.main()
+        start.assert_not_called()
 
     def test_preserves_the_completed_run_when_expiry_updates_its_deletion_state(self):
         rental.save(dict(id='fixture', phase='evaluated', exit_code=0))
@@ -172,6 +200,33 @@ class RentalLifecycleTests(unittest.TestCase):
             with patch.object(rental, 'api', side_effect=responses):
                 self.assertEqual(rental.recent_rentals(100000), [owned])
 
+    def test_allows_the_other_gpu_to_run_while_counting_legacy_rentals_for_the_h100(self):
+        rtx = dict(id=90, label='autoresearch-rtx5090-live', start_date=0)
+        legacy = dict(id=42, label='autoresearch-20261104-legacy', start_date=99000)
+        responses = [{'invoices': [{'instance_id': 42}]}, {'contracts': [legacy, rtx]}]
+        with patch.object(rental, 'list_instances', return_value=[rtx]):
+            with patch.object(rental, 'api', side_effect=responses):
+                self.assertEqual(rental.recent_rentals(100000), [legacy])
+        with patch.object(rental, 'list_instances', return_value=[rtx, legacy]):
+            self.assertEqual(rental.recent_rentals(100000, rental.get_profile('rtx5090')), [rtx])
+
+    def test_binds_new_launch_and_expiry_timers_to_the_jobs_gpu(self):
+        jobs = [dict(self.job, gpu_id=identifier) for identifier in ('h100', 'rtx5090')]
+        for job in jobs:
+            with self.subTest(gpu=job['gpu_id']):
+                with patch.object(rental, 'run') as run:
+                    with patch.object(rental.subprocess, 'check_output', return_value='active\n'):
+                        rental.arm_expiry(job)
+                command = run.call_args.args[0]
+                self.assertIn('--unit=autoresearch-expire-' + job['gpu_id'] + '-fixture', command)
+                self.assertEqual(command[-4:], ['--gpu', job['gpu_id'], 'expire', 'fixture'])
+                with patch.object(rental, 'run') as run:
+                    with patch.object(rental.subprocess, 'check_output', return_value='active\n'):
+                        rental.schedule(dict(job, phase='prepared'), '2099-01-01T00:00:00Z')
+                command = run.call_args.args[0]
+                self.assertIn('--unit=autoresearch-start-' + job['gpu_id'] + '-fixture', command)
+                self.assertEqual(command[-4:], ['--gpu', job['gpu_id'], 'start', 'fixture'])
+
     def test_allows_a_fresh_request_after_a_provider_confirmed_rejection(self):
         rental.save(dict(id='fixture', creation_requested_at=1000, creation_rejected=True))
         with patch.object(rental, 'recent_rentals', return_value=[]):
@@ -233,7 +288,7 @@ class RentalLifecycleTests(unittest.TestCase):
             (artifacts / name).write_bytes(name.encode())
             manifest[field] = rental.digest(artifacts / name)
         (artifacts / 'runtime.json').write_text(json.dumps(manifest))
-        for name in rental.SOURCES:
+        for name in rental.source_files():
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text('current ' + name)
         (self.root / 'tools').mkdir()
@@ -264,7 +319,7 @@ class RentalLifecycleTests(unittest.TestCase):
         runtime = directory / 'runtime.json'
         runtime.write_text(json.dumps(manifest))
         (artifacts / 'runtime.json').write_text('{"container_image":"later-image"}')
-        for name in rental.SOURCES:
+        for name in rental.source_files():
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text('later ' + name)
         job = {**self.job, 'phase': 'prepared', 'source_archive_sha256': rental.digest(source),

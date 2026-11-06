@@ -24,10 +24,9 @@ import urllib.error
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
-from gpu_config import active_gpu, profile_for_job, source_files
+from gpu_config import active_gpu, get_profile, profile_for_job, read_config, source_files
 from tools.runtime_archives import archive_specs, deployment_names, UNPACK_XZ
 
-SOURCES = source_files()
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
     'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
     'protocol.py', 'run_prepared.py', 'tokenizer_adapter.py', 'verify_requests.py',
@@ -81,7 +80,7 @@ def training_seconds(job):
                 if isinstance(node, ast.Assign) and any(
                         isinstance(target, ast.Name) and target.id == 'TIME_BUDGET' for target in node.targets):
                     return ast.literal_eval(node.value)
-    return active_gpu().settings()['training_seconds']
+    return profile_for_job(job).settings()['training_seconds']
 
 
 def lease_seconds(job):
@@ -105,10 +104,21 @@ def run(command, **kwargs):
     return subprocess.run(command, check=True, **kwargs)
 
 
-def recent_rentals(now):
+def label_gpu(label):
+    if not str(label).startswith(PROJECT_LABELS):
+        return None
+    for identifier in read_config()['gpus']:
+        if label.startswith('autoresearch-' + identifier + '-'):
+            return identifier
+    # All rental labels before GPU tracks were introduced belonged to the H100.
+    return 'h100'
+
+
+def recent_rentals(now, profile=None):
     """Check live instances and actual contract start times in recent billing history."""
+    profile = active_gpu() if profile is None else profile
     rows = list_instances(timeout=10)
-    owned = [row for row in rows if str(row.get('label', '')).startswith(PROJECT_LABELS)]
+    owned = [row for row in rows if label_gpu(row.get('label', '')) == profile.identifier]
     if owned:
         return owned
     invoices = api('GET', 'users/me/invoices', params={
@@ -118,28 +128,39 @@ def recent_rentals(now):
     if identifiers:
         contracts = api('POST', 'contracts/fetch/', {'contract_ids': identifiers})
         rows.extend(contracts['contracts'])
-    return [row for row in rows if str(row.get('label', '')).startswith(PROJECT_LABELS)
+    return [row for row in rows if label_gpu(row.get('label', '')) == profile.identifier
             and now - float(row['start_date']) < 86400]
 
 
-def check_daily_budget(now):
+def check_daily_budget(now, profile=None):
+    profile = active_gpu() if profile is None else profile
     for path in (ROOT / 'queue').glob('*/job.json'):
         previous = json.loads(path.read_text())
         requested = previous.get('creation_requested_at')
-        if requested is not None and not previous.get('creation_rejected') and now - requested < 86400:
-            raise RuntimeError('A daily research rental was already requested within the last 24 hours.')
-    if recent_rentals(now):
-        raise RuntimeError('The previous daily research rental is less than 24 hours old.')
+        if (requested is not None and not previous.get('creation_rejected') and now - requested < 86400
+                and profile_for_job(previous).identifier == profile.identifier):
+            raise RuntimeError(f'A {profile.identifier} rental was already requested within the last 24 hours.')
+    if recent_rentals(now, profile):
+        raise RuntimeError(f'The previous {profile.identifier} rental is less than 24 hours old or still active.')
+
+
+def timer_unit(job, action):
+    return 'autoresearch-' + action + '-' + profile_for_job(job).identifier + '-' + job['id']
+
+
+def rental_lock(profile):
+    return ROOT / 'results/operations' / ('rental-' + profile.identifier + '.lock')
 
 
 def arm_expiry(job):
-    unit = 'autoresearch-expire-' + job['id']
+    unit = timer_unit(job, 'expire')
     when = dt.datetime.fromtimestamp(job['expires_at'], dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     run(['systemd-run', '--user', '--unit=' + unit, '--on-calendar=' + when,
          '--timer-property=AccuracySec=1s', '--timer-property=Persistent=yes',
          '--property=WorkingDirectory=' + str(ROOT), '--property=EnvironmentFile=' + str(ROOT / '.env'),
          '--property=Restart=on-failure', '--property=RestartSec=10s',
-         sys.executable, str(ROOT / 'tools/rental.py'), 'expire', job['id']])
+         sys.executable, str(ROOT / 'tools/rental.py'), '--gpu', profile_for_job(job).identifier,
+         'expire', job['id']])
     state = subprocess.check_output(
         ['systemctl', '--user', 'show', unit + '.timer', '--property=ActiveState', '--value'], text=True,
     ).strip()
@@ -427,7 +448,8 @@ def execute(job, instance, key):
     job['launch_requested_at'] = time.time()
     save(job)
     try:
-        remote('cd autoresearch && if mkdir .started 2>/dev/null; then '
+        remote('cd autoresearch && export AUTORESEARCH_GPU=' + shlex.quote(profile.identifier)
+               + ' && if mkdir .started 2>/dev/null; then '
                'nohup bash gpu_run.sh > bootstrap.log 2>&1 < /dev/null & echo $! > run.pid; fi')
     except (subprocess.SubprocessError, OSError):
         print('The launch acknowledgement was lost; observing the original job handle.', flush=True)
@@ -492,13 +514,11 @@ def execute(job, instance, key):
 
 
 def start(job):
-    if os.environ.get('AUTORESEARCH_RENTAL_HOLD') == '1':
-        raise RuntimeError('GPU rentals are on hold by user request.')
+    profile = profile_for_job(job)
+    if os.environ.get('AUTORESEARCH_RENTAL_HOLD_' + profile.identifier.upper()) == '1':
+        raise RuntimeError(f'{profile.identifier} rentals are on hold by user request.')
     if job['phase'] != 'prepared':
         raise RuntimeError('This job already has a creation attempt; observe or expire it instead.')
-    profile = profile_for_job(job)
-    if profile.identifier != active_gpu().identifier:
-        raise RuntimeError('The prepared job belongs to an inactive GPU; only the user selects the GPU.')
     runtime_path = job_path(job['id']).parent / 'runtime.json'
     if digest(runtime_path) != job['runtime_manifest_sha256']:
         raise RuntimeError('The prepared runtime manifest changed.')
@@ -509,7 +529,7 @@ def start(job):
         if digest(artifact_directory(job) / name) != sha256:
             raise RuntimeError('A prepared runtime archive changed; no rental was requested.')
     required_seconds = execution_budget(job)
-    check_daily_budget(time.time())
+    check_daily_budget(time.time(), profile)
     public = validate_environment()
     offer = choose_offer(profile)
     if offer['dph_total'] > job['max_hourly_cost']:
@@ -578,14 +598,15 @@ def schedule(job, when):
     parsed = dt.datetime.fromisoformat(when.replace('Z', '+00:00'))
     if parsed.tzinfo is None or parsed.timestamp() < time.time() + 60:
         raise ValueError('Specify a future time with an explicit timezone.')
-    unit = 'autoresearch-start-' + job['id']
+    unit = timer_unit(job, 'start')
     calendar = parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     run(['systemd-run', '--user', '--unit=' + unit, '--on-calendar=' + calendar,
          '--timer-property=AccuracySec=1s', '--timer-property=Persistent=yes',
          '--property=WorkingDirectory=' + str(ROOT), '--property=EnvironmentFile=' + str(ROOT / '.env'),
          '--property=StandardOutput=append:' + str(ROOT / 'logs' / (job['id'] + '.log')),
          '--property=StandardError=append:' + str(ROOT / 'logs' / (job['id'] + '.log')),
-         sys.executable, str(ROOT / 'tools/rental.py'), 'start', job['id']])
+         sys.executable, str(ROOT / 'tools/rental.py'), '--gpu', profile_for_job(job).identifier,
+         'start', job['id']])
     state = subprocess.check_output(
         ['systemctl', '--user', 'show', unit + '.timer', '--property=ActiveState', '--value'], text=True,
     ).strip()
@@ -598,7 +619,8 @@ def check_expiry():
     identifier = 'expiry-check-' + uuid.uuid4().hex[:8]
     job_path(identifier).parent.mkdir(parents=True)
     job = dict(id=identifier, label='autoresearch-' + identifier, phase='diagnostic',
-               diagnostic=True, expires_at=time.time() + 20, creation_uncertain=False)
+               gpu_id=active_gpu().identifier, diagnostic=True,
+               expires_at=time.time() + 20, creation_uncertain=False)
     save(job)
     arm_expiry(job)
     print('Scheduled an expiry check with no rental or destroy request.', flush=True)
@@ -624,6 +646,8 @@ def cancel(job):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--gpu', choices=tuple(read_config()['gpus']),
+                        help='Select a GPU for preparation, or verify the GPU of an existing job.')
     sub = parser.add_subparsers(dest='action', required=True)
     preparation = sub.add_parser('prepare')
     preparation.add_argument('--commit', required=True)
@@ -638,6 +662,8 @@ def main():
     scheduling.add_argument('identifier')
     scheduling.add_argument('--at', required=True)
     args = parser.parse_args()
+    if args.gpu:
+        os.environ['AUTORESEARCH_GPU'] = args.gpu
     if args.action == 'prepare':
         prepare_job(args.commit, args.baseline, args.description, args.expected_eval_seconds)
         return
@@ -645,6 +671,10 @@ def main():
         check_expiry()
         return
     job = load(args.identifier)
+    profile = profile_for_job(job)
+    if args.gpu and args.gpu != profile.identifier:
+        parser.error('The specified GPU differs from the prepared job.')
+    os.environ['AUTORESEARCH_GPU'] = profile.identifier
     if args.action == 'expire':
         if job.get('diagnostic'):
             validate_environment()
@@ -656,7 +686,7 @@ def main():
     elif args.action == 'status':
         print(json.dumps(dict(job=job, instances=[row for row in list_instances() if row.get('label') == job['label']]), indent=2))
     else:
-        lock_path = ROOT / 'results/operations/rental.lock'
+        lock_path = rental_lock(profile)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

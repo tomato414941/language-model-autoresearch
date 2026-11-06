@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 
@@ -79,7 +80,7 @@ def get_profile(identifier=None, path=None):
 
 
 def active_gpu():
-    return get_profile()
+    return get_profile(os.environ.get("AUTORESEARCH_GPU") or None)
 
 
 def profile_for_job(job):

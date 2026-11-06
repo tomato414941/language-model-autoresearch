@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +15,8 @@ from tools import rental
 
 class GPUConfigurationTests(unittest.TestCase):
     def setUp(self):
+        self.environment = patch.dict(gpu_config.os.environ, {'AUTORESEARCH_GPU': ''})
+        self.environment.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.config = copy.deepcopy(gpu_config.read_config())
@@ -21,6 +24,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+        self.environment.stop()
 
     def save(self):
         self.path.write_text(json.dumps(self.config))
@@ -41,6 +45,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_requires_the_users_budgets_before_preparing_a_first_rtx_rental(self):
         self.config['active_gpu'] = 'rtx5090'
+        self.config['gpus']['rtx5090'].update(dict.fromkeys(gpu_config.SETTING_FIELDS))
         self.save()
         profile = gpu_config.get_profile(path=self.path)
         with self.assertRaisesRegex(ValueError, 'user must set'):
@@ -58,15 +63,39 @@ class GPUConfigurationTests(unittest.TestCase):
             self.assertEqual(rental.execution_budget(job), 2745)
             self.assertEqual(rental.lease_seconds(job), 3600)
 
-    def test_preserves_the_global_daily_limit_when_the_user_switches_gpu(self):
+    def test_selects_each_process_gpu_without_changing_the_shared_default(self):
+        self.config['active_gpu'] = 'rtx5090'
+        self.save()
+        original = self.path.read_bytes()
+        with patch.object(gpu_config, 'CONFIG_PATH', self.path):
+            with patch.dict(gpu_config.os.environ, {'AUTORESEARCH_GPU': 'h100'}):
+                self.assertEqual(gpu_config.active_gpu().identifier, 'h100')
+                self.assertIn('gpus/h100/train.py', gpu_config.source_files())
+            self.assertEqual(gpu_config.active_gpu().identifier, 'rtx5090')
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_counts_each_gpus_recent_requests_in_its_own_daily_budget(self):
         with patch.object(rental, 'ROOT', self.root):
             rental.job_path('previous').parent.mkdir(parents=True)
             rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
             self.config['active_gpu'] = 'rtx5090'
             self.save()
             with patch.object(gpu_config, 'CONFIG_PATH', self.path):
-                with self.assertRaisesRegex(RuntimeError, 'last 24 hours'):
+                with patch.object(rental, 'recent_rentals', return_value=[]):
                     rental.check_daily_budget(2000)
+                with self.assertRaisesRegex(RuntimeError, 'last 24 hours'):
+                    rental.check_daily_budget(2000, gpu_config.get_profile('h100'))
+
+    def test_allows_both_gpus_to_hold_their_own_rental_lock(self):
+        with patch.object(rental, 'ROOT', self.root):
+            first = rental.rental_lock(gpu_config.get_profile('h100'))
+            second = rental.rental_lock(gpu_config.get_profile('rtx5090'))
+            first.parent.mkdir(parents=True)
+            with first.open('a') as h100, second.open('a') as rtx, first.open('a') as duplicate:
+                fcntl.flock(h100, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(rtx, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(duplicate, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_selects_only_the_users_active_gpu_from_offers(self):
         self.config['active_gpu'] = 'rtx5090'
