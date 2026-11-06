@@ -1,6 +1,6 @@
 """Stream a verified archive over independent SSH connections into its extractor."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import math
 from pathlib import Path
@@ -56,16 +56,19 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
                 processes.discard(process)
 
     def upload(index, payload):
+        # Delay acknowledgements to cap queued payloads at twice the worker count.
         name = directory + '/' + f'{index:08d}'
         temporary = name + '.tmp'
         checksum = hashlib.sha256(payload).hexdigest()
         command = ('set -e; cat > ' + temporary + '; '
                    + f'test "$(wc -c < {temporary})" -eq {len(payload)}; '
                    + 'printf ' + shlex.quote(checksum + '  ' + temporary + '\n')
-                   + ' | sha256sum -c - >/dev/null; mv ' + temporary + ' ' + name)
+                   + ' | sha256sum -c - >/dev/null; mv ' + temporary + ' ' + name + '; '
+                   + 'until test ' + str(index) + ' -lt $(( $(cat ' + directory + '/consumed) + '
+                   + str(workers) + ' )); do test ! -e ' + directory + '/abort || exit 125; sleep 0.05; done')
         invoke(command, payload)
 
-    invoke('mkdir -p ' + directory)
+    invoke('mkdir -p ' + directory + '; printf "0\\n" > ' + directory + '/consumed')
     # The receiver consumes ordered, verified chunks as soon as they arrive.
     receiver = (
         'set -euo pipefail; end=$((SECONDS + ' + str(math.ceil(timeout)) + ')); '
@@ -74,18 +77,30 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
         + 'until test -f "$part"; do '
         + 'test ! -e ' + directory + '/abort || exit 125; '
         + 'test "$SECONDS" -lt "$end" || exit 124; sleep 0.05; done; '
-        + 'cat "$part"; rm "$part"; done) | (' + unpack + ')'
+        + 'cat "$part"; rm "$part"; printf "%s\\n" "$((i+1))" > ' + directory + '/consumed.tmp; '
+        + 'mv ' + directory + '/consumed.tmp ' + directory + '/consumed; done) | (' + unpack + ')'
     )
     pool = ThreadPoolExecutor(max_workers=workers + 1)
     received = pool.submit(invoke, 'bash -c ' + shlex.quote(receiver))
     pending = []
     checksum = hashlib.sha256()
     sent = 0
+
+    def uploaded(future):
+        candidates = [future, received, *pending]
+        while True:
+            done, _ = wait(candidates, return_when=FIRST_COMPLETED)
+            for completed in done:
+                completed.result()
+            if future.done():
+                return
+            candidates = [candidate for candidate in candidates if not candidate.done()]
+
     try:
         with path.open('rb') as source:
             for index in range(count):
                 if len(pending) >= workers:
-                    pending.pop(0).result()
+                    uploaded(pending.pop(0))
                 if received.done():
                     received.result()
                     raise RuntimeError('The extractor ended before the archive transfer.')
@@ -100,7 +115,7 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
         if sent != size or checksum.hexdigest() != sha256:
             raise RuntimeError('The archive differs from its frozen SHA-256 digest.')
         for future in pending:
-            future.result()
+            uploaded(future)
         received.result()
         invoke('rm -rf ' + directory)
     except BaseException:

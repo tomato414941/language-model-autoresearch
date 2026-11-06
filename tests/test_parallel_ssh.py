@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import threading
 import tempfile
 import unittest
 
@@ -43,6 +44,39 @@ class ParallelArchiveTests(unittest.TestCase):
         receipt = self.transfer(chunk_bytes=self.path.stat().st_size + 1)
         self.assertEqual((self.root / 'restored').read_bytes(), self.payload)
         self.assertEqual(receipt['chunks'], 1)
+
+    def test_limits_remote_temporary_bytes_while_the_extractor_is_slow(self):
+        stopped = threading.Event()
+        maximum = [0]
+
+        def sample():
+            while not stopped.is_set():
+                size = 0
+                for directory in (self.root / 'autoresearch').glob('.transfer-*'):
+                    try:
+                        paths = list(directory.iterdir())
+                    except FileNotFoundError:
+                        continue
+                    for path in paths:
+                        if path.name[:8].isdigit():
+                            try:
+                                size += path.stat().st_size
+                            except FileNotFoundError:
+                                pass
+                maximum[0] = max(maximum[0], size)
+                stopped.wait(.001)
+
+        sampler = threading.Thread(target=sample)
+        sampler.start()
+        try:
+            stream_archive(self.connection, self.path, 'sleep 0.5; gzip -d > restored',
+                           sha256=self.sha256, timeout=10, workers=4, chunk_bytes=65536)
+        finally:
+            stopped.set()
+            sampler.join()
+        self.assertGreater(maximum[0], 0)
+        self.assertLessEqual(maximum[0], 2 * 4 * 65536)
+        self.assertEqual((self.root / 'restored').read_bytes(), self.payload)
 
     def test_streams_xz_chunks_into_the_packaged_parallel_runtime_decoder(self):
         content = io.BytesIO()
