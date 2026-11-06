@@ -32,7 +32,7 @@ class RecordedDecisionTests(unittest.TestCase):
 
     def make_run(self, identifier, bpb, baseline=False, *, rules='fixture rules',
                  measurement_source=None, gpu_name='H100 SXM', runtime_changes=None,
-                 suites=None, metric='val_bpb', gpu_id=None):
+                 suites=None, metric='val_bpb', gpu_id=None, default_gpu=None):
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
                    gpu_name=gpu_name, phase='evaluated', exit_code=0, metric=metric)
         snapshot = rental.job_path(identifier).parent
@@ -43,7 +43,7 @@ class RecordedDecisionTests(unittest.TestCase):
                  'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
         if gpu_id:
             config = read_config()
-            config['active_gpu'] = gpu_id
+            config['active_gpu'] = default_gpu or gpu_id
             if gpu_id == 'rtx5090':
                 config['gpus'][gpu_id].update(training_seconds=900, rental_seconds=2700, max_hourly_cost=0.8)
             values = config['gpus'][gpu_id]
@@ -132,6 +132,15 @@ class RecordedDecisionTests(unittest.TestCase):
             self.assertTrue(all(row['gpu_id'] == gpu for row in records))
             with (folder / 'results.tsv').open() as stream:
                 self.assertEqual(len(list(csv.reader(stream, delimiter='\t'))), count + 1)
+
+    def test_records_a_jobs_own_gpu_settings_when_the_shared_default_selects_the_other_gpu(self):
+        for gpu, default in (('h100', 'rtx5090'), ('rtx5090', 'h100')):
+            with self.subTest(gpu=gpu):
+                self.make_run(gpu + '-base', 1.0, baseline=True, gpu_id=gpu, default_gpu=default)
+                self.assertEqual(self.record(gpu + '-base')['status'], 'keep')
+                self.make_run(gpu + '-gain', 0.9, gpu_id=gpu, default_gpu=default)
+                record = self.record(gpu + '-gain')
+                self.assertEqual((record['status'], record['incumbent']), ('keep', gpu + '-base'))
 
     def test_imports_original_h100_logs_and_results_without_remeasuring_or_rewriting_history(self):
         from tools import gpu_tracks

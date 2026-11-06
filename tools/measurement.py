@@ -101,7 +101,7 @@ def from_snapshot(job, directory):
             profile = config["gpus"][job["gpu_id"]]
             settings = {name: profile[name] for name in
                         ("training_seconds", "rental_seconds", "max_hourly_cost")}
-            if (config["active_gpu"] != job["gpu_id"] or settings != job["gpu_settings"]
+            if (settings != job["gpu_settings"]
                     or profile["gpu_name"] != job["gpu_name"]):
                 raise ValueError("The frozen GPU settings differ from the prepared job.")
     if digest(source) != job["source_sha256"]["prepare.py"]:
