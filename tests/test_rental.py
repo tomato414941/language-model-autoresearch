@@ -20,6 +20,8 @@ class RentalLifecycleTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.root_patch = patch.object(rental, 'ROOT', self.root)
         self.root_patch.start()
+        self.transfer_patch = patch.object(rental, 'stream_archive', return_value={'fixture': 'transfer'})
+        self.transfer = self.transfer_patch.start()
         self.collection_cases = 0
         self.job = dict(id='fixture', label='autoresearch-fixture', instance_id=42,
                         phase='running', creation_uncertain=False, expires_at=time.time() + 3500,
@@ -29,6 +31,7 @@ class RentalLifecycleTests(unittest.TestCase):
         rental.save(self.job)
 
     def tearDown(self):
+        self.transfer_patch.stop()
         self.root_patch.stop()
         self.directory.cleanup()
         self.hold_patch.stop()
@@ -358,8 +361,6 @@ class RentalLifecycleTests(unittest.TestCase):
             text = arguments[-1]
             if text.startswith('nvidia-smi'):
                 return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0\n')
-            if text.startswith('tar -xzf'):
-                now[0] += 300
             if 'nohup bash gpu_run.sh' in text:
                 launched.append(text)
             return subprocess.CompletedProcess(arguments, 0, stdout='')
@@ -367,6 +368,7 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.object(rental, 'ssh_connection', return_value=['ssh']):
             with patch.object(rental, 'run', side_effect=command):
                 with patch.object(rental.time, 'time', side_effect=lambda: now[0]):
+                    self.transfer.side_effect = lambda *args, **kwargs: now.__setitem__(0, now[0] + 300)
                     with self.assertRaises(TimeoutError):
                         rental.execute(job, {}, self.root / 'key')
         self.assertEqual(launched, [])
@@ -420,16 +422,18 @@ class RentalLifecycleTests(unittest.TestCase):
             (artifacts / name).write_bytes(b'archive fixture')
         snapshot = rental.job_path('fixture').parent
         (snapshot / 'source.tar.gz').write_bytes(b'source fixture')
+        runtime_hash = rental.digest(artifacts / 'gpu-env.tar.xz')
         (snapshot / 'runtime.json').write_text(json.dumps(dict(
-            python_version='3.12.16', gpu_env_sha256='canonical runtime',
-            transport=dict(format=transport_format, canonical_gpu_env_sha256='canonical runtime'))))
+            python_version='3.12.16', gpu_env_sha256=runtime_hash,
+            gpu_assets_sha256=rental.digest(artifacts / 'gpu-assets.tar.gz'),
+            transport=dict(format=transport_format, canonical_gpu_env_sha256=runtime_hash,
+                           gpu_env_xz_sha256=runtime_hash,
+                           bootstrap_sha256=rental.digest(artifacts / 'gpu-bootstrap.tar.gz')))))
         commands, uploads = [], []
 
         def command(arguments, **kwargs):
             text = arguments[-1]
             commands.append(text)
-            if 'stdin' in kwargs:
-                uploads.append(Path(kwargs['stdin'].name).name)
             if text.startswith('nvidia-smi'):
                 return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0, 0\n')
             if 'kill -0' in text:
@@ -441,6 +445,9 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.object(rental, 'ssh_connection', return_value=['ssh']), \
                 patch.object(rental, 'run', side_effect=command):
             rental.execute(self.job, {}, self.root / 'key')
+        for call in self.transfer.call_args_list:
+            uploads.append(Path(call.args[1]).name)
+            commands.append(call.args[2])
         self.assertEqual(uploads, ['gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz', 'source.tar.gz'])
         self.assertTrue(any('.bootstrap/.python/' in text for text in commands))
         self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)

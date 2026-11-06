@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
 from gpu_config import active_gpu, get_profile, profile_for_job, read_config, source_files
 from tools.runtime_archives import archive_specs, deployment_names, UNPACK_XZ
+from tools.parallel_ssh import stream_archive
 
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
     'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
@@ -423,6 +424,9 @@ def execute(job, instance, key):
     runtime_path = job_path(job['id']).parent / 'runtime.json'
     manifest = json.loads(runtime_path.read_text()) if runtime_path.exists() else {}
     names = deployment_names(manifest)
+    hashes = dict(archive_specs(manifest)) if manifest else {}
+    hashes['source.tar.gz'] = job.get('source_archive_sha256')
+    transfers = []
     for path in [*(artifacts / name for name in names), job_path(job['id']).parent / 'source.tar.gz']:
         if path.name == 'gpu-bootstrap.tar.gz':
             remote('mkdir -p autoresearch/.bootstrap')
@@ -440,8 +444,11 @@ def execute(job, instance, key):
             unpack = 'cd autoresearch && ' + shlex.join(command)
         else:
             unpack = 'tar -xzf - -C autoresearch'
-        with path.open('rb') as source:
-            remote(unpack, timeout=900, stdin=source)
+        receipt = stream_archive(connection, path, unpack, sha256=hashes.get(path.name) or digest(path),
+                                 timeout=min(900, deadline - time.time()))
+        transfers.append(receipt)
+        job['archive_transfers'] = transfers
+        save(job)
     job['transfer_completed_at'] = time.time()
     save(job)
     require_execution_time(job)
