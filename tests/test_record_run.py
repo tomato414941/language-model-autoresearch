@@ -329,17 +329,18 @@ class RecordedDecisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.record('baseline')
 
-    def test_finalizes_after_deletion_once_and_exports_the_bpb_decision(self):
+    def test_records_once_after_the_machine_is_returned_and_exports_the_bpb_decision(self):
         self.make_run('baseline', 1.0, baseline=True)
         self.record('baseline')
         self.make_run('candidate', 0.9)
-        rental.save(dict(id='candidate', creation_requested_at=1000))
-        def delete(job):
+        rental.save(dict(id='candidate', instance_id=42))
+        def give_back(job):
             rental.save(dict(id=job['id'], deleted_at=1100))
         def record(command):
             self.assertEqual(rental.load(command[-1])['deleted_at'], 1100)
             return self.record(command[-1])
-        with patch.object(rental, 'delete_instances', side_effect=delete):
+        with patch.object(rental.vast_backend, 'command'), \
+                patch.object(rental, 'return_machines', side_effect=give_back):
             with patch.object(rental, 'run', side_effect=record):
                 for _ in range(2):
                     rental.finalize(rental.load('candidate'))

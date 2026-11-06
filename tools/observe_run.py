@@ -1,4 +1,4 @@
-"""Read the existing rental's GPU state, process handle and log tails without restarting work."""
+"""Read the running job's GPU state, process handle and log tails without restarting work."""
 
 import argparse
 import datetime as dt
@@ -11,8 +11,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from tools.rental import load, ssh_connection
-from tools.vast_control import list_instances
+from tools.rental import load, ssh_command
+from tools import vast_backend
 
 
 def main():
@@ -20,15 +20,14 @@ def main():
     parser.add_argument('identifier')
     args = parser.parse_args()
     job = load(args.identifier)
-    matches = [row for row in list_instances(timeout=15)
-               if row.get('label') == job['label'] and row['id'] == job.get('instance_id')]
+    returned = {row['instance'] for row in vast_backend.entries() if row.get('event') == 'returned'}
+    held = job.get('instance_id') is not None and job['instance_id'] not in returned
     print(json.dumps(dict(
         observed_at=dt.datetime.now(dt.timezone.utc).isoformat(), phase=job['phase'],
         expires_at=job.get('expires_at'), exit_code=job.get('exit_code'),
-        instances=[{key: row.get(key) for key in ('id', 'gpu_name', 'num_gpus', 'actual_status')}
-                   for row in matches],
+        instance=job.get('instance_id'), returned=not held,
     ), indent=2), flush=True)
-    if not matches:
+    if not held or not job.get('ssh_config'):
         return
     with tempfile.TemporaryDirectory(prefix='autoresearch-observe-') as temporary:
         key = Path(temporary) / 'key'
@@ -45,7 +44,7 @@ def main():
             'if test -f run.log; then printf "\\nrun.log\\n"; '
             'tail -c 6000 run.log | tr "\\r" "\\n" | tail -n 8; fi; fi'
         )
-        result = subprocess.run(ssh_connection(matches[0], key) + [command],
+        result = subprocess.run(ssh_command(job, key) + [command],
                                 capture_output=True, text=True, timeout=30)
         print(result.stdout.replace('\r', '\n'), end='', flush=True)
         if result.returncode:

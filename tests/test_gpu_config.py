@@ -1,5 +1,4 @@
 import copy
-import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -20,15 +19,10 @@ class GPUConfigurationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.config = copy.deepcopy(gpu_config.read_config())
-        self.config['rental_scope'] = 'gpu'
         self.path = self.root / 'gpus.json'
         self.save()
         self.config_patch = patch.object(gpu_config, 'CONFIG_PATH', self.path)
         self.config_patch.start()
-        for default in (patch.object(rental, 'list_instances', return_value=[]),
-                        patch.object(rental.vast_backend, 'entries', return_value=[])):
-            default.start()
-            self.addCleanup(default.stop)
 
     def tearDown(self):
         self.config_patch.stop()
@@ -93,101 +87,6 @@ class GPUConfigurationTests(unittest.TestCase):
                 self.assertIn('gpus/h100/train.py', gpu_config.source_files())
             self.assertEqual(gpu_config.active_gpu().identifier, 'rtx5090')
         self.assertEqual(self.path.read_bytes(), original)
-
-    def test_counts_an_unfinished_request_before_renting_either_gpu(self):
-        with patch.object(rental, 'ROOT', self.root):
-            rental.job_path('previous').parent.mkdir(parents=True)
-            rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
-            self.config['active_gpu'] = 'rtx5090'
-            self.save()
-            with patch.object(gpu_config, 'CONFIG_PATH', self.path):
-                with self.assertRaisesRegex(RuntimeError, 'not finished'):
-                    rental.check_daily_budget(2000)
-                with self.assertRaisesRegex(RuntimeError, 'not finished'):
-                    rental.check_daily_budget(2000, gpu_config.get_profile('h100'))
-
-    def test_allows_both_gpus_to_hold_their_own_rental_lock(self):
-        with patch.object(rental, 'ROOT', self.root):
-            first = rental.rental_lock(gpu_config.get_profile('h100'))
-            second = rental.rental_lock(gpu_config.get_profile('rtx5090'))
-            first.parent.mkdir(parents=True)
-            with first.open('a') as h100, second.open('a') as rtx, first.open('a') as duplicate:
-                fcntl.flock(h100, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(rtx, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(duplicate, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def test_counts_a_previous_gpu_rental_in_the_whole_loops_daily_budget(self):
-        self.config['rental_scope'] = 'loop'
-        self.save()
-        with patch.object(rental, 'ROOT', self.root):
-            rental.job_path('previous').parent.mkdir(parents=True)
-            rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
-            with self.assertRaisesRegex(RuntimeError, 'not finished'):
-                rental.check_daily_budget(2000, gpu_config.get_profile('rtx5090'))
-
-    def test_serializes_both_gpus_when_the_user_selects_loop_scope(self):
-        self.config['rental_scope'] = 'loop'
-        self.save()
-        with patch.object(rental, 'ROOT', self.root):
-            first = rental.rental_lock(gpu_config.get_profile('h100'))
-            second = rental.rental_lock(gpu_config.get_profile('rtx5090'))
-            first.parent.mkdir(parents=True)
-            with first.open('a') as h100, second.open('a') as rtx:
-                fcntl.flock(h100, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(rtx, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def test_rents_only_the_configured_active_gpu_in_loop_scope(self):
-        self.config.update(rental_scope='loop', active_gpu='rtx5090')
-        self.save()
-        rental.check_gpu_selection(gpu_config.get_profile('rtx5090'))
-        with patch.dict(gpu_config.os.environ, {'AUTORESEARCH_GPU': 'h100'}):
-            with self.assertRaisesRegex(RuntimeError, 'selected in gpus.json'):
-                rental.check_gpu_selection(gpu_config.get_profile('h100'))
-
-    def test_counts_the_other_gpus_live_instance_and_recent_contract_in_loop_scope(self):
-        self.config.update(rental_scope='loop', active_gpu='rtx5090')
-        self.save()
-        previous = dict(id=42, label='autoresearch-h100-previous', start_date=99000)
-        with patch.object(rental, 'list_instances', return_value=[previous]):
-            self.assertEqual(rental.recent_rentals(100000), [previous])
-        with patch.object(rental, 'list_instances', return_value=[]):
-            with patch.object(rental, 'api', side_effect=[{'invoices':[{'instance_id':42}]},
-                                                        {'contracts':[previous]}]):
-                self.assertEqual(rental.recent_rentals(100000), [previous])
-
-    def test_selects_only_the_users_active_gpu_from_offers(self):
-        self.config['active_gpu'] = 'rtx5090'
-        self.save()
-        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607,
-                    verification='verified')
-        offers = [dict(base, id=1, dph_total=0.7), dict(base, id=2, dph_total=0.5),
-                  dict(base, id=3, gpu_name='H100 SXM', dph_total=0.1)]
-        with patch.object(gpu_config, 'CONFIG_PATH', self.path):
-            with patch.object(rental, 'api', return_value={'offers': offers}) as api:
-                self.assertEqual(rental.choose_offer()['id'], 2)
-        self.assertEqual(api.call_args.args[2]['gpu_name'], {'eq': 'RTX 5090'})
-
-    def test_selects_a_different_machine_after_recorded_startup_failures(self):
-        self.config['active_gpu'] = 'rtx5090'
-        self.save()
-        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607,
-                    verification='verified')
-        offers = [dict(base, id=1, machine_id=10, dph_total=.4),
-                  dict(base, id=2, machine_id=10, dph_total=.45),
-                  dict(base, id=3, machine_id=20, dph_total=.5),
-                  dict(base, id=4, machine_id=30, dph_total=.6)]
-        with patch.object(rental, 'ROOT', self.root), patch.object(gpu_config, 'CONFIG_PATH', self.path):
-            rental.job_path('rtx-failed').parent.mkdir(parents=True)
-            rental.save(dict(id='rtx-failed', gpu_id='rtx5090', error_type='SSHUnavailable',
-                             creation_requested_at=1000, offer_id=1, provider_machine_id=10))
-            rental.job_path('h100-failed').parent.mkdir(parents=True)
-            rental.save(dict(id='h100-failed', gpu_id='h100', error_type='SSHUnavailable',
-                             creation_requested_at=1000, provider_machine_id=20))
-            with patch.object(rental.time, 'time', return_value=1000 + 30 * 86400):
-                with patch.object(rental, 'api', return_value={'offers': offers}):
-                    self.assertEqual(rental.choose_offer()['id'], 4)
 
     def test_exports_the_selected_model_source_when_launched_through_the_dispatcher(self):
         import torch
