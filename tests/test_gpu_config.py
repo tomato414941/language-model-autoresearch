@@ -165,14 +165,15 @@ class GPUConfigurationTests(unittest.TestCase):
                 self.assertEqual(rental.choose_offer()['id'], 2)
         self.assertEqual(api.call_args.args[2]['gpu_name'], {'eq': 'RTX 5090'})
 
-    def test_selects_an_available_machine_after_an_ssh_startup_failure_on_the_same_gpu(self):
+    def test_selects_a_different_machine_after_recorded_startup_failures(self):
         self.config['active_gpu'] = 'rtx5090'
         self.save()
         base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607,
                     verification='verified')
         offers = [dict(base, id=1, machine_id=10, dph_total=.4),
                   dict(base, id=2, machine_id=10, dph_total=.45),
-                  dict(base, id=3, machine_id=20, dph_total=.5)]
+                  dict(base, id=3, machine_id=20, dph_total=.5),
+                  dict(base, id=4, machine_id=30, dph_total=.6)]
         with patch.object(rental, 'ROOT', self.root), patch.object(gpu_config, 'CONFIG_PATH', self.path):
             rental.job_path('rtx-failed').parent.mkdir(parents=True)
             rental.save(dict(id='rtx-failed', gpu_id='rtx5090', error_type='SSHUnavailable',
@@ -180,9 +181,9 @@ class GPUConfigurationTests(unittest.TestCase):
             rental.job_path('h100-failed').parent.mkdir(parents=True)
             rental.save(dict(id='h100-failed', gpu_id='h100', error_type='SSHUnavailable',
                              creation_requested_at=1000, provider_machine_id=20))
-            with patch.object(rental.time, 'time', return_value=2000):
+            with patch.object(rental.time, 'time', return_value=1000 + 30 * 86400):
                 with patch.object(rental, 'api', return_value={'offers': offers}):
-                    self.assertEqual(rental.choose_offer()['id'], 3)
+                    self.assertEqual(rental.choose_offer()['id'], 4)
 
     def test_exports_the_selected_model_source_when_launched_through_the_dispatcher(self):
         import torch

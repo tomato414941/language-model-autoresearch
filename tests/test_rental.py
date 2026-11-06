@@ -316,7 +316,7 @@ class RentalLifecycleTests(unittest.TestCase):
             self.assertEqual(rental.choose_offer()['id'], 4)
         self.assertEqual(api.call_args.args[2]['verified'], {'eq': True})
 
-    def test_reuses_recent_shared_machine_failures_for_the_requested_gpu(self):
+    def test_keeps_recorded_physical_machine_failures_out_of_future_rentals(self):
         profile = rental.get_profile('rtx5090')
         base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
                     gpu_ram=32000, verification='verified')
@@ -328,8 +328,8 @@ class RentalLifecycleTests(unittest.TestCase):
         recent = dict(gpu_id='rtx5090', machine_id=10, reported_at=1000000 - 60)
         for second, expected in (
                 (dict(recent, machine_id=20), 3),
-                (dict(recent, machine_id=20, gpu_id='h100'), 2),
-                (dict(recent, machine_id=20, reported_at=1000000 - 8 * 86400), 2)):
+                (dict(recent, machine_id=20, gpu_id='h100'), 3),
+                (dict(recent, machine_id=20, reported_at=1000000 - 8 * 86400), 3)):
             with self.subTest(second=second):
                 path.write_text(json.dumps([recent, second]))
                 with patch.object(rental.time, 'time', return_value=1000000), \
@@ -337,6 +337,75 @@ class RentalLifecycleTests(unittest.TestCase):
                     self.assertEqual(rental.choose_offer(profile)['id'], expected)
                 excluded = api.call_args.args[2]['machine_id']['notin']
                 self.assertIn(10, excluded)
+
+    def test_selects_the_machine_after_a_code_failure_but_not_a_confirmed_machine_failure(self):
+        base = dict(gpu_name='H100 SXM', num_gpus=1, cuda_max_good=12.8,
+                    gpu_ram=81559, verification='verified')
+        offers = [dict(base, id=1, machine_id=10, dph_total=1),
+                  dict(base, id=2, machine_id=20, dph_total=2)]
+        for identifier, machine, kind in (('machine-failure', 10, 'machine'), ('code-failure', 20, 'code')):
+            rental.job_path(identifier).parent.mkdir()
+            rental.save(dict(id=identifier, gpu_id='h100', creation_requested_at=1000,
+                             provider_machine_id=machine, failure_kind=kind, error_type='RuntimeError'))
+        with patch.object(rental, 'api', return_value={'offers': offers}):
+            self.assertEqual(rental.choose_offer()['id'], 2)
+
+    def test_classifies_a_confirmed_startup_failure_and_preserves_unobserved_provider_failures(self):
+        _, manifest, base_job = self.rtx_runtime()
+        source_directory = rental.job_path('fixture').parent
+        manifest['container_image'] = 'fixture-image'
+        (source_directory / 'runtime.json').write_text(json.dumps(manifest))
+        offer = dict(id=7, machine_id=70, gpu_name='RTX 5090', dph_total=0.5)
+        for seen, expected in ((True, 'machine'), (False, 'unknown')):
+            with self.subTest(instance_seen=seen):
+                identifier = 'startup-' + expected
+                directory = rental.job_path(identifier).parent
+                directory.mkdir()
+                for name in ('runtime.json', 'source.tar.gz'):
+                    (directory / name).write_bytes((source_directory / name).read_bytes())
+                job = dict(base_job, id=identifier, label='autoresearch-rtx5090-' + identifier,
+                           phase='prepared', instance_id=None, max_hourly_cost=1,
+                           source_archive_sha256=rental.digest(directory / 'source.tar.gz'),
+                           runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
+                rental.save(job)
+                clock = [1000]
+                instances = Mock(return_value=[dict(id=42, actual_status='loading')]) if seen else Mock(
+                    side_effect=TimeoutError('provider query unavailable'))
+                with patch.object(rental, 'check_daily_budget'), \
+                        patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
+                        patch.object(rental, 'choose_offer', return_value=offer), \
+                        patch.object(rental, 'arm_expiry'), \
+                        patch.object(rental, 'api', return_value={'success': True, 'new_contract': 42}), \
+                        patch.object(rental, 'list_instances', instances), \
+                        patch.object(rental.time, 'time', side_effect=lambda: clock[0]), \
+                        patch.object(rental.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, 2000)), \
+                        patch.object(rental, 'finalize') as finalize, \
+                        patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
+                    with self.assertRaisesRegex(TimeoutError, 'did not become ready'):
+                        rental.start(job)
+                stored = rental.load(identifier)
+                self.assertEqual(stored['failure_kind'], expected)
+                self.assertEqual(stored['provider_machine_id'], 70)
+                self.assertEqual(stored['phase'], 'failed')
+                finalize.assert_called_once()
+
+    def test_records_machine_failures_when_the_gpu_preflight_fails(self):
+        for response in (subprocess.CompletedProcess([], 0, stdout='NVIDIA H200, 0\n'),
+                         subprocess.CalledProcessError(1, ['nvidia-smi'])):
+            with self.subTest(response=response):
+                job = dict(self.job, failure_kind='unknown')
+                rental.save(job)
+
+                def command(*args, **kwargs):
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+                with patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                        patch.object(rental, 'run', side_effect=command):
+                    with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                        rental.execute(job, {}, self.root / 'key')
+                self.assertEqual(rental.load('fixture')['failure_kind'], 'machine')
 
     def test_selects_a_lower_total_cost_for_the_prepared_deployment(self):
         profile = rental.get_profile('rtx5090')
@@ -474,7 +543,7 @@ class RentalLifecycleTests(unittest.TestCase):
         job = {**self.job, 'phase': 'prepared', 'source_archive_sha256': rental.digest(source),
                'runtime_manifest_sha256': rental.digest(runtime), 'max_hourly_cost': 5.0}
         rental.save(job)
-        offer = dict(id=7, gpu_name='H100 SXM', dph_total=4.0)
+        offer = dict(id=7, machine_id=70, gpu_name='H100 SXM', dph_total=4.0)
         instance = dict(id=42, actual_status='running', ssh_host='fixture')
         with patch.object(rental, 'check_daily_budget'), \
                 patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
@@ -490,6 +559,7 @@ class RentalLifecycleTests(unittest.TestCase):
             rental.start(job)
         request = api.call_args_list[0]
         self.assertEqual(request.args[2]['image'], 'fixture-image')
+        self.assertEqual(rental.load('fixture')['provider_machine_id'], 70)
         self.assertEqual(choose.call_args.kwargs['download_bytes'],
                          source.stat().st_size + sum((artifacts / name).stat().st_size
                                                      for name in rental.deployment_names(manifest)))

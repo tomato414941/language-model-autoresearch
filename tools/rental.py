@@ -399,20 +399,17 @@ def choose_offer(profile=None, *, download_bytes=0, settings=None):
     profile = active_gpu() if profile is None else profile
     values = profile.values
     unavailable_machines, unavailable_offers = set(), set()
-    now = time.time()
     failures_path = ROOT / 'results/operations/machine-failures.json'
     if failures_path.is_file():
         for failure in json.loads(failures_path.read_text()):
-            reported = failure.get('reported_at')
-            if (failure.get('gpu_id') == profile.identifier and reported is not None
-                    and 0 <= now - reported < 7 * 86400 and failure.get('machine_id') is not None):
+            if failure.get('machine_id') is not None:
                 unavailable_machines.add(failure['machine_id'])
     for path in (ROOT / 'queue').glob('*/job.json'):
         previous = json.loads(path.read_text())
         requested = previous.get('creation_requested_at')
-        if (previous.get('error_type') == 'SSHUnavailable'
-                and requested is not None and now - requested < 7 * 86400
-                and profile_for_job(previous).identifier == profile.identifier):
+        if (requested is not None and not previous.get('creation_rejected')
+                and (previous.get('failure_kind') == 'machine'
+                     or previous.get('error_type') == 'SSHUnavailable')):
             if previous.get('provider_machine_id') is not None:
                 unavailable_machines.add(previous['provider_machine_id'])
             if previous.get('offer_id') is not None:
@@ -568,14 +565,21 @@ def execute(job, instance, key):
             raise TimeoutError('The rental budget is exhausted.')
         return run(connection + [command], timeout=min(timeout, remaining), **kwargs)
 
-    gpu = remote('nvidia-smi --query-gpu=name,memory.used --format=csv,noheader,nounits',
-                 capture_output=True, text=True).stdout.strip().splitlines()
+    try:
+        gpu = remote('nvidia-smi --query-gpu=name,memory.used --format=csv,noheader,nounits',
+                     capture_output=True, text=True).stdout.strip().splitlines()
+    except subprocess.CalledProcessError:
+        job['failure_kind'] = 'machine'
+        save(job)
+        raise
     job['initial_gpu_observation'] = gpu
     save(job)
     profile = profile_for_job(job)
     pattern = profile.values.get('device_name_pattern', re.escape(profile.gpu_name))
     if (len(gpu) != 1 or not re.search(pattern, gpu[0])
             or float(gpu[0].rsplit(',', 1)[1]) > 512):
+        job['failure_kind'] = 'machine'
+        save(job)
         raise RuntimeError(f'The rental does not provide one idle {profile.gpu_name}.')
     remote('mkdir -p autoresearch')
     job['transfer_started_at'] = time.time()
@@ -697,6 +701,8 @@ def execute(job, instance, key):
     record_preparation_timing(remote, destination)
     job['exit_code'] = status
     job['phase'] = 'evaluated' if status == 0 else 'failed'
+    if status != 0:
+        job.setdefault('failure_kind', 'unknown')
     job['collected_at'] = time.time()
     save(job)
 
@@ -734,6 +740,7 @@ def start(job):
         check_daily_budget(time.time(), profile)
         job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
                    phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
+                   provider_machine_id=offer.get('machine_id'),
                    hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'),
                    host_verification=offer.get('verification'),
                    offer_transfer_costs=dict(deployment_bytes=download_bytes,
@@ -761,6 +768,7 @@ def start(job):
                 api('POST', f"instances/{job['instance_id']}/ssh/", {'ssh_key': public})
             except (urllib.error.URLError, TimeoutError):
                 print('SSH-key acknowledgement unavailable; observing access to the same instance.', flush=True)
+            instance_seen = False
             while time.time() < job['expires_at'] - required_seconds:
                 try:
                     instance = next((row for row in list_instances() if row['id'] == job['instance_id']), None)
@@ -768,6 +776,8 @@ def start(job):
                     print('Readiness observation failed; retaining the same instance:', type(error).__name__, flush=True)
                     time.sleep(15)
                     continue
+                if instance is not None:
+                    instance_seen = True
                 if instance and instance.get('actual_status') == 'running' and instance.get('ssh_host'):
                     try:
                         run(ssh_connection(instance, key) + ['true'], timeout=15,
@@ -781,12 +791,14 @@ def start(job):
                     break
                 time.sleep(15)
             else:
+                job['failure_kind'] = 'machine' if instance_seen else 'unknown'
                 raise TimeoutError('The rental did not become ready in time for training and BPB evaluation.')
     except BaseException as error:
         if isinstance(error, urllib.error.HTTPError) and error.code in (400, 401, 402, 403, 404, 409, 410, 422, 429):
             if not job.get('instance_id'):
                 job.update(creation_uncertain=False, creation_rejected=True)
         job.update(phase='failed', error_type=type(error).__name__)
+        job.setdefault('failure_kind', 'unknown')
         save(job)
         raise
     finally:
