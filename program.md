@@ -8,8 +8,8 @@ To set up a new experiment, work with the user to:
 
 1. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `prepare.py` — the fixed frame (allowed data, time budget, evaluation) and a default tokenizer and dataloader. Do not modify.
-   - `train.py` in your GPU's folder — the file you modify. Model architecture, optimizer, training loop.
-2. **Rent the GPU**: experiments run on one rented GPU, yours, never on the machine you run on (see the rules at the end).
+   - `train.py` in the active GPU's folder — the file you modify. Model architecture, optimizer, training loop.
+2. **Rent the GPU**: experiments run on one rented GPU, the active one, never on the machine you run on (see the rules at the end).
 3. **Prepare the data**: run `uv run prepare.py` to download the data and train the tokenizer.
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 5. **Confirm and go**: Confirm setup looks good.
@@ -21,7 +21,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget**, set per GPU (wall clock training time, excluding startup/compilation; 30 minutes on the H100 and 1 hour on the RTX 5090): one run in each daily rental. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
-- Modify your GPU's `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
+- Modify the active GPU's `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
 - Prepare anything beforehand that needs only the CPU, from the allowed data. Its code may live in files of its own, and it does not count toward the training budget.
 
 **What you CANNOT do:**
@@ -76,7 +76,7 @@ grep "^qa_bpb:\|^math_bpb:\|^code_bpb:\|^val_bpb:" run.log
 
 ## Logging results
 
-When an experiment is done, log it to your GPU's `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+When an experiment is done, log it to the active GPU's `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
 The TSV has a header row and 8 columns:
 
@@ -115,7 +115,7 @@ LOOP FOREVER:
 6. If the grep output is empty, the run crashed. Record the attempt as failed and inspect `tail -n 50 run.log`. A technical fix can be prepared for a later run under the daily limit.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
 8. If the candidate improves on the evaluations both share (see the goal above), you "advance" the branch, keeping the git commit
-9. Otherwise, you restore your GPU's folder to where you started
+9. Otherwise, you restore the active GPU's folder to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
@@ -127,9 +127,9 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 ## Rules of this repository
 
-- **GPUs.** The loop has two GPUs, one H100 SXM and one RTX 5090. Each GPU has its own agent, assigned by the user, that runs its own loop; the two may rent at the same time. Each GPU has its own folder with its own `train.py`, current best and results, and an agent edits only its own GPU's folder. The two models are separate and need not run on the other GPU. Compare a candidate only with the current best of its own GPU; an idea found on one GPU may be tried on the other. Keep each GPU's settings (training time, rental length, price cap) in one place. On the H100 the training is 30 minutes in a rental of at most 1 hour; on the RTX 5090 it is 1 hour in a rental of at most 1 hour 45 minutes. A GPU's first run measures its baseline. The user approved restructuring the repository and `prepare.py` for this.
-- **Rentals.** Rent your GPU at most once a day and for at most its rental length, counting only your GPU's rentals in this loop (other rentals on the same account do not count): the setup, the day's training and its eval must fit in it. Delete it right after.
+- **GPUs.** The loop has two GPUs, one H100 SXM and one RTX 5090, and runs on one of them at a time; the user chooses which. Each GPU has its own folder with its own `train.py`, current best and results. The two models are separate and need not run on the other GPU. Compare a candidate only with the current best of its own GPU; an idea found on one GPU may be tried on the other. Keep each GPU's settings (training time, rental length, price cap) in one place, so that switching changes only which GPU is active. On the H100 the training is 30 minutes in a rental of at most 1 hour; on the RTX 5090 it is 1 hour in a rental of at most 1 hour 45 minutes. A GPU's first run measures its baseline. The user approved restructuring the repository and `prepare.py` for this.
+- **Rentals.** Rent the active GPU at most once a day and for at most its rental length, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's training and its eval must fit in it. Delete it right after.
 - **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental, even if it takes more than a day.
 - **CPU work.** Run work that needs no GPU on the processing server in your environment notes, never on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
 - **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Take the tasks from AI2's `olmes` at a pinned revision, with every task, example, prompt and score formula unchanged; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. How the scores are computed is free, and measurements that the three scores do not use may be skipped. The user approved adding `olmes` as a dependency and implementing in `prepare.py` the suites, how they are computed and the data downloads. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick.
-- The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPUs and their agents, the time budgets and the rentals.
+- The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPUs and which one is active, the time budgets and the rentals.
