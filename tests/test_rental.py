@@ -1,13 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import tarfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
 
 from tools import rental
+from gpu_config import read_config
 
 
 class RentalLifecycleTests(unittest.TestCase):
@@ -18,6 +21,12 @@ class RentalLifecycleTests(unittest.TestCase):
         self.hold_patch.start()
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
+        config = read_config()
+        config.update(active_gpu='h100', rental_scope='gpu')
+        self.config_path = self.root / 'fixture-gpus.json'
+        self.config_path.write_text(json.dumps(config))
+        self.config_patch = patch('gpu_config.CONFIG_PATH', self.config_path)
+        self.config_patch.start()
         self.root_patch = patch.object(rental, 'ROOT', self.root)
         self.root_patch.start()
         self.transfer_patch = patch.object(rental, 'stream_archive', return_value={'fixture': 'transfer'})
@@ -35,6 +44,7 @@ class RentalLifecycleTests(unittest.TestCase):
         self.root_patch.stop()
         self.directory.cleanup()
         self.hold_patch.stop()
+        self.config_patch.stop()
 
     def test_honors_the_users_rental_hold_before_requesting_a_machine(self):
         job = {**self.job, 'phase': 'prepared'}
@@ -346,6 +356,57 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(request.args[2]['image'], 'fixture-image')
         execute.assert_called_once()
         finalize.assert_called_once()
+
+    def test_reserves_one_creation_when_concurrent_controllers_switch_to_loop_scope(self):
+        artifacts = self.root / 'artifacts'
+        artifacts.mkdir()
+        manifest = dict(container_image='fixture-image')
+        for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'), ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
+            (artifacts / name).write_bytes(b'fixture archive')
+            manifest[field] = rental.digest(artifacts / name)
+        jobs = []
+        for identifier in ('first-request', 'second-request'):
+            directory = rental.job_path(identifier).parent
+            directory.mkdir()
+            (directory / 'source.tar.gz').write_bytes(b'fixture source')
+            (directory / 'runtime.json').write_text(json.dumps(manifest))
+            job = dict(self.job, id=identifier, phase='prepared', instance_id=None,
+                       label='autoresearch-' + identifier, max_hourly_cost=5,
+                       source_archive_sha256=rental.digest(directory / 'source.tar.gz'),
+                       runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
+            rental.save(job)
+            jobs.append(job)
+        barrier = threading.Barrier(2)
+
+        def choose(profile):
+            if barrier.wait(timeout=5) == 0:
+                config = read_config()
+                config['rental_scope'] = 'loop'
+                self.config_path.write_text(json.dumps(config))
+            barrier.wait(timeout=5)
+            return dict(id=7, gpu_name='H100 SXM', dph_total=4)
+
+        with patch.object(rental, 'recent_rentals', return_value=[]), \
+                patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
+                patch.object(rental, 'choose_offer', side_effect=choose), \
+                patch.object(rental, 'arm_expiry'), \
+                patch.object(rental, 'api', return_value={'success':True, 'new_contract':42}) as api, \
+                patch.object(rental, 'list_instances', return_value=[dict(id=42, actual_status='running', ssh_host='fixture')]), \
+                patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run'), patch.object(rental, 'execute'), patch.object(rental, 'finalize'), \
+                patch.dict(rental.os.environ, {'VAST_SSH_KEY':'fixture-private-key'}):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(rental.start, job) for job in jobs]
+                outcomes = []
+                for future in futures:
+                    try:
+                        future.result(timeout=10)
+                        outcomes.append('created')
+                    except RuntimeError as error:
+                        self.assertIn('last 24 hours', str(error))
+                        outcomes.append('daily limit')
+        self.assertCountEqual(outcomes, ['created', 'daily limit'])
+        self.assertEqual(sum(call.args[0] == 'PUT' for call in api.call_args_list), 1)
 
     def test_ends_setup_when_transfer_uses_the_time_needed_for_the_full_evaluation(self):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):

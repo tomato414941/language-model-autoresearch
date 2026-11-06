@@ -118,8 +118,14 @@ def label_gpu(label):
 def recent_rentals(now, profile=None):
     """Check live instances and actual contract start times in recent billing history."""
     profile = active_gpu() if profile is None else profile
+    whole_loop = read_config().get('rental_scope', 'loop') == 'loop'
+
+    def belongs(row):
+        identifier = label_gpu(row.get('label', ''))
+        return identifier is not None and (whole_loop or identifier == profile.identifier)
+
     rows = list_instances(timeout=10)
-    owned = [row for row in rows if label_gpu(row.get('label', '')) == profile.identifier]
+    owned = [row for row in rows if belongs(row)]
     if owned:
         return owned
     invoices = api('GET', 'users/me/invoices', params={
@@ -129,20 +135,22 @@ def recent_rentals(now, profile=None):
     if identifiers:
         contracts = api('POST', 'contracts/fetch/', {'contract_ids': identifiers})
         rows.extend(contracts['contracts'])
-    return [row for row in rows if label_gpu(row.get('label', '')) == profile.identifier
+    return [row for row in rows if belongs(row)
             and now - float(row['start_date']) < 86400]
 
 
 def check_daily_budget(now, profile=None):
     profile = active_gpu() if profile is None else profile
+    whole_loop = read_config().get('rental_scope', 'loop') == 'loop'
+    scope = 'loop' if whole_loop else profile.identifier
     for path in (ROOT / 'queue').glob('*/job.json'):
         previous = json.loads(path.read_text())
         requested = previous.get('creation_requested_at')
         if (requested is not None and not previous.get('creation_rejected') and now - requested < 86400
-                and profile_for_job(previous).identifier == profile.identifier):
-            raise RuntimeError(f'A {profile.identifier} rental was already requested within the last 24 hours.')
+                and (whole_loop or profile_for_job(previous).identifier == profile.identifier)):
+            raise RuntimeError(f'A {scope} rental was already requested within the last 24 hours.')
     if recent_rentals(now, profile):
-        raise RuntimeError(f'The previous {profile.identifier} rental is less than 24 hours old or still active.')
+        raise RuntimeError(f'The previous {scope} rental is less than 24 hours old or still active.')
 
 
 def timer_unit(job, action):
@@ -150,7 +158,14 @@ def timer_unit(job, action):
 
 
 def rental_lock(profile):
-    return ROOT / 'results/operations' / ('rental-' + profile.identifier + '.lock')
+    scope = 'loop' if read_config().get('rental_scope', 'loop') == 'loop' else profile.identifier
+    return ROOT / 'results/operations' / ('rental-' + scope + '.lock')
+
+
+def check_gpu_selection(profile):
+    if (read_config().get('rental_scope', 'loop') == 'loop'
+            and profile.identifier != get_profile().identifier):
+        raise RuntimeError('Only the GPU selected in gpus.json may be rented in loop scope.')
 
 
 def arm_expiry(job):
@@ -539,6 +554,7 @@ def start(job):
         raise RuntimeError(f'{profile.identifier} rentals are on hold by user request.')
     if job['phase'] != 'prepared':
         raise RuntimeError('This job already has a creation attempt; observe or expire it instead.')
+    check_gpu_selection(profile)
     runtime_path = job_path(job['id']).parent / 'runtime.json'
     if digest(runtime_path) != job['runtime_manifest_sha256']:
         raise RuntimeError('The prepared runtime manifest changed.')
@@ -554,13 +570,20 @@ def start(job):
     offer = choose_offer(profile)
     if offer['dph_total'] > job['max_hourly_cost']:
         raise RuntimeError('The current offer exceeds the prepared GPU cost limit.')
-    job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
-               phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
-               hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'))
-    save(job)
-    arm_expiry(job)
-    job.update(phase='creation_requested', creation_uncertain=True, creation_requested_at=time.time())
-    save(job)
+    reservation = ROOT / 'results/operations/rental-reservation.lock'
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    with reservation.open('a') as lock:
+        # Serialize only quota reservation, so changing scope cannot race a second creation.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        check_gpu_selection(profile)
+        check_daily_budget(time.time(), profile)
+        job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
+                   phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
+                   hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'))
+        save(job)
+        arm_expiry(job)
+        job.update(phase='creation_requested', creation_uncertain=True, creation_requested_at=time.time())
+        save(job)
     try:
         response = api('PUT', f"asks/{offer['id']}/", {
             'client_id': 'me', 'image': manifest['container_image'], 'disk': profile.values['disk_gb'],

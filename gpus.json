@@ -1,5 +1,6 @@
 {
   "active_gpu": "rtx5090",
+  "rental_scope": "loop",
   "gpus": {
     "h100": {
       "gpu_name": "H100 SXM",

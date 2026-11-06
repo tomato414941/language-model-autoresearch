@@ -20,9 +20,14 @@ class GPUConfigurationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.config = copy.deepcopy(gpu_config.read_config())
+        self.config['rental_scope'] = 'gpu'
         self.path = self.root / 'gpus.json'
+        self.save()
+        self.config_patch = patch.object(gpu_config, 'CONFIG_PATH', self.path)
+        self.config_patch.start()
 
     def tearDown(self):
+        self.config_patch.stop()
         self.temporary.cleanup()
         self.environment.stop()
 
@@ -96,6 +101,46 @@ class GPUConfigurationTests(unittest.TestCase):
                 fcntl.flock(rtx, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(duplicate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_counts_a_previous_gpu_rental_in_the_whole_loops_daily_budget(self):
+        self.config['rental_scope'] = 'loop'
+        self.save()
+        with patch.object(rental, 'ROOT', self.root):
+            rental.job_path('previous').parent.mkdir(parents=True)
+            rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
+            with self.assertRaisesRegex(RuntimeError, 'loop.*last 24 hours'):
+                rental.check_daily_budget(2000, gpu_config.get_profile('rtx5090'))
+
+    def test_serializes_both_gpus_when_the_user_selects_loop_scope(self):
+        self.config['rental_scope'] = 'loop'
+        self.save()
+        with patch.object(rental, 'ROOT', self.root):
+            first = rental.rental_lock(gpu_config.get_profile('h100'))
+            second = rental.rental_lock(gpu_config.get_profile('rtx5090'))
+            first.parent.mkdir(parents=True)
+            with first.open('a') as h100, second.open('a') as rtx:
+                fcntl.flock(h100, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(rtx, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_rents_only_the_configured_active_gpu_in_loop_scope(self):
+        self.config.update(rental_scope='loop', active_gpu='rtx5090')
+        self.save()
+        rental.check_gpu_selection(gpu_config.get_profile('rtx5090'))
+        with patch.dict(gpu_config.os.environ, {'AUTORESEARCH_GPU': 'h100'}):
+            with self.assertRaisesRegex(RuntimeError, 'selected in gpus.json'):
+                rental.check_gpu_selection(gpu_config.get_profile('h100'))
+
+    def test_counts_the_other_gpus_live_instance_and_recent_contract_in_loop_scope(self):
+        self.config.update(rental_scope='loop', active_gpu='rtx5090')
+        self.save()
+        previous = dict(id=42, label='autoresearch-h100-previous', start_date=99000)
+        with patch.object(rental, 'list_instances', return_value=[previous]):
+            self.assertEqual(rental.recent_rentals(100000), [previous])
+        with patch.object(rental, 'list_instances', return_value=[]):
+            with patch.object(rental, 'api', side_effect=[{'invoices':[{'instance_id':42}]},
+                                                        {'contracts':[previous]}]):
+                self.assertEqual(rental.recent_rentals(100000), [previous])
 
     def test_selects_only_the_users_active_gpu_from_offers(self):
         self.config['active_gpu'] = 'rtx5090'

@@ -60,6 +60,8 @@ class GPUProfile:
 
 def read_config(path=None):
     data = json.loads(Path(path if path is not None else CONFIG_PATH).read_text())
+    if data.get("rental_scope", "loop") not in ("loop", "gpu"):
+        raise ValueError("rental_scope must be loop or gpu.")
     profiles = data.get("gpus")
     if not isinstance(profiles, dict) or data.get("active_gpu") not in profiles:
         raise ValueError("gpus.json must select exactly one configured active_gpu.")
