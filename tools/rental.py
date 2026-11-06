@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.vast_control import api, list_instances
 from gpu_config import active_gpu, get_profile, profile_for_job, read_config, source_files
-from tools.runtime_archives import archive_specs, deployment_names, UNPACK_XZ
+from tools.runtime_archives import archive_specs, deployment_names, encoding_cache_asset_path, UNPACK_XZ
 from tools.parallel_ssh import stream_archive
 
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
@@ -484,7 +484,13 @@ def execute(job, instance, key):
     job['launch_requested_at'] = time.time()
     save(job)
     try:
-        remote('cd autoresearch && export AUTORESEARCH_GPU=' + shlex.quote(profile.identifier)
+        environment = {'AUTORESEARCH_GPU': profile.identifier}
+        if manifest.get('encoding_cache'):
+            path = manifest['encoding_cache']['asset_path']
+            if path != encoding_cache_asset_path(profile.identifier):
+                raise ValueError('The encoding cache must belong to the prepared GPU track.')
+            environment['OLMES_ENCODING_CACHE'] = path
+        remote('cd autoresearch && export ' + shlex.join(f'{name}={value}' for name, value in environment.items())
                + ' && if mkdir .started 2>/dev/null; then '
                'nohup bash gpu_run.sh > bootstrap.log 2>&1 < /dev/null & echo $! > run.pid; fi')
     except (subprocess.SubprocessError, OSError):

@@ -468,12 +468,17 @@ class RentalLifecycleTests(unittest.TestCase):
                         rental.execute(job, {}, self.root / 'key')
         self.assertEqual(launched, [])
 
-    def test_starts_training_once_when_one_observation_times_out(self):
+    def observe_one_launch(self, *, encoding_cache=False):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):
             path = self.root / 'artifacts' / name
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(b'archive fixture')
         (rental.job_path('fixture').parent / 'source.tar.gz').write_bytes(b'source fixture')
+        if encoding_cache:
+            manifest = dict(gpu_env_sha256=rental.digest(self.root / 'artifacts/gpu-env.tar.gz'),
+                            gpu_assets_sha256=rental.digest(self.root / 'artifacts/gpu-assets.tar.gz'),
+                            encoding_cache={'asset_path': rental.encoding_cache_asset_path('h100')})
+            (rental.job_path('fixture').parent / 'runtime.json').write_text(json.dumps(manifest))
         probes = iter([subprocess.TimeoutExpired('ssh', 10), 'running', 'exit 0'])
         launched = []
 
@@ -502,6 +507,14 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(rental.load('fixture')['exit_code'], 0)
         sample = json.loads((self.root / 'results/runs/fixture/gpu-observations.jsonl').read_text())
         self.assertEqual(sample['error_type'], 'TimeoutExpired')
+        return launched
+
+    def test_starts_training_once_when_one_observation_times_out(self):
+        self.observe_one_launch()
+
+    def test_launches_the_native_encoding_cache_from_the_jobs_frozen_runtime(self):
+        launched = self.observe_one_launch(encoding_cache=True)
+        self.assertIn('OLMES_ENCODING_CACHE=' + rental.encoding_cache_asset_path('h100'), launched[0])
 
     def test_deploys_a_verified_xz_runtime_with_its_separate_bootstrap_before_one_training_launch(self):
         self.deploy_xz_runtime('python-xz')

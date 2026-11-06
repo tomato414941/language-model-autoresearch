@@ -11,6 +11,10 @@ UNPACK_XZ = ('import sys,tarfile; '
              '.extractall(".",filter="fully_trusted")')
 
 
+def encoding_cache_asset_path(gpu_id):
+    return str(PurePosixPath('autoresearch', 'gpus', gpu_id, 'olmes', 'native-encodings.sqlite'))
+
+
 def deployment_names(manifest):
     transport = manifest.get('transport')
     if transport is None:
