@@ -25,6 +25,10 @@ class GPUConfigurationTests(unittest.TestCase):
         self.save()
         self.config_patch = patch.object(gpu_config, 'CONFIG_PATH', self.path)
         self.config_patch.start()
+        for default in (patch.object(rental, 'list_instances', return_value=[]),
+                        patch.object(rental.vast_backend, 'entries', return_value=[])):
+            default.start()
+            self.addCleanup(default.stop)
 
     def tearDown(self):
         self.config_patch.stop()
@@ -90,16 +94,16 @@ class GPUConfigurationTests(unittest.TestCase):
             self.assertEqual(gpu_config.active_gpu().identifier, 'rtx5090')
         self.assertEqual(self.path.read_bytes(), original)
 
-    def test_counts_each_gpus_recent_requests_in_its_own_daily_budget(self):
+    def test_counts_an_unfinished_request_before_renting_either_gpu(self):
         with patch.object(rental, 'ROOT', self.root):
             rental.job_path('previous').parent.mkdir(parents=True)
             rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
             self.config['active_gpu'] = 'rtx5090'
             self.save()
             with patch.object(gpu_config, 'CONFIG_PATH', self.path):
-                with patch.object(rental, 'recent_rentals', return_value=[]):
+                with self.assertRaisesRegex(RuntimeError, 'not finished'):
                     rental.check_daily_budget(2000)
-                with self.assertRaisesRegex(RuntimeError, 'last 24 hours'):
+                with self.assertRaisesRegex(RuntimeError, 'not finished'):
                     rental.check_daily_budget(2000, gpu_config.get_profile('h100'))
 
     def test_allows_both_gpus_to_hold_their_own_rental_lock(self):
@@ -119,7 +123,7 @@ class GPUConfigurationTests(unittest.TestCase):
         with patch.object(rental, 'ROOT', self.root):
             rental.job_path('previous').parent.mkdir(parents=True)
             rental.save(dict(id='previous', gpu_id='h100', creation_requested_at=1000))
-            with self.assertRaisesRegex(RuntimeError, 'loop.*last 24 hours'):
+            with self.assertRaisesRegex(RuntimeError, 'not finished'):
                 rental.check_daily_budget(2000, gpu_config.get_profile('rtx5090'))
 
     def test_serializes_both_gpus_when_the_user_selects_loop_scope(self):

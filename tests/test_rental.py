@@ -31,6 +31,12 @@ class RentalLifecycleTests(unittest.TestCase):
         self.config_patch.start()
         self.root_patch = patch.object(rental, 'ROOT', self.root)
         self.root_patch.start()
+        for default in (patch.object(rental, 'list_instances', return_value=[]),
+                        patch.object(rental.vast_backend, 'entries', return_value=[]),
+                        patch.object(rental.vast_backend, 'rent',
+                                     side_effect=AssertionError('Use a fixture for vendor rentals.'))):
+            default.start()
+            self.addCleanup(default.stop)
         self.transfer_patch = patch.object(rental, 'stream_archive', return_value={'fixture': 'transfer'})
         self.transfer = self.transfer_patch.start()
         self.collection_cases = 0
@@ -212,6 +218,22 @@ class RentalLifecycleTests(unittest.TestCase):
                     rental.delete_instances(self.job)
         self.assertNotIn('deleted_at', rental.load('fixture'))
 
+    def test_returns_a_checked_machine_through_the_shared_tool_and_confirms_its_absence(self):
+        job = dict(self.job, rental_backend='vast-rental')
+        observations = [[dict(id=42, label=job['label'])], []]
+        with patch.object(rental, 'list_instances', side_effect=observations), \
+                patch.object(rental.vast_backend, 'command') as command:
+            rental.delete_instances(job)
+        command.assert_called_once_with(['return', '42'], timeout=30)
+        self.assertIn('deleted_at', rental.load('fixture'))
+
+    def test_connects_through_the_checked_route_with_the_callers_key_file(self):
+        instance = dict(id=42, ssh_config='fixture.config', ssh_host='vast-42')
+        command = rental.ssh_connection(instance, Path('fixture-key'))
+        self.assertEqual(command, ['ssh', '-F', 'fixture.config', '-i', 'fixture-key',
+                                   '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+                                   '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', 'vast-42'])
+
     def test_keeps_observing_the_original_label_when_the_create_response_is_uncertain(self):
         job = {**self.job, 'instance_id': None, 'creation_uncertain': True}
         with patch.object(rental, 'list_instances', return_value=[]):
@@ -220,17 +242,56 @@ class RentalLifecycleTests(unittest.TestCase):
                     rental.delete_instances(job)
         api.assert_not_called()
 
-    def test_prevents_a_second_daily_request_using_the_durable_request_history(self):
+    def test_prevents_another_request_while_an_attempt_has_not_finished(self):
         rental.save(dict(id='fixture', creation_requested_at=1000))
-        with patch.object(rental, 'recent_rentals') as recent:
-            with self.assertRaises(RuntimeError):
-                rental.check_daily_budget(2000)
-        recent.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            rental.check_daily_budget(2000)
 
-    def test_prevents_a_new_request_when_the_provider_reports_a_recent_research_contract(self):
-        with patch.object(rental, 'recent_rentals', return_value=[{'id': 99}]):
+    def test_prevents_a_new_request_while_the_provider_reports_an_active_loop_gpu(self):
+        with patch.object(rental, 'list_instances', return_value=[{'id': 99, 'label': 'autoresearch-active'}]):
             with self.assertRaises(RuntimeError):
                 rental.check_daily_budget(2000)
+
+    def test_allows_the_approved_historical_six_cent_failure_to_be_retried(self):
+        rental.save(dict(id='fixture', phase='failed', creation_requested_at=1000,
+                         deleted_at=1493.253, hourly_cost=0.4116666666666667))
+        self.assertEqual(rental.check_daily_budget(2000), rental.Decimal('0.06'))
+
+    def test_applies_the_daily_failed_cost_limit_to_shared_ledger_amounts_once(self):
+        rental.save(dict(id='fixture', phase='failed', creation_requested_at=1000,
+                         deleted_at=1500, rental_backend='vast-rental'))
+        for amount, allowed in (('0.06', True), ('0.50', True), ('0.501', False)):
+            with self.subTest(amount=amount):
+                entries = [dict(id='rent', event='rented', instance=42, label=self.job['label'],
+                                at='1970-01-01T00:16:40+00:00'),
+                           dict(id='failed', event='unusable', instance=42),
+                           dict(id='back', event='returned', instance=42, dollars=amount)]
+                with patch.object(rental.vast_backend, 'entries', return_value=entries):
+                    if allowed:
+                        self.assertEqual(rental.check_daily_budget(2000), rental.Decimal(amount))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'more than'):
+                            rental.check_daily_budget(2000)
+
+    def test_keeps_a_completed_measured_run_as_the_only_valid_run_that_day(self):
+        rental.save(dict(id='fixture', phase='evaluated', exit_code=0,
+                         creation_requested_at=1000, deleted_at=1500))
+        with self.assertRaisesRegex(RuntimeError, 'measured run today'):
+            rental.check_daily_budget(2000)
+
+    def test_allows_the_next_utc_calendar_day_without_waiting_twenty_four_hours(self):
+        rental.save(dict(id='fixture', phase='evaluated', exit_code=0,
+                         creation_requested_at=86300, deleted_at=86400))
+        self.assertEqual(rental.check_daily_budget(86401), 0)
+
+    def test_ignores_the_cost_and_instances_of_other_projects(self):
+        entries = [dict(id='rent', event='rented', instance=99, label='another-project',
+                        at='1970-01-01T00:16:40+00:00'),
+                   dict(id='failed', event='unusable', instance=99),
+                   dict(id='back', event='returned', instance=99, dollars=10)]
+        with patch.object(rental.vast_backend, 'entries', return_value=entries), \
+                patch.object(rental, 'list_instances', return_value=[dict(id=99, label='another-project')]):
+            self.assertEqual(rental.check_daily_budget(2000), 0)
 
     def test_counts_an_owned_live_instance_even_when_its_contract_is_more_than_a_day_old(self):
         row = dict(id=42, label='autoresearch-h100-old', start_date=0, actual_status='running')
@@ -350,44 +411,35 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.object(rental, 'api', return_value={'offers': offers}):
             self.assertEqual(rental.choose_offer()['id'], 2)
 
-    def test_classifies_a_confirmed_startup_failure_and_preserves_unobserved_provider_failures(self):
-        _, manifest, base_job = self.rtx_runtime()
-        source_directory = rental.job_path('fixture').parent
+    def test_retries_vendor_rejected_machines_before_starting_the_single_run(self):
+        _, manifest, job = self.rtx_runtime()
+        directory = rental.job_path('fixture').parent
         manifest['container_image'] = 'fixture-image'
-        (source_directory / 'runtime.json').write_text(json.dumps(manifest))
-        offer = dict(id=7, machine_id=70, gpu_name='RTX 5090', dph_total=0.5)
-        for seen, expected in ((True, 'machine'), (False, 'unknown')):
-            with self.subTest(instance_seen=seen):
-                identifier = 'startup-' + expected
-                directory = rental.job_path(identifier).parent
-                directory.mkdir()
-                for name in ('runtime.json', 'source.tar.gz'):
-                    (directory / name).write_bytes((source_directory / name).read_bytes())
-                job = dict(base_job, id=identifier, label='autoresearch-rtx5090-' + identifier,
-                           phase='prepared', instance_id=None, max_hourly_cost=1,
-                           source_archive_sha256=rental.digest(directory / 'source.tar.gz'),
-                           runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
-                rental.save(job)
-                clock = [1000]
-                instances = Mock(return_value=[dict(id=42, actual_status='loading')]) if seen else Mock(
-                    side_effect=TimeoutError('provider query unavailable'))
-                with patch.object(rental, 'check_daily_budget'), \
-                        patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
-                        patch.object(rental, 'choose_offer', return_value=offer), \
-                        patch.object(rental, 'arm_expiry'), \
-                        patch.object(rental, 'api', return_value={'success': True, 'new_contract': 42}), \
-                        patch.object(rental, 'list_instances', instances), \
-                        patch.object(rental.time, 'time', side_effect=lambda: clock[0]), \
-                        patch.object(rental.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, 2000)), \
-                        patch.object(rental, 'finalize') as finalize, \
-                        patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
-                    with self.assertRaisesRegex(TimeoutError, 'did not become ready'):
-                        rental.start(job)
-                stored = rental.load(identifier)
-                self.assertEqual(stored['failure_kind'], expected)
-                self.assertEqual(stored['provider_machine_id'], 70)
-                self.assertEqual(stored['phase'], 'failed')
-                finalize.assert_called_once()
+        (directory / 'runtime.json').write_text(json.dumps(manifest))
+        job.update(phase='prepared', instance_id=None, max_hourly_cost=1,
+                   source_archive_sha256=rental.digest(directory / 'source.tar.gz'),
+                   runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
+        rental.save(job)
+        rejected = dict(rented=None, offers=2, failed=1)
+        accepted = dict(rented=42, machine=70, price=0.5,
+                        ssh_config='fixture.config', ssh_host='vast-42')
+        attempts = [dict(unusable=41, machine=71, stage='check'), rejected]
+        with patch.object(rental, 'check_daily_budget'), \
+                patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
+                patch.object(rental, 'arm_expiry'), \
+                patch.object(rental.vast_backend, 'rent', side_effect=[
+                    (rejected, attempts), (accepted, [accepted])]) as vendor, \
+                patch.object(rental, 'execute') as execute, \
+                patch.object(rental, 'finalize') as finalize, \
+                patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
+            rental.start(job)
+        stored = rental.load('fixture')
+        self.assertEqual(vendor.call_count, 2)
+        self.assertEqual(stored['selection_attempts'][0]['unusable'], 41)
+        self.assertEqual(stored['instance_id'], 42)
+        self.assertEqual(stored['provider_machine_id'], 70)
+        execute.assert_called_once()
+        finalize.assert_called_once()
 
     def test_records_machine_failures_when_the_gpu_preflight_fails(self):
         for response in (subprocess.CompletedProcess([], 0, stdout='NVIDIA H200, 0\n'),
@@ -543,32 +595,27 @@ class RentalLifecycleTests(unittest.TestCase):
         job = {**self.job, 'phase': 'prepared', 'source_archive_sha256': rental.digest(source),
                'runtime_manifest_sha256': rental.digest(runtime), 'max_hourly_cost': 5.0}
         rental.save(job)
-        offer = dict(id=7, machine_id=70, gpu_name='H100 SXM', dph_total=4.0)
-        instance = dict(id=42, actual_status='running', ssh_host='fixture')
+        accepted = dict(rented=42, machine=70, price=4.0,
+                        ssh_config='fixture.config', ssh_host='vast-42')
         with patch.object(rental, 'check_daily_budget'), \
                 patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
-                patch.object(rental, 'choose_offer', return_value=offer) as choose, \
+                patch.object(rental.vast_backend, 'rent', return_value=(accepted, [accepted])) as vendor, \
                 patch.object(rental, 'arm_expiry'), \
-                patch.object(rental, 'api', return_value={'success': True, 'new_contract': 42}) as api, \
-                patch.object(rental, 'list_instances', return_value=[instance]), \
                 patch.object(rental, 'ssh_connection', return_value=['ssh']), \
                 patch.object(rental, 'run'), \
                 patch.object(rental, 'execute') as execute, \
                 patch.object(rental, 'finalize') as finalize, \
                 patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
             rental.start(job)
-        request = api.call_args_list[0]
-        self.assertEqual(request.args[2]['image'], 'fixture-image')
+        self.assertEqual(vendor.call_args.args[1]['container_image'], 'fixture-image')
         self.assertEqual(rental.load('fixture')['provider_machine_id'], 70)
-        self.assertEqual(choose.call_args.kwargs['download_bytes'],
+        self.assertEqual(rental.load('fixture')['deployment_bytes'],
                          source.stat().st_size + sum((artifacts / name).stat().st_size
                                                      for name in rental.deployment_names(manifest)))
-        self.assertEqual(choose.call_args.kwargs['settings'],
-                         dict(rental_seconds=3600, max_hourly_cost=5.0))
         execute.assert_called_once()
         finalize.assert_called_once()
 
-    def test_reserves_one_creation_when_concurrent_controllers_switch_to_loop_scope(self):
+    def test_reserves_one_checked_rental_across_concurrent_controllers(self):
         artifacts = self.root / 'artifacts'
         artifacts.mkdir()
         manifest = dict(container_image='fixture-image')
@@ -587,22 +634,12 @@ class RentalLifecycleTests(unittest.TestCase):
                        runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
             rental.save(job)
             jobs.append(job)
-        barrier = threading.Barrier(2)
-
-        def choose(profile, **kwargs):
-            if barrier.wait(timeout=5) == 0:
-                config = read_config()
-                config['rental_scope'] = 'loop'
-                self.config_path.write_text(json.dumps(config))
-            barrier.wait(timeout=5)
-            return dict(id=7, gpu_name='H100 SXM', dph_total=4)
-
-        with patch.object(rental, 'recent_rentals', return_value=[]), \
+        accepted = dict(rented=42, machine=70, price=4.0,
+                        ssh_config='fixture.config', ssh_host='vast-42')
+        with patch.object(rental, 'list_instances', return_value=[]), \
                 patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
-                patch.object(rental, 'choose_offer', side_effect=choose), \
+                patch.object(rental.vast_backend, 'rent', return_value=(accepted, [accepted])) as vendor, \
                 patch.object(rental, 'arm_expiry'), \
-                patch.object(rental, 'api', return_value={'success':True, 'new_contract':42}) as api, \
-                patch.object(rental, 'list_instances', return_value=[dict(id=42, actual_status='running', ssh_host='fixture')]), \
                 patch.object(rental, 'ssh_connection', return_value=['ssh']), \
                 patch.object(rental, 'run'), patch.object(rental, 'execute'), patch.object(rental, 'finalize'), \
                 patch.dict(rental.os.environ, {'VAST_SSH_KEY':'fixture-private-key'}):
@@ -614,10 +651,10 @@ class RentalLifecycleTests(unittest.TestCase):
                         future.result(timeout=10)
                         outcomes.append('created')
                     except RuntimeError as error:
-                        self.assertIn('last 24 hours', str(error))
+                        self.assertIn('not finished', str(error))
                         outcomes.append('daily limit')
         self.assertCountEqual(outcomes, ['created', 'daily limit'])
-        self.assertEqual(sum(call.args[0] == 'PUT' for call in api.call_args_list), 1)
+        self.assertEqual(vendor.call_count, 1)
 
     def test_ends_setup_when_transfer_uses_the_time_needed_for_the_full_evaluation(self):
         for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):

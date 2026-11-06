@@ -4,6 +4,7 @@ import argparse
 import ast
 import csv
 import datetime as dt
+from decimal import Decimal, ROUND_CEILING
 import fcntl
 import hashlib
 import json
@@ -27,7 +28,7 @@ from tools.vast_control import api, list_instances
 from gpu_config import active_gpu, get_profile, profile_for_job, read_config, source_files
 from tools.runtime_archives import archive_specs, deployment_names, encoding_cache_asset_path, UNPACK_XZ
 from tools.parallel_ssh import stream_archive
-from tools import r2
+from tools import r2, vast_backend
 
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
     'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
@@ -41,6 +42,7 @@ EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estima
 COLLECTION_SECONDS = 45
 PROJECT_LABELS = ('autoresearch-',)
 BOOTSTRAP = 'gpu-bootstrap.tar.gz'
+FAILED_COST_LIMIT = Decimal('0.50')
 
 
 def digest(path):
@@ -176,18 +178,59 @@ def recent_rentals(now, profile=None):
             and now - float(row['start_date']) < 86400]
 
 
-def check_daily_budget(now, profile=None):
-    profile = active_gpu() if profile is None else profile
-    whole_loop = read_config().get('rental_scope', 'loop') == 'loop'
-    scope = 'loop' if whole_loop else profile.identifier
-    for path in (ROOT / 'queue').glob('*/job.json'):
-        previous = json.loads(path.read_text())
+def check_daily_budget(now, profile=None, ignore_job=None):
+    """Permit another attempt after failures within $0.50, but never a second valid daily run."""
+    if any(label_gpu(row.get('label', '')) is not None for row in list_instances(timeout=10)):
+        raise RuntimeError('A GPU belonging to this loop is still active.')
+    day = dt.datetime.fromtimestamp(now, dt.timezone.utc).date()
+    jobs = [json.loads(path.read_text()) for path in (ROOT / 'queue').glob('*/job.json')]
+    labels = {job.get('label') for job in jobs}
+    decisions = {}
+    for path in [ROOT / 'results/decisions.json', *ROOT.glob('gpus/*/results/decisions.json')]:
+        if path.is_file():
+            decisions.update({row['id']: row['status'] for row in json.loads(path.read_text())})
+    entries = vast_backend.entries()
+    rentals = {row['instance']: row for row in entries
+               if row.get('event') == 'rented' and row.get('label') in labels}
+    returned = {row['instance']: row for row in entries if row.get('event') == 'returned'}
+    unusable = {row['instance'] for row in entries if row.get('event') == 'unusable'}
+    failed_ids, total = set(), Decimal('0')
+    for previous in jobs:
         requested = previous.get('creation_requested_at')
-        if (requested is not None and not previous.get('creation_rejected') and now - requested < 86400
-                and (whole_loop or profile_for_job(previous).identifier == profile.identifier)):
-            raise RuntimeError(f'A {scope} rental was already requested within the last 24 hours.')
-    if recent_rentals(now, profile):
-        raise RuntimeError(f'The previous {scope} rental is less than 24 hours old or still active.')
+        if requested is None or previous.get('creation_rejected') or previous['id'] == ignore_job:
+            continue
+        if dt.datetime.fromtimestamp(requested, dt.timezone.utc).date() != day:
+            continue
+        status = decisions.get(previous['id'])
+        if status in ('keep', 'discard') or (previous.get('phase') == 'evaluated' and status != 'crash'):
+            raise RuntimeError('This loop already completed a measured run today.')
+        if (previous.get('phase') != 'failed' and status != 'crash') or not previous.get('deleted_at'):
+            raise RuntimeError('A previous attempt has not finished and been returned.')
+        ids = {identifier for identifier, row in rentals.items() if row['label'] == previous.get('label')}
+        failed_ids.update(ids)
+        if not ids:
+            # Before the shared tool was adopted, cost was recorded by duration and hourly price.
+            if previous.get('rental_backend') == 'vast-rental':
+                raise RuntimeError('The shared ledger has not recorded the previous attempt cost.')
+            duration = max(0, previous['deleted_at'] - requested)
+            charge = Decimal(str(duration)) * Decimal(str(previous['hourly_cost'])) / 3600
+            if not charge.is_finite() or charge < 0:
+                raise RuntimeError('The historical rental cost is invalid.')
+            total += charge.quantize(Decimal('0.01'), rounding=ROUND_CEILING)
+    for identifier, row in rentals.items():
+        if (identifier in unusable and
+                dt.datetime.fromisoformat(row['at']).astimezone(dt.timezone.utc).date() == day):
+            failed_ids.add(identifier)
+    for identifier in failed_ids:
+        if identifier not in returned:
+            raise RuntimeError('A failed rental has not been returned in the shared ledger.')
+        charge = Decimal(str(returned[identifier]['dollars']))
+        if not charge.is_finite() or charge < 0:
+            raise RuntimeError('The shared ledger returned an invalid rental cost.')
+        total += charge
+    if total > FAILED_COST_LIMIT:
+        raise RuntimeError("Today's failed attempts have cost more than $0.50.")
+    return total
 
 
 def timer_unit(job, action):
@@ -247,7 +290,11 @@ def delete_instances(job):
         if acknowledged and row['id'] not in visible_ids:
             continue
         try:
-            response = api('DELETE', f"instances/{row['id']}/", {}, timeout=10)
+            if job.get('rental_backend') == 'vast-rental':
+                vast_backend.command(['return', str(row['id'])], timeout=30)
+                response = {'success': True}
+            else:
+                response = api('DELETE', f"instances/{row['id']}/", {}, timeout=10)
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 raise
@@ -269,6 +316,14 @@ def delete_instances(job):
 
 
 def finalize(job):
+    if job.get('rental_backend') == 'vast-rental' and job.get('instance_id'):
+        try:
+            values = {name: job.get(name) for name in ('id', 'phase', 'exit_code', 'failure_kind')}
+            vast_backend.command(['note', str(job['instance_id']),
+                                  'autoresearch ' + job['id'], '--values', json.dumps(values)], timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            # A note must never delay returning a paid machine.
+            pass
     delete_instances(job)
     current = load(job['id'])
     if (current.get('creation_requested_at') is not None
@@ -395,9 +450,7 @@ def lowest_cost_offer(offers, download_bytes, rental_seconds, max_hourly_cost):
     return chosen
 
 
-def choose_offer(profile=None, *, download_bytes=0, settings=None):
-    profile = active_gpu() if profile is None else profile
-    values = profile.values
+def excluded_machines():
     unavailable_machines, unavailable_offers = set(), set()
     failures_path = ROOT / 'results/operations/machine-failures.json'
     if failures_path.is_file():
@@ -414,6 +467,13 @@ def choose_offer(profile=None, *, download_bytes=0, settings=None):
                 unavailable_machines.add(previous['provider_machine_id'])
             if previous.get('offer_id') is not None:
                 unavailable_offers.add(previous['offer_id'])
+    return unavailable_machines, unavailable_offers
+
+
+def choose_offer(profile=None, *, download_bytes=0, settings=None):
+    profile = active_gpu() if profile is None else profile
+    values = profile.values
+    unavailable_machines, unavailable_offers = excluded_machines()
     query = {'external': {'eq': False}, 'rentable': {'eq': True}, 'verified': {'eq': True},
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
              'gpu_name': {'eq': profile.gpu_name}, 'gpu_ram': {'gte': values['minimum_gpu_ram_mb']},
@@ -441,6 +501,10 @@ def choose_offer(profile=None, *, download_bytes=0, settings=None):
 
 
 def ssh_connection(instance, key, prefer_direct=True):
+    if instance.get('ssh_config'):
+        return ['ssh', '-F', str(instance['ssh_config']), '-i', str(key),
+                '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+                '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', instance['ssh_host']]
     ports = instance.get('ports') or {}
     direct = ports.get('22/tcp')
     if prefer_direct and direct and instance.get('public_ipaddr'):
@@ -726,11 +790,15 @@ def start(job):
     download_bytes += (job_path(job['id']).parent / 'source.tar.gz').stat().st_size
     required_seconds = execution_budget(job)
     check_daily_budget(time.time(), profile)
-    public = validate_environment()
-    offer = choose_offer(profile, download_bytes=download_bytes,
-                         settings=dict(rental_seconds=lease_seconds(job), max_hourly_cost=job['max_hourly_cost']))
-    if offer['dph_total'] > job['max_hourly_cost']:
-        raise RuntimeError('The current offer exceeds the prepared GPU cost limit.')
+    validate_environment()
+    values = profile.values
+    query = {name: {'gte': values[field]} for name, field in (
+        ('gpu_ram', 'minimum_gpu_ram_mb'), ('cpu_ram', 'minimum_cpu_ram_mb'),
+        ('cpu_cores_effective', 'minimum_cpu_cores'), ('inet_down', 'minimum_download_mbps'),
+        ('reliability2', 'minimum_reliability'), ('cuda_max_good', 'cuda_minimum'))}
+    excluded, _ = excluded_machines()
+    if excluded:
+        query['machine_id'] = {'notin': sorted(excluded)}
     reservation = ROOT / 'results/operations/rental-reservation.lock'
     reservation.parent.mkdir(parents=True, exist_ok=True)
     with reservation.open('a') as lock:
@@ -739,64 +807,44 @@ def start(job):
         check_gpu_selection(profile)
         check_daily_budget(time.time(), profile)
         job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
-                   phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
-                   provider_machine_id=offer.get('machine_id'),
-                   hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'),
-                   host_verification=offer.get('verification'),
-                   offer_transfer_costs=dict(deployment_bytes=download_bytes,
-                                             inet_down_cost=offer.get('inet_down_cost'),
-                                             inet_up_cost=offer.get('inet_up_cost')))
+                   phase='arming', gpu_name=profile.gpu_name, rental_backend='vast-rental',
+                   deployment_bytes=download_bytes)
         save(job)
         arm_expiry(job)
         job.update(phase='creation_requested', creation_uncertain=True, creation_requested_at=time.time())
         save(job)
     try:
-        response = api('PUT', f"asks/{offer['id']}/", {
-            'client_id': 'me', 'image': manifest['container_image'], 'disk': profile.values['disk_gb'],
-            'label': job['label'], 'runtype': 'ssh_direc ssh_proxy', 'env': {}, 'cancel_unavail': True,
-        })
-        if response.get('success') is not True or not response.get('new_contract'):
-            job.update(creation_uncertain=False, creation_rejected=True)
-            raise RuntimeError('The provider declined the rental request.')
-        job.update(instance_id=int(response['new_contract']), creation_uncertain=False, phase='starting')
-        save(job)
         with tempfile.TemporaryDirectory(prefix='autoresearch-ssh-') as temporary:
             key = Path(temporary) / 'key'
             key.write_text(os.environ['VAST_SSH_KEY'].rstrip() + '\n')
             key.chmod(0o600)
-            try:
-                api('POST', f"instances/{job['instance_id']}/ssh/", {'ssh_key': public})
-            except (urllib.error.URLError, TimeoutError):
-                print('SSH-key acknowledgement unavailable; observing access to the same instance.', flush=True)
-            instance_seen = False
-            while time.time() < job['expires_at'] - required_seconds:
-                try:
-                    instance = next((row for row in list_instances() if row['id'] == job['instance_id']), None)
-                except (urllib.error.URLError, TimeoutError, RuntimeError) as error:
-                    print('Readiness observation failed; retaining the same instance:', type(error).__name__, flush=True)
-                    time.sleep(15)
-                    continue
-                if instance is not None:
-                    instance_seen = True
-                if instance and instance.get('actual_status') == 'running' and instance.get('ssh_host'):
-                    try:
-                        run(ssh_connection(instance, key) + ['true'], timeout=15,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except (subprocess.SubprocessError, OSError):
-                        time.sleep(15)
-                        continue
-                    job['ready_at'] = time.time()
+            while True:
+                check_daily_budget(time.time(), profile, ignore_job=job['id'])
+                remaining = job['expires_at'] - time.time() - required_seconds
+                if remaining <= 0:
+                    raise TimeoutError('No time remains for another checked machine and the complete run.')
+                job['creation_uncertain'] = True
+                save(job)
+                response, attempts = vast_backend.rent(job, manifest, profile, key, query, remaining,
+                                                       job_path(job['id']).parent)
+                job.setdefault('selection_attempts', []).extend(attempts)
+                if response.get('rented') is not None:
+                    job.update(instance_id=response['rented'], provider_machine_id=response['machine'],
+                               hourly_cost=response['price'], host_verification='verified',
+                               creation_uncertain=False, phase='starting', ready_at=time.time(),
+                               ssh_config=response['ssh_config'], ssh_host=response['ssh_host'])
                     save(job)
-                    execute(job, instance, key)
+                    execute(job, dict(id=job['instance_id'], ssh_config=job['ssh_config'],
+                                      ssh_host=job['ssh_host']), key)
                     break
-                time.sleep(15)
-            else:
-                job['failure_kind'] = 'machine' if instance_seen else 'unknown'
-                raise TimeoutError('The rental did not become ready in time for training and BPB evaluation.')
+                job['creation_uncertain'] = False
+                save(job)
+                if response.get('failed', 0) == 0:
+                    created = any(row.get('event') == 'rented' and row.get('label') == job['label']
+                                  for row in vast_backend.entries())
+                    job['creation_rejected'] = not created
+                    raise RuntimeError('vast-rental found no available eligible machine.')
     except BaseException as error:
-        if isinstance(error, urllib.error.HTTPError) and error.code in (400, 401, 402, 403, 404, 409, 410, 422, 429):
-            if not job.get('instance_id'):
-                job.update(creation_uncertain=False, creation_rejected=True)
         job.update(phase='failed', error_type=type(error).__name__)
         job.setdefault('failure_kind', 'unknown')
         save(job)
