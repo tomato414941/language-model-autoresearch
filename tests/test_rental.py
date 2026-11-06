@@ -297,7 +297,8 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(rental.load('fixture')['phase'], 'cancelled')
 
     def test_selects_a_single_driver_compatible_h100_sxm_from_the_provider_results(self):
-        base = dict(gpu_name='H100 SXM', num_gpus=1, cuda_max_good=12.8, gpu_ram=81559)
+        base = dict(gpu_name='H100 SXM', num_gpus=1, cuda_max_good=12.8, gpu_ram=81559,
+                    verification='verified')
         offers = [{**base, 'id': 1, 'num_gpus': 2, 'dph_total': 1.0},
                   {**base, 'id': 2, 'gpu_name': 'H200', 'dph_total': 1.0},
                   {**base, 'id': 3, 'cuda_max_good': 12.6, 'dph_total': 1.0},
@@ -307,10 +308,40 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.object(rental, 'api', return_value={'offers': offers}):
             self.assertEqual(rental.choose_offer()['id'], 4)
 
+    def test_selects_verified_machines_from_the_provider_results(self):
+        base = dict(gpu_name='H100 SXM', num_gpus=1, cuda_max_good=12.8, gpu_ram=81559)
+        offers = [dict(base, id=index, dph_total=index, verification=state)
+                  for index, state in enumerate(('deverified', 'unverified', None, 'verified'), 1)]
+        with patch.object(rental, 'api', return_value={'offers': offers}) as api:
+            self.assertEqual(rental.choose_offer()['id'], 4)
+        self.assertEqual(api.call_args.args[2]['verified'], {'eq': True})
+
+    def test_reuses_recent_shared_machine_failures_for_the_requested_gpu(self):
+        profile = rental.get_profile('rtx5090')
+        base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
+                    gpu_ram=32000, verification='verified')
+        offers = [dict(base, id=1, machine_id=10, dph_total=0.50),
+                  dict(base, id=2, machine_id=20, dph_total=0.60),
+                  dict(base, id=3, machine_id=30, dph_total=0.70)]
+        path = self.root / 'results/operations/machine-failures.json'
+        path.parent.mkdir(parents=True)
+        recent = dict(gpu_id='rtx5090', machine_id=10, reported_at=1000000 - 60)
+        for second, expected in (
+                (dict(recent, machine_id=20), 3),
+                (dict(recent, machine_id=20, gpu_id='h100'), 2),
+                (dict(recent, machine_id=20, reported_at=1000000 - 8 * 86400), 2)):
+            with self.subTest(second=second):
+                path.write_text(json.dumps([recent, second]))
+                with patch.object(rental.time, 'time', return_value=1000000), \
+                        patch.object(rental, 'api', return_value={'offers': offers}) as api:
+                    self.assertEqual(rental.choose_offer(profile)['id'], expected)
+                excluded = api.call_args.args[2]['machine_id']['notin']
+                self.assertIn(10, excluded)
+
     def test_selects_a_lower_total_cost_for_the_prepared_deployment(self):
         profile = rental.get_profile('rtx5090')
         base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
-                    gpu_ram=32000, inet_up_cost=0.01)
+                    gpu_ram=32000, inet_up_cost=0.01, verification='verified')
         offers = [dict(base, id=1, dph_total=0.50, inet_down_cost=0.10),
                   dict(base, id=2, dph_total=0.55, inet_down_cost=0.01)]
         with patch.object(rental, 'api', return_value={'offers': offers}):
@@ -320,7 +351,7 @@ class RentalLifecycleTests(unittest.TestCase):
     def test_uses_the_prepared_lease_and_hourly_limit_for_transfer_savings(self):
         profile = rental.get_profile('rtx5090')
         base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
-                    gpu_ram=32000, inet_up_cost=0.01)
+                    gpu_ram=32000, inet_up_cost=0.01, verification='verified')
         offers = [dict(base, id=1, dph_total=0.50, inet_down_cost=0.05),
                   dict(base, id=2, dph_total=0.60, inet_down_cost=0.01)]
         with patch.object(rental, 'api', return_value={'offers': offers}):

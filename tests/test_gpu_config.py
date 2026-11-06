@@ -156,7 +156,8 @@ class GPUConfigurationTests(unittest.TestCase):
     def test_selects_only_the_users_active_gpu_from_offers(self):
         self.config['active_gpu'] = 'rtx5090'
         self.save()
-        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607)
+        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607,
+                    verification='verified')
         offers = [dict(base, id=1, dph_total=0.7), dict(base, id=2, dph_total=0.5),
                   dict(base, id=3, gpu_name='H100 SXM', dph_total=0.1)]
         with patch.object(gpu_config, 'CONFIG_PATH', self.path):
@@ -167,7 +168,8 @@ class GPUConfigurationTests(unittest.TestCase):
     def test_selects_an_available_machine_after_an_ssh_startup_failure_on_the_same_gpu(self):
         self.config['active_gpu'] = 'rtx5090'
         self.save()
-        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607)
+        base = dict(gpu_name='RTX 5090', num_gpus=1, cuda_max_good=12.8, gpu_ram=32607,
+                    verification='verified')
         offers = [dict(base, id=1, machine_id=10, dph_total=.4),
                   dict(base, id=2, machine_id=10, dph_total=.45),
                   dict(base, id=3, machine_id=20, dph_total=.5)]

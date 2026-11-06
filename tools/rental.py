@@ -399,17 +399,25 @@ def choose_offer(profile=None, *, download_bytes=0, settings=None):
     profile = active_gpu() if profile is None else profile
     values = profile.values
     unavailable_machines, unavailable_offers = set(), set()
+    now = time.time()
+    failures_path = ROOT / 'results/operations/machine-failures.json'
+    if failures_path.is_file():
+        for failure in json.loads(failures_path.read_text()):
+            reported = failure.get('reported_at')
+            if (failure.get('gpu_id') == profile.identifier and reported is not None
+                    and 0 <= now - reported < 7 * 86400 and failure.get('machine_id') is not None):
+                unavailable_machines.add(failure['machine_id'])
     for path in (ROOT / 'queue').glob('*/job.json'):
         previous = json.loads(path.read_text())
         requested = previous.get('creation_requested_at')
         if (previous.get('error_type') == 'SSHUnavailable'
-                and requested is not None and time.time() - requested < 7 * 86400
+                and requested is not None and now - requested < 7 * 86400
                 and profile_for_job(previous).identifier == profile.identifier):
             if previous.get('provider_machine_id') is not None:
                 unavailable_machines.add(previous['provider_machine_id'])
             if previous.get('offer_id') is not None:
                 unavailable_offers.add(previous['offer_id'])
-    query = {'external': {'eq': False}, 'rentable': {'eq': True},
+    query = {'external': {'eq': False}, 'rentable': {'eq': True}, 'verified': {'eq': True},
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
              'gpu_name': {'eq': profile.gpu_name}, 'gpu_ram': {'gte': values['minimum_gpu_ram_mb']},
              'cpu_ram': {'gte': values['minimum_cpu_ram_mb']},
@@ -419,8 +427,11 @@ def choose_offer(profile=None, *, download_bytes=0, settings=None):
              'cuda_max_good': {'gte': values['cuda_minimum']},
              'order': [['dph_total', 'asc']], 'type': 'ondemand',
              'allocated_storage': values['disk_gb'], 'limit': 20}
+    if unavailable_machines:
+        query['machine_id'] = {'notin': sorted(unavailable_machines)}
     offers = [row for row in api('POST', 'bundles/', query)['offers']
               if row.get('num_gpus') == 1 and row.get('gpu_name') == profile.gpu_name
+              and row.get('verification') == 'verified'
               and float(row.get('gpu_ram', 0)) >= values['minimum_gpu_ram_mb']
               and float(row.get('cuda_max_good', 0)) >= values['cuda_minimum']
               and row.get('machine_id') not in unavailable_machines
@@ -724,6 +735,7 @@ def start(job):
         job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
                    phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
                    hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'),
+                   host_verification=offer.get('verification'),
                    offer_transfer_costs=dict(deployment_bytes=download_bytes,
                                              inet_down_cost=offer.get('inet_down_cost'),
                                              inet_up_cost=offer.get('inet_up_cost')))
