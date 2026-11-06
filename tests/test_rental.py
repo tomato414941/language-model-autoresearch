@@ -575,7 +575,14 @@ class RentalLifecycleTests(unittest.TestCase):
         (snapshot / 'runtime.json').write_text(json.dumps(manifest))
         return artifacts, manifest
 
-    def rtx_ssh_runtime(self):
+    def rtx_runtime(self, delivery='ssh'):
+        config = json.loads(self.config_path.read_text())
+        values = config['gpus']['rtx5090']
+        if delivery is None:
+            values.pop('archive_delivery', None)
+        else:
+            values['archive_delivery'] = delivery
+        self.config_path.write_text(json.dumps(config))
         profile = rental.get_profile('rtx5090')
         artifacts = profile.artifacts_directory(self.root)
         artifacts.mkdir(parents=True)
@@ -598,7 +605,7 @@ class RentalLifecycleTests(unittest.TestCase):
         return artifacts, manifest, job
 
     def test_validates_the_ssh_profiles_local_archives_when_an_object_store_is_configured(self):
-        artifacts, manifest, _ = self.rtx_ssh_runtime()
+        artifacts, manifest, _ = self.rtx_runtime()
         environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
                            R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
         with patch.dict(rental.os.environ, environment), \
@@ -609,7 +616,7 @@ class RentalLifecycleTests(unittest.TestCase):
                 rental.verify_archives(manifest, artifacts, 'invalid local runtime')
 
     def test_delivers_the_ssh_profiles_archives_over_ssh_with_global_object_store_settings(self):
-        _, _, job = self.rtx_ssh_runtime()
+        _, _, job = self.rtx_runtime()
         commands = []
 
         def command(arguments, **kwargs):
@@ -634,6 +641,41 @@ class RentalLifecycleTests(unittest.TestCase):
         uploads = [Path(call.args[1]).name for call in self.transfer.call_args_list]
         self.assertEqual(uploads, ['gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz', 'source.tar.gz'])
         self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+
+    def test_fetches_the_rtx_runtime_from_r2_with_default_delivery(self):
+        _, _, job = self.rtx_runtime(delivery=None)
+        transfers = []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            if text.startswith('nvidia-smi'):
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA GeForce RTX 5090, 0, 0\n')
+            if 'kill -0' in text:
+                return subprocess.CompletedProcess(arguments, 0, stdout='exit 0')
+            if kwargs.get('stdout') is not None:
+                kwargs['stdout'].write(b'fixture artifact')
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        def upload(connection, path, *args, **kwargs):
+            transfers.append(('ssh', Path(path).name))
+            return dict(archive=Path(path).name, source='ssh')
+
+        def fetch(connection, store, name, *args, **kwargs):
+            transfers.append(('r2', name))
+            return dict(archive=name, source='r2')
+
+        self.transfer.side_effect = upload
+        environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
+                           R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
+        with patch.dict(rental.os.environ, environment), \
+                patch.object(rental.r2, 'stored', return_value=15), \
+                patch.object(rental.r2, 'fetch', side_effect=fetch), \
+                patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run', side_effect=command):
+            rental.execute(job, {}, self.root / 'key')
+        self.assertEqual(transfers, [('ssh', 'gpu-bootstrap.tar.gz'), ('r2', 'gpu-env.tar.xz'),
+                                    ('r2', 'gpu-assets.tar.gz'), ('ssh', 'source.tar.gz')])
         self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
 
     def test_fetches_the_large_archives_from_r2_after_installing_its_fetcher(self):
