@@ -14,8 +14,6 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
-import bisect
-from collections import deque
 import math
 import time
 from dataclasses import dataclass, asdict
@@ -83,7 +81,7 @@ class GPTConfig:
     float32_embedding_master: bool = True
     share_value_embeddings: bool = True
     value_silu: bool = True
-    training_loss_chunk_size: int = 16384
+    training_loss_chunk_size: int = 0
 
 
 def norm(x):
@@ -559,50 +557,85 @@ def _training_document_batches(source_pattern=None):
             yield batch, epochs.copy()
 
 
-class LengthIndexedDocuments:
-    """Select the native best fit while preserving first-arrival ties."""
-
-    def __init__(self):
-        self.lengths = []
-        self.buckets = {}
-        self.count = 0
-
-    def __len__(self):
-        return self.count
-
-    def extend(self, documents):
-        for document in documents:
-            length = len(document)
-            if length not in self.buckets:
-                bisect.insort(self.lengths, length)
-                self.buckets[length] = deque()
-            self.buckets[length].append(document)
-            self.count += 1
-
-    def pop_best(self, remaining):
-        index = max(0, bisect.bisect_right(self.lengths, remaining) - 1)
-        length = self.lengths[index]
-        bucket = self.buckets[length]
-        document = bucket.popleft()
-        self.count -= 1
-        if not bucket:
-            self.lengths.pop(index)
-            del self.buckets[length]
-        return document
-
-
-def make_training_dataloader(tokenizer, B, T, buffer_size=1000, source_pattern=None):
+def _packed_training_rows(tokenizer, B, T, source_pattern=None):
     from array import array
+    from collections import deque
+    import numpy as np
+    import torch
 
-    # Keep prepare.py's document stream, refill boundary, cropping and shifted targets.
-    # Per-length FIFO queues preserve its first-match tie rule without scanning every document.
-    row_capacity = T + 1
-    batches = _training_document_batches(source_pattern)
-    bos_token = tokenizer.get_bos_token_id()
-    documents = LengthIndexedDocuments()
-    epoch = 1
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    row_values = row_buffer.numpy()
+    if B <= 0 or T <= 0:
+        raise ValueError("Use a positive batch and sequence length.")
+    batches = iter(_training_document_batches(source_pattern))
+    bos = tokenizer.get_bos_token_id()
+    queued, current, offset = deque(), None, 0
+    previous, epoch = None, 1
+    packed = torch.empty((B, T + 1), dtype=torch.long, device="cpu")
+    values = packed.numpy()
+    try:
+        while True:
+            for row_index in range(B):
+                position = 0
+                if previous is not None:
+                    values[row_index, 0] = previous
+                    position = 1
+                while position < T + 1:
+                    if current is None or offset == len(current):
+                        while not queued:
+                            try:
+                                texts, epoch = next(batches)
+                            except StopIteration:
+                                return
+                            for tokens in tokenizer.encode(texts, prepend=bos):
+                                if len(tokens) == 0 or tokens[0] != bos:
+                                    raise ValueError("Every original document must keep its native BOS.")
+                                queued.append(np.frombuffer(array("I", tokens), dtype=np.uint32))
+                        current, offset = queued.popleft(), 0
+                    count = min(T + 1 - position, len(current) - offset)
+                    values[row_index, position:position + count] = current[offset:offset + count]
+                    offset += count
+                    position += count
+                previous = int(values[row_index, -1])
+            yield packed, epoch
+    finally:
+        close = getattr(batches, "close", None)
+        if close is not None:
+            close()
+
+
+def _mixed_training_rows(tokenizer, B, T, source_pattern=None):
+    """Fill each update from a fixed cycle of original per-source rows."""
+    if B <= 0 or T <= 0:
+        raise ValueError("Use a positive batch and sequence length.")
+    pattern = ("fineweb",) if source_pattern is None else tuple(source_pattern)
+    allowed = {"fineweb", "finemath-3plus", "finemath-4plus", "common-pile"}
+    if not pattern or not set(pattern) <= allowed:
+        raise ValueError("Use a nonempty row cycle of allowed training sources.")
+    names = dict.fromkeys(pattern)
+    if len(names) == 1:
+        yield from _packed_training_rows(tokenizer, B, T, pattern)
+        return
+    readers = {name: _packed_training_rows(tokenizer, 1, T, (name,)) for name in names}
+    epochs = dict.fromkeys(names, 1)
+    packed = torch.empty((B, T + 1), dtype=torch.long, device="cpu")
+    position = 0
+    try:
+        while True:
+            for row in range(B):
+                name = pattern[position]
+                source, epoch = next(readers[name])
+                packed[row].copy_(source[0])
+                epochs[name] = epoch[name] if isinstance(epoch, dict) else epoch
+                position = (position + 1) % len(pattern)
+            yield packed, epochs.copy()
+    finally:
+        for reader in readers.values():
+            reader.close()
+
+
+def make_training_dataloader(tokenizer, B, T, source_pattern=None):
+    from concurrent.futures import ThreadPoolExecutor
+
+    rows = _mixed_training_rows(tokenizer, B, T, source_pattern)
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
@@ -610,31 +643,29 @@ def make_training_dataloader(tokenizer, B, T, buffer_size=1000, source_pattern=N
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
     transfer_done = None
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(documents) < buffer_size:
-                    texts, epoch = next(batches)
-                    # Dense token IDs widen to torch.long when copied into the packed rows.
-                    documents.extend(array("I", row) for row in tokenizer.encode(texts, prepend=bos_token))
-                remaining = row_capacity - pos
-                document = documents.pop_best(remaining)
-                if len(document) > remaining:
-                    document = document[:remaining]
-                row_values[row_idx, pos:pos + len(document)] = document
-                pos += len(document)
-        # Pinned host storage must remain unchanged until its prior H2D copy completes.
-        if transfer_done is not None:
-            transfer_done.synchronize()
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        if gpu_buffer.is_cuda:
-            if transfer_done is None:
-                transfer_done = torch.cuda.Event()
-            transfer_done.record()
-        yield inputs, targets, epoch
+    # CPU-only packing can overlap model execution; CUDA stays on the caller's stream.
+    # https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="training-data")
+    pending = worker.submit(next, rows)
+    try:
+        while True:
+            packed, epoch = pending.result()
+            if transfer_done is not None:
+                transfer_done.synchronize()
+            cpu_inputs.copy_(packed[:, :-1])
+            cpu_targets.copy_(packed[:, 1:])
+            # The worker may reuse packed only after both synchronous host copies finish.
+            pending = worker.submit(next, rows)
+            gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+            if gpu_buffer.is_cuda:
+                if transfer_done is None:
+                    transfer_done = torch.cuda.Event()
+                transfer_done.record()
+            yield inputs, targets, epoch
+    finally:
+        pending.cancel()
+        worker.shutdown(wait=True, cancel_futures=True)
+        rows.close()
 
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
@@ -799,6 +830,14 @@ def scale_adam_second_moments(optimizer, batch_ratio):
             beta1, beta2 = group['betas']
             group['betas'] = (beta1, beta2 ** batch_ratio)
 
+def scale_adam_weight_decay(optimizer, batch_ratio):
+    """Keep the nominal Adam decay coefficient per token near its reference batch."""
+    if not math.isfinite(batch_ratio) or batch_ratio <= 0:
+        raise ValueError("The batch ratio must be finite and positive.")
+    for group in optimizer.param_groups:
+        if group['kind'] == 'adamw':
+            group['weight_decay'] *= batch_ratio
+
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
@@ -809,9 +848,12 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "L"    # full causal attention through Torch SDPA
 
 # Optimization
-TRAINING_SOURCES = ("fineweb",) # independent first-run data recipe
-TOTAL_BATCH_SIZE = 2**17 # one device batch, ~131K tokens per optimizer step
+# Each equal-sized microbatch fixes target-token shares at 75% web, 12.5% math and 12.5% code.
+# https://huggingface.co/blog/smollm3
+TRAINING_SOURCES = ("fineweb",) * 3 + ("finemath-4plus",) + ("fineweb",) * 3 + ("common-pile",)
+TOTAL_BATCH_SIZE = 2**15 # one 16x2048 device batch per optimizer step
 BATCH_REFERENCE_SIZE = 2**18 # parent batch for Adam variance, Muon decay and warmup
+ADAM_DECAY_REFERENCE_SIZE = 2**17 # current RTX baseline, distinct from the parent reference
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.008  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -827,7 +869,7 @@ TAIL_EMA_BLEND = 0.60   # weight of EMA in the single returned model
 OLMES_BATCH_SIZE = 8    # native likelihood examples per inference batch
 
 # Model size
-DEPTH = 8               # number of transformer layers
+DEPTH = 10              # number of transformer layers
 DEVICE_BATCH_SIZE = 16   # independent 32-GB device batch
 
 # ---------------------------------------------------------------------------
@@ -884,6 +926,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY * TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE,
 )
 scale_adam_second_moments(optimizer, TOTAL_BATCH_SIZE / BATCH_REFERENCE_SIZE)
+scale_adam_weight_decay(optimizer, TOTAL_BATCH_SIZE / ADAM_DECAY_REFERENCE_SIZE)
 
 tail_ema = TailEMA(model, TAIL_EMA_START, TAIL_EMA_TAU, TAIL_EMA_BLEND)
 model = torch.compile(model, dynamic=False)
@@ -1001,6 +1044,7 @@ while True:
 
 print()  # newline after \r training log
 
+train_loader.close()
 total_tokens = step * TOTAL_BATCH_SIZE
 total_training_time += tail_ema.apply()
 
