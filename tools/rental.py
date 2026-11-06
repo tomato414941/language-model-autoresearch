@@ -113,15 +113,22 @@ def verify_archives(manifest, artifacts, failure):
     to upload an archive that R2 does not hold yet.
     """
     store = r2_store(manifest)
+    sizes = {}
     for name, sha256 in archive_specs(manifest):
         path = artifacts / name
         if store is None or name == BOOTSTRAP:
             if not path.is_file() or digest(path) != sha256:
                 raise RuntimeError(failure)
-        elif r2.stored(store, name, sha256) is None:
-            if not path.is_file():
-                raise RuntimeError(failure)
-            r2.upload(store, path, sha256, name)
+            sizes[name] = path.stat().st_size
+        else:
+            size = r2.stored(store, name, sha256)
+            if size is None:
+                if not path.is_file():
+                    raise RuntimeError(failure)
+                r2.upload(store, path, sha256, name)
+                size = path.stat().st_size
+            sizes[name] = size
+    return sizes
 
 
 def results_directory(job):
@@ -353,7 +360,42 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     print(json.dumps({'id': identifier, 'commit': commit, 'phase': job['phase']}, indent=2))
 
 
-def choose_offer(profile=None):
+def lowest_cost_offer(offers, download_bytes, rental_seconds, max_hourly_cost):
+    """Prefer known transfer savings over the cheapest hourly offer, within its budget."""
+    cheapest = min(offers, key=lambda row: row['dph_total'])
+
+    def rates(row):
+        try:
+            values = (row['inet_down_cost'], row['inet_up_cost'])
+            if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   and math.isfinite(value) and value >= 0 for value in values):
+                return values
+        except KeyError:
+            pass
+        return None
+
+    base_rates = rates(cheapest)
+    if download_bytes <= 0 or base_rates is None:
+        return cheapest
+    # GiB understates savings if the provider's advertised $/GB uses decimal bytes.
+    download_gib = download_bytes / 1024 ** 3
+    # Savings at the maximum lease also hold at shorter leases after deployment.
+    # Unknown output traffic may not become more expensive than the hourly choice.
+    hours = rental_seconds / 3600
+    chosen = cheapest
+    cost = hours * chosen['dph_total'] + download_gib * base_rates[0]
+    for row in offers:
+        prices = rates(row)
+        if (row['dph_total'] > max_hourly_cost or prices is None
+                or prices[1] > base_rates[1]):
+            continue
+        estimate = hours * row['dph_total'] + download_gib * prices[0]
+        if estimate < cost:
+            chosen, cost = row, estimate
+    return chosen
+
+
+def choose_offer(profile=None, *, download_bytes=0, settings=None):
     profile = active_gpu() if profile is None else profile
     values = profile.values
     unavailable_machines, unavailable_offers = set(), set()
@@ -386,7 +428,8 @@ def choose_offer(profile=None):
               and math.isfinite(row['dph_total']) and row['dph_total'] >= 0]
     if not offers:
         raise RuntimeError(f'No suitable single {profile.gpu_name} is available; no rental was requested.')
-    return min(offers, key=lambda row: row['dph_total'])
+    settings = profile.settings() if settings is None else settings
+    return lowest_cost_offer(offers, download_bytes, settings['rental_seconds'], settings['max_hourly_cost'])
 
 
 def ssh_connection(instance, key, prefer_direct=True):
@@ -660,11 +703,15 @@ def start(job):
     if digest(job_path(job['id']).parent / 'source.tar.gz') != job['source_archive_sha256']:
         raise RuntimeError('The prepared experiment sources changed.')
     manifest = json.loads(runtime_path.read_text())
-    verify_archives(manifest, artifact_directory(job), 'A prepared runtime archive changed; no rental was requested.')
+    sizes = verify_archives(manifest, artifact_directory(job),
+                            'A prepared runtime archive changed; no rental was requested.')
+    download_bytes = sum(sizes[name] for name in deployment_names(manifest))
+    download_bytes += (job_path(job['id']).parent / 'source.tar.gz').stat().st_size
     required_seconds = execution_budget(job)
     check_daily_budget(time.time(), profile)
     public = validate_environment()
-    offer = choose_offer(profile)
+    offer = choose_offer(profile, download_bytes=download_bytes,
+                         settings=dict(rental_seconds=lease_seconds(job), max_hourly_cost=job['max_hourly_cost']))
     if offer['dph_total'] > job['max_hourly_cost']:
         raise RuntimeError('The current offer exceeds the prepared GPU cost limit.')
     reservation = ROOT / 'results/operations/rental-reservation.lock'
@@ -676,7 +723,10 @@ def start(job):
         check_daily_budget(time.time(), profile)
         job.update(requested_at=time.time(), expires_at=time.time() + lease_seconds(job) - CLEANUP_SECONDS,
                    phase='arming', gpu_name=offer['gpu_name'], offer_id=offer['id'],
-                   hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'))
+                   hourly_cost=offer['dph_total'], host_reliability=offer.get('reliability2'),
+                   offer_transfer_costs=dict(deployment_bytes=download_bytes,
+                                             inet_down_cost=offer.get('inet_down_cost'),
+                                             inet_up_cost=offer.get('inet_up_cost')))
         save(job)
         arm_expiry(job)
         job.update(phase='creation_requested', creation_uncertain=True, creation_requested_at=time.time())

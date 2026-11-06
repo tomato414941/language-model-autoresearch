@@ -307,6 +307,45 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.object(rental, 'api', return_value={'offers': offers}):
             self.assertEqual(rental.choose_offer()['id'], 4)
 
+    def test_selects_a_lower_total_cost_for_the_prepared_deployment(self):
+        profile = rental.get_profile('rtx5090')
+        base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
+                    gpu_ram=32000, inet_up_cost=0.01)
+        offers = [dict(base, id=1, dph_total=0.50, inet_down_cost=0.10),
+                  dict(base, id=2, dph_total=0.55, inet_down_cost=0.01)]
+        with patch.object(rental, 'api', return_value={'offers': offers}):
+            chosen = rental.choose_offer(profile, download_bytes=4 * 1024 ** 3)
+        self.assertEqual(chosen['id'], 2)
+
+    def test_uses_the_prepared_lease_and_hourly_limit_for_transfer_savings(self):
+        profile = rental.get_profile('rtx5090')
+        base = dict(gpu_name=profile.gpu_name, num_gpus=1, cuda_max_good=12.8,
+                    gpu_ram=32000, inet_up_cost=0.01)
+        offers = [dict(base, id=1, dph_total=0.50, inet_down_cost=0.05),
+                  dict(base, id=2, dph_total=0.60, inet_down_cost=0.01)]
+        with patch.object(rental, 'api', return_value={'offers': offers}):
+            self.assertEqual(rental.choose_offer(profile, download_bytes=4 * 1024 ** 3)['id'], 1)
+            settings = dict(rental_seconds=3600, max_hourly_cost=1)
+            self.assertEqual(rental.choose_offer(profile, download_bytes=4 * 1024 ** 3,
+                                                 settings=settings)['id'], 2)
+            settings['max_hourly_cost'] = 0.55
+            self.assertEqual(rental.choose_offer(profile, download_bytes=4 * 1024 ** 3,
+                                                 settings=settings)['id'], 1)
+
+    def test_preserves_the_hourly_choice_when_bandwidth_prices_are_unknown(self):
+        for price in (None, -1, float('nan'), float('inf'), 'unknown', True):
+            with self.subTest(price=price):
+                offers = [dict(id=1, dph_total=0.50, inet_down_cost=price, inet_up_cost=0.01),
+                          dict(id=2, dph_total=0.55, inet_down_cost=0, inet_up_cost=0)]
+                self.assertEqual(rental.lowest_cost_offer(offers, 4 * 1024 ** 3, 6300, 1)['id'], 1)
+
+    def test_keeps_upload_costs_from_overturning_known_download_savings(self):
+        offers = [dict(id=1, dph_total=0.50, inet_down_cost=0.10, inet_up_cost=0.01),
+                  dict(id=2, dph_total=0.55, inet_down_cost=0, inet_up_cost=0.02)]
+        self.assertEqual(rental.lowest_cost_offer(offers, 4 * 1024 ** 3, 6300, 1)['id'], 1)
+        offers[1]['inet_up_cost'] = 0.01
+        self.assertEqual(rental.lowest_cost_offer(offers, 0, 6300, 1)['id'], 1)
+
     def test_requires_an_active_independent_expiry_timer_before_proceeding(self):
         with patch.object(rental, 'run'):
             with patch.object(rental.subprocess, 'check_output', return_value='inactive\n'):
@@ -408,7 +447,7 @@ class RentalLifecycleTests(unittest.TestCase):
         instance = dict(id=42, actual_status='running', ssh_host='fixture')
         with patch.object(rental, 'check_daily_budget'), \
                 patch.object(rental, 'validate_environment', return_value='fixture-public-key'), \
-                patch.object(rental, 'choose_offer', return_value=offer), \
+                patch.object(rental, 'choose_offer', return_value=offer) as choose, \
                 patch.object(rental, 'arm_expiry'), \
                 patch.object(rental, 'api', return_value={'success': True, 'new_contract': 42}) as api, \
                 patch.object(rental, 'list_instances', return_value=[instance]), \
@@ -420,6 +459,11 @@ class RentalLifecycleTests(unittest.TestCase):
             rental.start(job)
         request = api.call_args_list[0]
         self.assertEqual(request.args[2]['image'], 'fixture-image')
+        self.assertEqual(choose.call_args.kwargs['download_bytes'],
+                         source.stat().st_size + sum((artifacts / name).stat().st_size
+                                                     for name in rental.deployment_names(manifest)))
+        self.assertEqual(choose.call_args.kwargs['settings'],
+                         dict(rental_seconds=3600, max_hourly_cost=5.0))
         execute.assert_called_once()
         finalize.assert_called_once()
 
@@ -444,7 +488,7 @@ class RentalLifecycleTests(unittest.TestCase):
             jobs.append(job)
         barrier = threading.Barrier(2)
 
-        def choose(profile):
+        def choose(profile, **kwargs):
             if barrier.wait(timeout=5) == 0:
                 config = read_config()
                 config['rental_scope'] = 'loop'
@@ -755,7 +799,10 @@ class RentalLifecycleTests(unittest.TestCase):
         with patch.dict(rental.os.environ, environment), \
                 patch.object(rental.r2, 'stored', side_effect=lambda store, name, sha256: held.get(name)), \
                 patch.object(rental.r2, 'upload') as upload:
-            rental.verify_archives(manifest, artifacts, 'missing')
+            sizes = rental.verify_archives(manifest, artifacts, 'missing')
+            self.assertEqual(sizes, {'gpu-env.tar.gz': 10, 'gpu-env.tar.xz': 5,
+                                    'gpu-bootstrap.tar.gz': (artifacts / 'gpu-bootstrap.tar.gz').stat().st_size,
+                                    'gpu-assets.tar.gz': 14})
             self.assertEqual([call.args[2:] for call in upload.call_args_list], [('b' * 64, 'gpu-assets.tar.gz')])
             (artifacts / 'gpu-assets.tar.gz').unlink()
             with self.assertRaisesRegex(RuntimeError, 'missing'):
