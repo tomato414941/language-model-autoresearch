@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import ast
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -46,6 +47,37 @@ class RentalLifecycleTests(unittest.TestCase):
         self.directory.cleanup()
         self.hold_patch.stop()
         self.config_patch.stop()
+
+    def test_records_preparation_time_and_data_readiness_from_the_collected_run(self):
+        gpu = self.root / 'autoresearch'
+        gpu.mkdir()
+
+        def remote(command, **kwargs):
+            return subprocess.run(['bash', '-c', command], cwd=self.root, check=True, **kwargs)
+
+        for data_message in ('Data: 71/71 shards ready', 'Data: all 71 shards already downloaded'):
+            with self.subTest(data=data_message):
+                log = data_message + '\nDone! Ready to train.\n'
+                (self.root / 'prepare.log').write_text(log)
+                for name, modified, text in (
+                        ('run.pid', 1000, '123\n'), ('prepare.log', 1063, log),
+                        ('run.log', 5000, 'completed training log'), ('run.exit', 5001, '0\n')):
+                    path = gpu / name
+                    path.write_text(text)
+                    os.utime(path, (modified, modified))
+                rental.record_preparation_timing(remote, self.root)
+                observation = json.loads((self.root / 'preparation-timing.json').read_text())
+                self.assertEqual(observation['approximate_preparation_seconds'], 63)
+                self.assertEqual(observation['ready_shards'], 71)
+                self.assertEqual(observation['requested_shards'], 71)
+                self.assertTrue(observation['prepare_log_completed_marker'])
+
+    def test_preserves_an_unavailable_timing_record_when_the_remote_read_times_out(self):
+        remote = Mock(side_effect=subprocess.TimeoutExpired('ssh', 5))
+        rental.record_preparation_timing(remote, self.root)
+        observation = json.loads((self.root / 'preparation-timing.json').read_text())
+        self.assertEqual(observation['error_type'], 'TimeoutExpired')
+        self.assertEqual(observation['files'], {})
 
     def test_honors_the_users_rental_hold_before_requesting_a_machine(self):
         job = {**self.job, 'phase': 'prepared'}
