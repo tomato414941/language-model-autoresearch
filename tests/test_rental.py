@@ -18,7 +18,7 @@ class RentalLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.hold_patch = patch.dict(rental.os.environ, {
             'AUTORESEARCH_GPU': 'h100', 'AUTORESEARCH_RENTAL_HOLD_H100': '0',
-            'AUTORESEARCH_RENTAL_HOLD_RTX5090': '0'})
+            'AUTORESEARCH_RENTAL_HOLD_RTX5090': '0', **{name: '' for name in rental.r2.VARIABLES}})
         self.hold_patch.start()
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -561,6 +561,74 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)
         self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
         return commands
+
+    def r2_runtime(self):
+        artifacts = self.root / 'artifacts'
+        artifacts.mkdir()
+        (artifacts / 'gpu-bootstrap.tar.gz').write_bytes(b'bootstrap fixture')
+        snapshot = rental.job_path('fixture').parent
+        (snapshot / 'source.tar.gz').write_bytes(b'source fixture')
+        manifest = dict(python_version='3.12.16', gpu_env_sha256='a' * 64, gpu_assets_sha256='b' * 64,
+                        transport=dict(format='python-xz-mt', canonical_gpu_env_sha256='a' * 64,
+                                       gpu_env_xz_sha256='c' * 64,
+                                       bootstrap_sha256=rental.digest(artifacts / 'gpu-bootstrap.tar.gz')))
+        (snapshot / 'runtime.json').write_text(json.dumps(manifest))
+        return artifacts, manifest
+
+    def test_fetches_the_large_archives_from_r2_after_installing_its_fetcher(self):
+        self.r2_runtime()
+        events = []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            events.append(text)
+            if text.startswith('nvidia-smi'):
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, 0, 0\n')
+            if 'kill -0' in text:
+                return subprocess.CompletedProcess(arguments, 0, stdout='exit 0')
+            if kwargs.get('stdout') is not None:
+                kwargs['stdout'].write(b'fixture artifact')
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        def fetch(connection, store, name, sha256, size, unpack, interpreter, **kwargs):
+            events.append('r2 ' + name)
+            self.assertEqual(interpreter, '.bootstrap/.python/cpython-3.12.16-linux-x86_64-gnu/bin/python3.12')
+            self.assertLessEqual(kwargs['expires'], 3500)
+            return dict(archive=name, sha256=sha256, bytes=size, source='r2')
+
+        self.transfer.side_effect = lambda connection, path, *args, **kwargs: events.append('ssh ' + Path(path).name)
+        environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
+                           R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
+        with patch.dict(rental.os.environ, environment), \
+                patch.object(rental.r2, 'stored', return_value=15), \
+                patch.object(rental.r2, 'fetch', side_effect=fetch), \
+                patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run', side_effect=command):
+            rental.execute(self.job, {}, self.root / 'key')
+        transfers = [event for event in events if event.startswith(('ssh ', 'r2 ', 'cat > '))]
+        self.assertEqual(transfers, ['ssh gpu-bootstrap.tar.gz', 'cat > autoresearch/.bootstrap/r2_fetch.py',
+                                     'r2 gpu-env.tar.xz', 'r2 gpu-assets.tar.gz', 'ssh source.tar.gz'])
+        self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in events), 1)
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+
+    def test_uploads_only_the_archives_that_r2_lacks_and_keeps_the_bootstrap_local(self):
+        artifacts, manifest = self.r2_runtime()
+        (artifacts / 'gpu-assets.tar.gz').write_bytes(b'assets fixture')
+        environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
+                           R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
+        held = {'gpu-env.tar.gz': 10, 'gpu-env.tar.xz': 5}
+        with patch.dict(rental.os.environ, environment), \
+                patch.object(rental.r2, 'stored', side_effect=lambda store, name, sha256: held.get(name)), \
+                patch.object(rental.r2, 'upload') as upload:
+            rental.verify_archives(manifest, artifacts, 'missing')
+            self.assertEqual([call.args[2:] for call in upload.call_args_list], [('b' * 64, 'gpu-assets.tar.gz')])
+            (artifacts / 'gpu-assets.tar.gz').unlink()
+            with self.assertRaisesRegex(RuntimeError, 'missing'):
+                rental.verify_archives(manifest, artifacts, 'missing')
+            (artifacts / 'gpu-bootstrap.tar.gz').write_bytes(b'changed bootstrap')
+            held['gpu-assets.tar.gz'] = 14
+            with self.assertRaisesRegex(RuntimeError, 'missing'):
+                rental.verify_archives(manifest, artifacts, 'missing')
 
     def collect_at_boundary(self, exit_bytes, observed=None, fail_refresh=False):
         identifier = f'collection-{self.collection_cases}'

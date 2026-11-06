@@ -27,6 +27,7 @@ from tools.vast_control import api, list_instances
 from gpu_config import active_gpu, get_profile, profile_for_job, read_config, source_files
 from tools.runtime_archives import archive_specs, deployment_names, encoding_cache_asset_path, UNPACK_XZ
 from tools.parallel_ssh import stream_archive
+from tools import r2
 
 OLMES_SOURCES = tuple('evaluation/' + name for name in (
     'arc_macro.py', 'checkpoint.py', 'count_tokens.py', 'count_gold_tokens.py', 'gold_bpb.py', 'model.py', 'prepare_requests.py',
@@ -39,6 +40,7 @@ CLEANUP_SECONDS = 60
 EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
 COLLECTION_SECONDS = 45
 PROJECT_LABELS = ('autoresearch-',)
+BOOTSTRAP = 'gpu-bootstrap.tar.gz'
 
 
 def digest(path):
@@ -93,6 +95,29 @@ def artifact_directory(job):
     if job.get('gpu_id'):
         return profile_for_job(job).artifacts_directory(ROOT)
     return ROOT / 'artifacts'
+
+
+def r2_store(manifest):
+    """Use R2 for transport runtimes, whose bootstrap interpreter can fetch from it."""
+    return r2.settings() if manifest.get('transport') else None
+
+
+def verify_archives(manifest, artifacts, failure):
+    """Check every runtime archive against its frozen digest before a rental is requested.
+
+    With R2, everything except the small bootstrap lives there; a local copy is needed only
+    to upload an archive that R2 does not hold yet.
+    """
+    store = r2_store(manifest)
+    for name, sha256 in archive_specs(manifest):
+        path = artifacts / name
+        if store is None or name == BOOTSTRAP:
+            if not path.is_file() or digest(path) != sha256:
+                raise RuntimeError(failure)
+        elif r2.stored(store, name, sha256) is None:
+            if not path.is_file():
+                raise RuntimeError(failure)
+            r2.upload(store, path, sha256, name)
 
 
 def results_directory(job):
@@ -289,9 +314,7 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
     sources = source_files(profile)
     sources += OLMES_SOURCES if metric == 'olmes_bpb' else ()
     hashes = {name: digest(ROOT / name) for name in sources}
-    for name, sha256 in archive_specs(manifest):
-        if digest(artifacts / name) != sha256:
-            raise RuntimeError('A runtime archive is incomplete or changed.')
+    verify_archives(manifest, artifacts, 'A runtime archive is incomplete or changed.')
     identifier = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
     directory = job_path(identifier).parent
     directory.mkdir(parents=True)
@@ -455,16 +478,19 @@ def execute(job, instance, key):
     names = deployment_names(manifest)
     hashes = dict(archive_specs(manifest)) if manifest else {}
     hashes['source.tar.gz'] = job.get('source_archive_sha256')
+    store = r2_store(manifest)
+    interpreter = None
+    if manifest.get('transport'):
+        version = manifest['python_version']
+        if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+            raise ValueError('Invalid packaged Python version.')
+        interpreter = f'.bootstrap/.python/cpython-{version}-linux-x86_64-gnu/bin/python3.12'
     transfers = []
     for path in [*(artifacts / name for name in names), job_path(job['id']).parent / 'source.tar.gz']:
-        if path.name == 'gpu-bootstrap.tar.gz':
+        if path.name == BOOTSTRAP:
             remote('mkdir -p autoresearch/.bootstrap')
             unpack = 'tar -xzf - -C autoresearch/.bootstrap'
         elif path.suffix == '.xz':
-            version = manifest['python_version']
-            if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
-                raise ValueError('Invalid packaged Python version.')
-            interpreter = f'.bootstrap/.python/cpython-{version}-linux-x86_64-gnu/bin/python3.12'
             command = [interpreter]
             if manifest.get('transport', {}).get('format') == 'python-xz-mt':
                 command += ['.bootstrap/runtime_unpack.py', 'extract']
@@ -473,8 +499,19 @@ def execute(job, instance, key):
             unpack = 'cd autoresearch && ' + shlex.join(command)
         else:
             unpack = 'tar -xzf - -C autoresearch'
-        receipt = stream_archive(connection, path, unpack, sha256=hashes.get(path.name) or digest(path),
-                                 timeout=min(900, deadline - time.time()))
+        if store is not None and path.parent == artifacts and path.name != BOOTSTRAP:
+            # The rental downloads directly from R2; the processing server sends only small files.
+            size = r2.stored(store, path.name, hashes[path.name])
+            if size is None:
+                raise RuntimeError('A runtime archive is missing from R2.')
+            receipt = r2.fetch(connection, store, path.name, hashes[path.name], size, unpack, interpreter,
+                               timeout=min(900, deadline - time.time()),
+                               expires=max(60, int(job['expires_at'] - time.time())))
+        else:
+            receipt = stream_archive(connection, path, unpack, sha256=hashes.get(path.name) or digest(path),
+                                     timeout=min(900, deadline - time.time()))
+            if path.name == BOOTSTRAP and store is not None:
+                remote('cat > autoresearch/.bootstrap/r2_fetch.py', input=r2.FETCHER.read_bytes())
         transfers.append(receipt)
         job['archive_transfers'] = transfers
         save(job)
@@ -568,9 +605,7 @@ def start(job):
     if digest(job_path(job['id']).parent / 'source.tar.gz') != job['source_archive_sha256']:
         raise RuntimeError('The prepared experiment sources changed.')
     manifest = json.loads(runtime_path.read_text())
-    for name, sha256 in archive_specs(manifest):
-        if digest(artifact_directory(job) / name) != sha256:
-            raise RuntimeError('A prepared runtime archive changed; no rental was requested.')
+    verify_archives(manifest, artifact_directory(job), 'A prepared runtime archive changed; no rental was requested.')
     required_seconds = execution_budget(job)
     check_daily_budget(time.time(), profile)
     public = validate_environment()
@@ -705,7 +740,7 @@ def main():
     preparation.add_argument('--description', required=True)
     preparation.add_argument('--expected-eval-seconds', type=float, default=180)
     sub.add_parser('check-expiry')
-    for action in ('start', 'expire', 'status', 'cancel'):
+    for action in ('start', 'expire', 'status', 'cancel', 'upload'):
         command = sub.add_parser(action)
         command.add_argument('identifier')
     scheduling = sub.add_parser('schedule')
@@ -735,6 +770,15 @@ def main():
         cancel(job)
     elif args.action == 'status':
         print(json.dumps(dict(job=job, instances=[row for row in list_instances() if row.get('label') == job['label']]), indent=2))
+    elif args.action == 'upload':
+        runtime_path = job_path(job['id']).parent / 'runtime.json'
+        if digest(runtime_path) != job['runtime_manifest_sha256']:
+            raise RuntimeError('The prepared runtime manifest changed.')
+        manifest = json.loads(runtime_path.read_text())
+        if r2_store(manifest) is None:
+            raise RuntimeError('R2 holds only transport runtimes, and every R2 variable must be set.')
+        verify_archives(manifest, artifact_directory(job), 'A prepared runtime archive is missing or changed.')
+        print('R2 holds every runtime archive of this job except its bootstrap.', flush=True)
     else:
         lock_path = rental_lock(profile)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
