@@ -1,6 +1,7 @@
 """Evaluate one experiment checkpoint once on all three native OLMES suites."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -13,6 +14,7 @@ from evaluation.model import CheckpointModel
 from evaluation.count_tokens import BATCH_SIZE
 from evaluation.arc_macro import APPROVED_CONFIG_FIX
 from evaluation.protocol import evaluate_prepared, sha256_file
+from evaluation.encoding_cache import EncodingReader, input_identity, use_encodings
 
 
 def main():
@@ -21,6 +23,8 @@ def main():
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--requests", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--encoding-cache", default=os.environ.get("OLMES_ENCODING_CACHE"),
+                        help="Replay a CPU-prepared native encoding cache for these exact requests.")
     parser.add_argument("--batch-size", type=int,
                         default=os.environ.get("OLMES_BATCH_SIZE", str(BATCH_SIZE)))
     args = parser.parse_args()
@@ -29,7 +33,14 @@ def main():
         raise RuntimeError("The complete quality evaluation runs on the rented GPU.")
     model = CheckpointModel(args.checkpoint, args.tokenizer, batch_size=args.batch_size)
     torch.cuda.reset_peak_memory_stats()
-    suites, manifest = evaluate_prepared(model, args.requests, args.output)
+    cache = EncodingReader(args.encoding_cache, input_identity(
+        model, args.tokenizer, Path(args.requests) / "manifest.json")) if args.encoding_cache else None
+    try:
+        with use_encodings(model, cache) if cache else nullcontext():
+            suites, manifest = evaluate_prepared(model, args.requests, args.output)
+    finally:
+        if cache:
+            cache.close()
     report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "olmes_revision": manifest["olmes_revision"],
@@ -46,6 +57,9 @@ def main():
         "elapsed_seconds": time.monotonic() - started,
         "peak_vram_mb": torch.cuda.max_memory_allocated() / 1024 ** 2,
     }
+    if cache:
+        report["encoding_cache"] = {"sha256": sha256_file(args.encoding_cache), "hits": cache.hits,
+                                    "format_version": cache.metadata["format_version"]}
     with (Path(args.output) / "summary.json").open("x") as output:
         json.dump(report, output, indent=2)
         output.write("\n")

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import ast
 import json
 from pathlib import Path
 import subprocess
@@ -317,6 +318,39 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(runtime['sources'], job['source_sha256'])
         with tarfile.open(directory / 'source.tar.gz') as archive:
             self.assertEqual(archive.extractfile('prepare.py').read(), b'current prepare.py')
+
+    def test_snapshots_the_native_evaluator_with_every_imported_local_module(self):
+        artifacts = self.root / 'gpus/h100/artifacts'
+        artifacts.mkdir(parents=True)
+        manifest = dict(gpu_id='h100', tokenizer={'fixture': 'tokenizer'}, sources={},
+                        evaluation_metric='olmes_bpb')
+        for name, field in (('gpu-env.tar.gz', 'gpu_env_sha256'),
+                            ('gpu-assets.tar.gz', 'gpu_assets_sha256')):
+            (artifacts / name).write_bytes(name.encode())
+            manifest[field] = rental.digest(artifacts / name)
+        (artifacts / 'runtime.json').write_text(json.dumps(manifest))
+        repository = Path(__file__).resolve().parents[1]
+        for name in rental.source_files() + rental.OLMES_SOURCES:
+            destination = self.root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if name.startswith('evaluation/'):
+                destination.write_bytes((repository / name).read_bytes())
+            else:
+                destination.write_text('fixture ' + name)
+        (self.root / 'tools').mkdir()
+        (self.root / 'tools/gpu_run.sh').write_text('fixture')
+        with patch('tools.package_runtime.verify_tokenizer', return_value=manifest['tokenizer']), \
+                patch('builtins.print'):
+            rental.prepare_job('a' * 40, False, 'fixture')
+        directory = next(path for path in (self.root / 'queue').iterdir() if path.name != 'fixture')
+        with tarfile.open(directory / 'source.tar.gz') as archive:
+            names = set(archive.getnames())
+            for name in names:
+                if name.startswith('evaluation/') and name.endswith('.py'):
+                    for node in ast.walk(ast.parse(archive.extractfile(name).read())):
+                        if isinstance(node, ast.ImportFrom) and (node.module or '').startswith('evaluation.'):
+                            module = node.module.replace('.', '/') + '.py'
+                            self.assertIn(module, names, f'{name} imports {module}')
 
     def test_rents_the_prepared_snapshot_while_the_working_sources_advance(self):
         directory = rental.job_path('fixture').parent
