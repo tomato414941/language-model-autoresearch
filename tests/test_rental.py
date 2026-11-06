@@ -374,13 +374,20 @@ class RentalLifecycleTests(unittest.TestCase):
         self.assertEqual(self.executed.call_args.args[1][-1], 'vast-42')
         self.finalized.assert_called_once()
 
-    def test_returns_without_a_run_when_vast_rental_finds_no_machine(self):
+    def test_keeps_the_job_startable_when_no_machine_ran_it(self):
         job = self.prepared()
+        rejected = dict(rented=None, offers=1, failed=1)
         with self.assertRaisesRegex(RuntimeError, 'no available eligible machine'):
-            self.run_prepared(job, [(dict(rented=None, offers=0, failed=0), [])])
+            self.run_prepared(job, [(rejected, [dict(unusable=41)]), (dict(rented=None, offers=0, failed=0), [])])
         self.executed.assert_not_called()
         self.finalized.assert_called_once()
-        self.assertEqual(rental.load('fixture')['phase'], 'failed')
+        stored = rental.load('fixture')
+        self.assertEqual(stored['phase'], 'prepared')
+        self.assertEqual(stored['selection_attempts'], [dict(unusable=41)])
+        accepted = dict(rented=42, machine=70, price=0.5, ssh_config='fixture.config', ssh_host='vast-42')
+        self.run_prepared(stored, [(accepted, [accepted])])
+        self.executed.assert_called_once()
+        self.assertEqual(rental.load('fixture')['instance_id'], 42)
 
     def test_rents_the_prepared_snapshot_while_the_working_sources_advance(self):
         job = self.prepared()

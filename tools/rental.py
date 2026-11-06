@@ -660,8 +660,12 @@ def run_job(job):
                     if response.get('failed', 0) == 0:
                         raise RuntimeError('vast-rental found no available eligible machine.')
         except BaseException as error:
-            job.update(phase='failed', error_type=type(error).__name__)
-            job.setdefault('failure_kind', 'unknown')
+            if job.get('instance_id') is None:
+                # No machine ever ran the job, so it may start again later, such as when cheaper machines are free.
+                job.update(phase='prepared', error_type=type(error).__name__)
+            else:
+                job.update(phase='failed', error_type=type(error).__name__)
+                job.setdefault('failure_kind', 'unknown')
             try:
                 with (directory / 'failure.log').open('a') as log:
                     log.write(type(error).__name__ + ': ' + str(error) + '\n')
