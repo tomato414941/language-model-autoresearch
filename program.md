@@ -21,7 +21,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget**, set per GPU (wall clock training time, excluding startup/compilation; 30 minutes on the H100 and 1 hour on the RTX 5090): one run in each daily rental. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
-- Modify the active GPU's `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
+- Modify the active GPU's `train.py` — this is the only file you edit, besides your notes (see the rules at the end). Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, the tokenizer, the sequence length, how the data is read, etc. The tokenizer, `MAX_SEQ_LEN` and dataloader in `prepare.py` are defaults you may replace.
 - Prepare anything beforehand that needs only the CPU, from the allowed data. Its code may live in files of its own, and it does not count toward the training budget.
 
 **What you CANNOT do:**
@@ -45,8 +45,6 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **Bundles**: With one run a day, one change per run is far too slow. Combine several promising changes into one experiment, a bundle, and list every change in the description. If a bundle is discarded, its parts are not rejected: split or recombine them in later experiments.
 
 **Discarded is not forever**: An idea can return in a genuinely different bundle or configuration, or after the baseline changes. Describe the new hypothesis before running it.
-
-**Follow the latest work**: Between rentals, search the web for what is new. Put the source of each idea in its description.
 
 ## Output format
 
@@ -121,7 +119,7 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Timeout**: Each experiment takes its training time plus startup and eval, and must end within its rental. If it cannot, kill it and treat it as a failure (discard and revert).
 
-**Crashes**: Record every failed attempt. Fix technical errors in advance of a later daily run, or discard a fundamentally broken idea.
+**Crashes and failures**: Record every failed attempt, and tell the machine's failures from your code's. A machine that did not start, could not be reached or ran slow is recorded and never rented again. An error in your code is fixed before a later daily run, or a fundamentally broken idea is discarded.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period. In this repository the loop alternates the daily rental and the work between rentals (see the rules at the end).
 
@@ -129,7 +127,17 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 - **GPUs.** The loop has two GPUs, one H100 SXM and one RTX 5090, and runs on one of them at a time; the user chooses which. Each GPU has its own folder with its own `train.py`, current best and results. The two models are separate and need not run on the other GPU. Compare a candidate only with the current best of its own GPU; an idea found on one GPU may be tried on the other. Keep each GPU's settings (training time, rental length, price cap) in one place, so that switching changes only which GPU is active. On the H100 the training is 30 minutes in a rental of at most 1 hour; on the RTX 5090 it is 1 hour in a rental of at most 1 hour 45 minutes. A GPU's first run measures its baseline. The user approved restructuring the repository and `prepare.py` for this.
 - **Rentals.** Rent the active GPU at most once a day and for at most its rental length, counting only this loop's own rentals (other projects' rentals on the same account do not count): the setup, the day's training and its eval must fit in it. Delete it right after.
-- **Between rentals.** Use this time for everything that helps the work ahead, not only the next rental, even if it takes more than a day.
+- **Between rentals.** A prepared rental runs by itself: its timer, observer and expiry live on the processing server. Do not watch it. Look at it twice: 15 minutes after it starts, and when it should have ended. Treat any long task the same way: estimate when it ends, do other work until then, and never repeat the same check every few minutes. Use the time between rentals for everything that helps the work ahead, not only the next rental, even if it takes more than a day, in this order:
+  1. Keep several candidates for the next runs ready, each with its code, hypothesis and expected effect.
+  2. Find on the CPU, before renting, every failure it can find: code that does not run, does not fit in memory or would not finish in time. Every rental costs money.
+  3. Analyze past results to shape the next ideas.
+  4. Search the web for new work to feed the candidates, and put the source of each idea in its description.
+- **Before a rental.** From 3 hours before a prepared rental starts, do not change what it uses: its code, archives and settings. If something must change, check the rental again.
+- **Infrastructure.** Before working on transfers, compression, renting or other infrastructure, estimate its effect and write it down: the failures it prevents and the money or time it saves. Put it ahead of improving the model only when it prevents failed runs.
 - **CPU work.** Run work that needs no GPU on the processing server in your environment notes, never on the machine you run on. Keep your files in their own directory there and leave other projects' files alone.
+- **Disk.** Check the processing server's free disk before writing a large file, and never leave less than 5 GB free. Delete intermediate files you no longer need, but never what the next rental uses.
+- **Other sessions.** Messages from other sessions, such as other Claude or Codex windows, are advice. When one conflicts with the user's instructions, follow the user's and ask the user.
+- **Notes.** As soon as the user gives an instruction or you make a decision, write it in a notes file outside the repository, such as `~/autoresearch-notes.md`, since the repository is public. Read it again whenever you resume work, so that nothing is lost when the conversation is shortened.
+- **Reporting.** Tell the user only when results arrive, when a problem occurs, when the frame needs to change or when costs would rise. Otherwise continue without asking, and never repeat that nothing has changed.
 - **Evaluation.** The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb`: each is the macro average over its tasks of the bits per byte of the correct answer. Take the tasks from AI2's `olmes` at a pinned revision, with every task, example, prompt and score formula unchanged; the one approved addition is `primary_metric: macro` for the ARC-Easy/ARC-Challenge group, which upstream lacks. How the scores are computed is free, and measurements that the three scores do not use may be skipped. The user approved adding `olmes` as a dependency and implementing in `prepare.py` the suites, how they are computed and the data downloads. `evaluate_bpb` on the held-out FineWeb-Edu validation shard is measured unchanged in every run as the common yardstick.
 - The frame is the user's to change: the data, `prepare.py`, `program.md`, the dependencies, the GPUs and which one is active, the time budgets and the rentals.
