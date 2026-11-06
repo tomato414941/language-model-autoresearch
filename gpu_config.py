@@ -70,6 +70,8 @@ def read_config(path=None):
             raise ValueError("GPU identifiers must be simple directory names.")
         if not isinstance(values, dict) or not isinstance(values.get("gpu_name"), str):
             raise ValueError("Every GPU profile must name its GPU.")
+        if values.get("archive_delivery", "auto") not in ("auto", "ssh"):
+            raise ValueError("archive_delivery must be auto or ssh.")
     return data
 
 

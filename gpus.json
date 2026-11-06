@@ -22,6 +22,7 @@
     },
     "rtx5090": {
       "gpu_name": "RTX 5090",
+      "archive_delivery": "ssh",
       "device_name_pattern": "(?:GeForce )?RTX 5090",
       "training_seconds": 3600,
       "rental_seconds": 6300,

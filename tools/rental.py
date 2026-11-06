@@ -98,8 +98,12 @@ def artifact_directory(job):
 
 
 def r2_store(manifest):
-    """Use R2 for transport runtimes, whose bootstrap interpreter can fetch from it."""
-    return r2.settings() if manifest.get('transport') else None
+    """Select the prepared GPU's archive delivery without changing another GPU's policy."""
+    if not manifest.get('transport'):
+        return None
+    if profile_for_job(manifest).values.get('archive_delivery', 'auto') == 'ssh':
+        return None
+    return r2.settings()
 
 
 def verify_archives(manifest, artifacts, failure):

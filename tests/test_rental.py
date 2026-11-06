@@ -575,6 +575,67 @@ class RentalLifecycleTests(unittest.TestCase):
         (snapshot / 'runtime.json').write_text(json.dumps(manifest))
         return artifacts, manifest
 
+    def rtx_ssh_runtime(self):
+        profile = rental.get_profile('rtx5090')
+        artifacts = profile.artifacts_directory(self.root)
+        artifacts.mkdir(parents=True)
+        for name in ('gpu-bootstrap.tar.gz', 'gpu-env.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz'):
+            (artifacts / name).write_bytes(name.encode())
+        manifest = dict(gpu_id=profile.identifier, python_version='3.12.16',
+                        gpu_env_sha256=rental.digest(artifacts / 'gpu-env.tar.gz'),
+                        gpu_assets_sha256=rental.digest(artifacts / 'gpu-assets.tar.gz'))
+        manifest['transport'] = dict(format='python-xz-mt',
+            canonical_gpu_env_sha256=manifest['gpu_env_sha256'],
+            gpu_env_xz_sha256=rental.digest(artifacts / 'gpu-env.tar.xz'),
+            bootstrap_sha256=rental.digest(artifacts / 'gpu-bootstrap.tar.gz'))
+        snapshot = rental.job_path('fixture').parent
+        (snapshot / 'runtime.json').write_text(json.dumps(manifest))
+        (snapshot / 'source.tar.gz').write_bytes(b'source fixture')
+        job = dict(self.job, gpu_id=profile.identifier, gpu_name=profile.gpu_name,
+                   gpu_settings=profile.settings(), expires_at=time.time() + 6200,
+                   expected_eval_seconds=1800)
+        rental.save(job)
+        return artifacts, manifest, job
+
+    def test_validates_the_ssh_profiles_local_archives_when_an_object_store_is_configured(self):
+        artifacts, manifest, _ = self.rtx_ssh_runtime()
+        environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
+                           R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
+        with patch.dict(rental.os.environ, environment), \
+                patch.object(rental.r2, 'stored', return_value=15):
+            rental.verify_archives(manifest, artifacts, 'invalid local runtime')
+            (artifacts / 'gpu-env.tar.xz').write_bytes(b'changed local runtime')
+            with self.assertRaisesRegex(RuntimeError, 'invalid local runtime'):
+                rental.verify_archives(manifest, artifacts, 'invalid local runtime')
+
+    def test_delivers_the_ssh_profiles_archives_over_ssh_with_global_object_store_settings(self):
+        _, _, job = self.rtx_ssh_runtime()
+        commands = []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            commands.append(text)
+            if text.startswith('nvidia-smi'):
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA GeForce RTX 5090, 0, 0\n')
+            if 'kill -0' in text:
+                return subprocess.CompletedProcess(arguments, 0, stdout='exit 0')
+            if kwargs.get('stdout') is not None:
+                kwargs['stdout'].write(b'fixture artifact')
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
+                           R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
+        with patch.dict(rental.os.environ, environment), \
+                patch.object(rental.r2, 'stored', return_value=15), \
+                patch.object(rental.r2, 'fetch', return_value={'source': 'r2'}), \
+                patch.object(rental, 'ssh_connection', return_value=['ssh']), \
+                patch.object(rental, 'run', side_effect=command):
+            rental.execute(job, {}, self.root / 'key')
+        uploads = [Path(call.args[1]).name for call in self.transfer.call_args_list]
+        self.assertEqual(uploads, ['gpu-bootstrap.tar.gz', 'gpu-env.tar.xz', 'gpu-assets.tar.gz', 'source.tar.gz'])
+        self.assertEqual(sum('nohup bash gpu_run.sh' in text for text in commands), 1)
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
+
     def test_fetches_the_large_archives_from_r2_after_installing_its_fetcher(self):
         self.r2_runtime()
         events = []
