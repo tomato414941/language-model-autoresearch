@@ -2,6 +2,7 @@
 
 import argparse
 from array import array
+from bisect import bisect_right
 import base64
 import gzip
 import hashlib
@@ -154,6 +155,51 @@ class Documents:
         if row[0] != self.manifest["bos"]:
             raise ValueError("Every original document must retain its leading BOS token.")
         return row
+
+
+class ChainedDocuments:
+    """Read existing cache segments in the declared complete source-file order."""
+
+    def __init__(self, directories, tokenizer_sha256, source, verify_files=False):
+        self.caches = [Documents(path, tokenizer_sha256, verify_files=verify_files) for path in directories]
+        if not self.caches:
+            raise ValueError("Use at least one complete training cache segment.")
+        fields = ("filename", "bytes", "sha256")
+        expected = [{key: entry[key] for key in fields} for entry in source["files"]]
+        names = [entry["filename"] for entry in expected]
+        if not names or names != sorted(set(names)):
+            raise ValueError("Declare the original unique source files in their native order.")
+        actual, self.ends = [], []
+        shape = {key: self.caches[0].manifest[key] for key in ("vocabulary", "bos", "token_dtype")}
+        for cache in self.caches:
+            origin = cache.manifest["source"]
+            if any(origin.get(key) != source.get(key) for key in ("name", "repository", "revision", "license")):
+                raise ValueError("Every cache segment must belong to the same pinned training source.")
+            if any(cache.manifest[key] != value for key, value in shape.items()):
+                raise ValueError("Every cache segment must use the same token representation.")
+            actual.extend({key: entry[key] for key in fields} for entry in origin["files"])
+            self.ends.append((self.ends[-1] if self.ends else 0) + len(cache))
+        if actual != expected:
+            raise ValueError("Cache segments must cover the declared complete source prefix in order.")
+
+    def __len__(self):
+        return self.ends[-1]
+
+    def __getitem__(self, index):
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        segment = bisect_right(self.ends, index)
+        start = self.ends[segment - 1] if segment else 0
+        return self.caches[segment][index - start]
+
+    def batches(self, batch_size=128):
+        if batch_size <= 0:
+            raise ValueError("Use positive document batches.")
+        epoch = 1
+        while True:
+            for start in range(0, len(self), batch_size):
+                yield [self[index] for index in range(start, min(start + batch_size, len(self)))], epoch
+            epoch += 1
 
 
 def verify(records, tokenizer, directory, tokenizer_sha256, batch_size=113, progress=None):
