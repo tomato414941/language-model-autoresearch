@@ -20,6 +20,16 @@ class InstanceListingTests(unittest.TestCase):
         }):
             self.assertEqual(vast_control.list_instances(), [])
 
+    def test_uses_current_state_when_the_provider_omits_the_legacy_actual_status(self):
+        rows = [dict(id=1, actual_status=None, cur_state='running', intended_status='running'),
+                dict(id=2, actual_status='stopped', cur_state='running'),
+                dict(id=3, actual_status=None, cur_state='loading', intended_status='running'),
+                dict(id=4, actual_status=None, intended_status='running')]
+        with patch.object(vast_control, 'api', return_value={'instances': rows}):
+            observed = vast_control.list_instances()
+        self.assertEqual([row['actual_status'] for row in observed], ['running', 'stopped', 'loading', None])
+        self.assertEqual(observed[0]['cur_state'], 'running')
+
     def test_surfaces_failed_incomplete_and_inconsistent_observations(self):
         cases = [
             [{}],

@@ -313,6 +313,17 @@ def prepare_job(commit, baseline, description, expected_eval_seconds=180):
 def choose_offer(profile=None):
     profile = active_gpu() if profile is None else profile
     values = profile.values
+    unavailable_machines, unavailable_offers = set(), set()
+    for path in (ROOT / 'queue').glob('*/job.json'):
+        previous = json.loads(path.read_text())
+        requested = previous.get('creation_requested_at')
+        if (previous.get('error_type') == 'SSHUnavailable'
+                and requested is not None and time.time() - requested < 7 * 86400
+                and profile_for_job(previous).identifier == profile.identifier):
+            if previous.get('provider_machine_id') is not None:
+                unavailable_machines.add(previous['provider_machine_id'])
+            if previous.get('offer_id') is not None:
+                unavailable_offers.add(previous['offer_id'])
     query = {'external': {'eq': False}, 'rentable': {'eq': True},
              'rented': {'eq': False}, 'num_gpus': {'eq': 1},
              'gpu_name': {'eq': profile.gpu_name}, 'gpu_ram': {'gte': values['minimum_gpu_ram_mb']},
@@ -327,6 +338,8 @@ def choose_offer(profile=None):
               if row.get('num_gpus') == 1 and row.get('gpu_name') == profile.gpu_name
               and float(row.get('gpu_ram', 0)) >= values['minimum_gpu_ram_mb']
               and float(row.get('cuda_max_good', 0)) >= values['cuda_minimum']
+              and row.get('machine_id') not in unavailable_machines
+              and row.get('id') not in unavailable_offers
               and math.isfinite(row['dph_total']) and row['dph_total'] >= 0]
     if not offers:
         raise RuntimeError(f'No suitable single {profile.gpu_name} is available; no rental was requested.')

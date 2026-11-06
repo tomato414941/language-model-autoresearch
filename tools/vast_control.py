@@ -52,6 +52,9 @@ def list_instances(timeout=45):
             if not isinstance(identifier, int) or identifier in identifiers:
                 raise RuntimeError('The provider returned an inconsistent instance listing.')
             identifiers.add(identifier)
+            # Some responses omit the legacy status; rental readiness also verifies SSH.
+            if not row.get('actual_status') and row.get('cur_state'):
+                row['actual_status'] = row['cur_state']
             rows.append(row)
         token = result.get('next_token')
         if not token:
