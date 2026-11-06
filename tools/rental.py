@@ -691,6 +691,8 @@ def execute(job, instance, key):
         transfers.append(receipt)
         job['archive_transfers'] = transfers
         save(job)
+        if receipt.get('cleanup_error'):
+            remote('true', capture_output=True, text=True)
     job['transfer_completed_at'] = time.time()
     save(job)
     require_execution_time(job)
@@ -847,6 +849,17 @@ def start(job):
     except BaseException as error:
         job.update(phase='failed', error_type=type(error).__name__)
         job.setdefault('failure_kind', 'unknown')
+        try:
+            with (job_path(job['id']).parent / 'failure.log').open('a') as log:
+                log.write(type(error).__name__ + ': ' + str(error) + '\n')
+                for name in ('stdout', 'stderr'):
+                    value = getattr(error, name, None)
+                    if value:
+                        if isinstance(value, bytes):
+                            value = value.decode(errors='replace')
+                        log.write(name + ':\n' + value + '\n')
+        except OSError:
+            print('The failure details could not be saved; returning the same machine.', flush=True)
         save(job)
         raise
     finally:

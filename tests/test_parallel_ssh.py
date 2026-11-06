@@ -45,6 +45,20 @@ class ParallelArchiveTests(unittest.TestCase):
         self.assertEqual((self.root / 'restored').read_bytes(), self.payload)
         self.assertEqual(receipt['chunks'], 1)
 
+    def test_keeps_the_verified_extraction_and_records_a_failed_temporary_directory_cleanup(self):
+        wrapper = self.root / 'cleanup.sh'
+        wrapper.write_text(
+            '#!/bin/bash\nset -e\ncd ' + shlex.quote(str(self.root)) + '\n'
+            'if [[ "$1" == "rm -rf autoresearch/.transfer-"* ]]; then\n'
+            '  printf "fixture connection closed\\n" >&2\n  exit 255\n'
+            'else\n  exec bash -c "$1"\nfi\n')
+        self.connection = ['bash', str(wrapper)]
+        receipt = self.transfer()
+        self.assertEqual((self.root / 'restored').read_bytes(), self.payload)
+        self.assertEqual(receipt['sha256'], self.sha256)
+        self.assertEqual(receipt['cleanup_error']['returncode'], 255)
+        self.assertIn('fixture connection closed', receipt['cleanup_error']['stderr'])
+
     def test_limits_remote_temporary_bytes_while_the_extractor_is_slow(self):
         stopped = threading.Event()
         maximum = [0]

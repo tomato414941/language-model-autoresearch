@@ -85,6 +85,7 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
     pending = []
     checksum = hashlib.sha256()
     sent = 0
+    cleanup_error = None
 
     def uploaded(future):
         candidates = [future, received, *pending]
@@ -117,7 +118,15 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
         for future in pending:
             uploaded(future)
         received.result()
-        invoke('rm -rf ' + directory)
+        try:
+            invoke('rm -rf ' + directory)
+        except (OSError, subprocess.SubprocessError, TimeoutError) as error:
+            # Verified extraction is complete; retain a cleanup failure without discarding it.
+            details = getattr(error, 'stderr', None)
+            if isinstance(details, bytes):
+                details = details.decode(errors='replace')
+            cleanup_error = dict(type=type(error).__name__, returncode=getattr(error, 'returncode', None),
+                                 stderr=details)
     except BaseException:
         stopped.set()
         with lock:
@@ -133,5 +142,8 @@ def stream_archive(connection, path, unpack, *, sha256, timeout, workers=WORKERS
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
-    return dict(archive=path.name, sha256=sha256, bytes=sent, chunks=count,
-                payload_connections=min(workers, count), elapsed_seconds=time.monotonic() - started)
+    receipt = dict(archive=path.name, sha256=sha256, bytes=sent, chunks=count,
+                   payload_connections=min(workers, count), elapsed_seconds=time.monotonic() - started)
+    if cleanup_error is not None:
+        receipt['cleanup_error'] = cleanup_error
+    return receipt

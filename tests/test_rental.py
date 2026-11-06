@@ -441,6 +441,33 @@ class RentalLifecycleTests(unittest.TestCase):
         execute.assert_called_once()
         finalize.assert_called_once()
 
+    def test_preserves_the_full_transfer_failure_before_returning_the_machine(self):
+        _, manifest, job = self.rtx_runtime()
+        directory = rental.job_path('fixture').parent
+        manifest['container_image'] = 'fixture-image'
+        (directory / 'runtime.json').write_text(json.dumps(manifest))
+        job.update(phase='prepared', instance_id=None, max_hourly_cost=1,
+                   source_archive_sha256=rental.digest(directory / 'source.tar.gz'),
+                   runtime_manifest_sha256=rental.digest(directory / 'runtime.json'))
+        rental.save(job)
+        accepted = dict(rented=42, machine=70, price=0.5,
+                        ssh_config='fixture.config', ssh_host='vast-42')
+        error = subprocess.CalledProcessError(255, 'SSH archive transfer',
+                                             output=b'fixture output\n', stderr=b'fixture connection closed\n')
+        with patch.object(rental, 'check_daily_budget'), \
+                patch.object(rental, 'validate_environment'), patch.object(rental, 'arm_expiry'), \
+                patch.object(rental.vast_backend, 'rent', return_value=(accepted, [accepted])), \
+                patch.object(rental, 'execute', side_effect=error), \
+                patch.object(rental, 'finalize') as finalize, \
+                patch.dict(rental.os.environ, {'VAST_SSH_KEY': 'fixture-private-key'}):
+            with self.assertRaises(subprocess.CalledProcessError):
+                rental.start(job)
+        details = (directory / 'failure.log').read_text()
+        self.assertIn('fixture output', details)
+        self.assertIn('fixture connection closed', details)
+        self.assertEqual(rental.load('fixture')['phase'], 'failed')
+        finalize.assert_called_once()
+
     def test_records_machine_failures_when_the_gpu_preflight_fails(self):
         for response in (subprocess.CompletedProcess([], 0, stdout='NVIDIA H200, 0\n'),
                          subprocess.CalledProcessError(1, ['nvidia-smi'])):
@@ -674,10 +701,14 @@ class RentalLifecycleTests(unittest.TestCase):
                 launched.append(text)
             return subprocess.CompletedProcess(arguments, 0, stdout='')
 
+        def transfer(*args, **kwargs):
+            now[0] += 300
+            return dict(fixture='transfer')
+
         with patch.object(rental, 'ssh_connection', return_value=['ssh']):
             with patch.object(rental, 'run', side_effect=command):
                 with patch.object(rental.time, 'time', side_effect=lambda: now[0]):
-                    self.transfer.side_effect = lambda *args, **kwargs: now.__setitem__(0, now[0] + 300)
+                    self.transfer.side_effect = transfer
                     with self.assertRaises(TimeoutError):
                         rental.execute(job, {}, self.root / 'key')
         self.assertEqual(launched, [])
@@ -725,6 +756,11 @@ class RentalLifecycleTests(unittest.TestCase):
 
     def test_starts_training_once_when_one_observation_times_out(self):
         self.observe_one_launch()
+
+    def test_completes_on_a_reachable_machine_after_a_verified_transfers_cleanup_fails(self):
+        self.transfer.return_value = dict(cleanup_error=dict(returncode=255, stderr='fixture closed'))
+        self.observe_one_launch()
+        self.assertEqual(rental.load('fixture')['phase'], 'evaluated')
 
     def test_launches_the_native_encoding_cache_from_the_jobs_frozen_runtime(self):
         launched = self.observe_one_launch(encoding_cache=True)
@@ -913,7 +949,11 @@ class RentalLifecycleTests(unittest.TestCase):
             self.assertLessEqual(kwargs['expires'], 3500)
             return dict(archive=name, sha256=sha256, bytes=size, source='r2')
 
-        self.transfer.side_effect = lambda connection, path, *args, **kwargs: events.append('ssh ' + Path(path).name)
+        def transfer(connection, path, *args, **kwargs):
+            events.append('ssh ' + Path(path).name)
+            return dict(fixture='transfer')
+
+        self.transfer.side_effect = transfer
         environment = dict(R2_ENDPOINT='https://store.example', R2_BUCKET='runtime',
                            R2_ACCESS_KEY_ID='key', R2_SECRET_ACCESS_KEY='secret')
         with patch.dict(rental.os.environ, environment), \
