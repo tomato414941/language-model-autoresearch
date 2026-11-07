@@ -114,8 +114,8 @@ def prepare_qk(q, k, cos, sin):
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def squared_relu(x):
-    return F.relu(x).square()
+def gated_activation(up, gate):
+    return F.silu(gate) * up
 
 
 @torch.compile(dynamic=True, fullgraph=True)
@@ -138,6 +138,9 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # Adapt the learned attention scale from QKNorm while preserving the initial RMS/RoPE path.
+        # https://aclanthology.org/2020.findings-emnlp.379/
+        self.qk_log_scale = nn.Parameter(torch.zeros(self.n_head))
         self.ve_gate_channels = min(32, self.n_embd)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -167,6 +170,7 @@ class CausalSelfAttention(nn.Module):
 
         cos, sin = cos_sin
         q, k = prepare_qk(q, k, cos, sin)
+        q = q * self.qk_log_scale.exp().to(q.dtype).view(1, 1, self.n_head, 1)
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
@@ -178,14 +182,17 @@ class MLP(nn.Module):
     def __init__(self, config, n_embd=None):
         super().__init__()
         width = config.n_embd if n_embd is None else n_embd
-        self.c_fc = nn.Linear(width, 4 * width, bias=False)
-        self.c_proj = nn.Linear(4 * width, width, bias=False)
+        # Three projections with approximately the parent's parameter count.
+        # https://arxiv.org/abs/2002.05202
+        hidden = ((8 * width + 383) // 384) * 128
+        self.c_fc = nn.Linear(width, hidden, bias=False)
+        self.c_gate = nn.Linear(width, hidden, bias=False)
+        self.c_proj = nn.Linear(hidden, width, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = squared_relu(x)
-        x = self.c_proj(x)
-        return x
+        weight = torch.cat((self.c_fc.weight, self.c_gate.weight), dim=0)
+        up, gate = F.linear(x, weight).chunk(2, dim=-1)
+        return self.c_proj(gated_activation(up, gate))
 
 
 class Block(nn.Module):
@@ -263,7 +270,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            block.attn.qk_log_scale.zero_()
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         for i in range(self.config.n_layer):
@@ -322,7 +331,8 @@ class GPT(nn.Module):
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gain.numel() + self.backout_gain.numel())
+                          self.smear_gain.numel() + self.backout_gain.numel() +
+                          sum(block.attn.qk_log_scale.numel() for block in self.transformer.h))
         t = self.config.sequence_len
         attn_flops = 0
         for block, window_size in zip(self.transformer.h, self.window_sizes, strict=True):
@@ -337,9 +347,10 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim == 2)
         scalars = (self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                   self.smear_gate.weight.numel() + self.smear_gain.numel() + self.backout_gain.numel())
+                   self.smear_gate.weight.numel() + self.smear_gain.numel() + self.backout_gain.numel() +
+                   sum(block.attn.qk_log_scale.numel() for block in self.transformer.h))
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(parameter.numel() for parameter in self.parameters())
         return {
@@ -350,7 +361,8 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.008, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in self.transformer.h.parameters() if p.ndim == 2]
+        temperature_params = [block.attn.qk_log_scale for block in self.transformer.h]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -358,7 +370,8 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         mixing_params = [self.smear_gate.weight, self.smear_gain, self.backout_gain]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(mixing_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(mixing_params) + len(temperature_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -369,6 +382,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=mixing_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=temperature_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

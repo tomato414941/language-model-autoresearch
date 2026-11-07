@@ -43,19 +43,36 @@ class PointwiseFunctionTests(unittest.TestCase):
                     torch.testing.assert_close(q.grad, reference_q.grad, **tolerance)
                     torch.testing.assert_close(k.grad, reference_k.grad, **tolerance)
 
-    def test_preserves_squared_relu_values_and_gradients(self):
+    def test_preserves_the_mlp_activation_values_and_gradients(self):
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 namespace = load_model_namespace()
                 torch._dynamo.reset()
-                compiled = torch.compile(namespace['squared_relu'], backend='aot_eager',
-                                         dynamic=True, fullgraph=True)
-                values = torch.linspace(-3, 3, 70, dtype=dtype).reshape(2, 5, 7).requires_grad_()
-                actual = compiled(values)
-                torch.testing.assert_close(actual, F.relu(values).square(), rtol=0, atol=0)
-                actual.sum().backward()
-                expected_gradient = torch.where(values > 0, 2 * values, torch.zeros_like(values))
-                torch.testing.assert_close(values.grad, expected_gradient, rtol=0, atol=0)
+                if 'gated_activation' in namespace:
+                    compiled = torch.compile(namespace['gated_activation'], backend='aot_eager',
+                                             dynamic=True, fullgraph=True)
+                    up = torch.linspace(-3, 3, 70, dtype=dtype).reshape(2, 5, 7).requires_grad_()
+                    gate = torch.linspace(3, -3, 70, dtype=dtype).reshape(2, 5, 7).requires_grad_()
+                    sigmoid = torch.sigmoid(gate.detach().double())
+                    expected_activation = gate.detach().double() * sigmoid
+                    expected = expected_activation.to(dtype) * up.detach()
+                    actual = compiled(up, gate)
+                    tolerance = dict(rtol=0.02, atol=0.003) if dtype == torch.bfloat16 else dict(rtol=2e-5, atol=2e-6)
+                    torch.testing.assert_close(actual, expected, **tolerance)
+                    actual.sum().backward()
+                    expected_gate_gradient = (up.detach().double() * sigmoid * (
+                        1 + gate.detach().double() * (1 - sigmoid))).to(dtype)
+                    torch.testing.assert_close(up.grad, expected_activation.to(dtype), **tolerance)
+                    torch.testing.assert_close(gate.grad, expected_gate_gradient, **tolerance)
+                else:
+                    compiled = torch.compile(namespace['squared_relu'], backend='aot_eager',
+                                             dynamic=True, fullgraph=True)
+                    values = torch.linspace(-3, 3, 70, dtype=dtype).reshape(2, 5, 7).requires_grad_()
+                    actual = compiled(values)
+                    torch.testing.assert_close(actual, F.relu(values).square(), rtol=0, atol=0)
+                    actual.sum().backward()
+                    expected_gradient = torch.where(values > 0, 2 * values, torch.zeros_like(values))
+                    torch.testing.assert_close(values.grad, expected_gradient, rtol=0, atol=0)
 
     def test_returns_float32_softcapped_logits_and_preserves_gradients(self):
         for dtype in (torch.float32, torch.bfloat16):
@@ -85,7 +102,8 @@ class PointwiseFunctionTests(unittest.TestCase):
             graphs.append(graph)
             return backend(graph, inputs)
 
-        for name in ('prepare_qk', 'squared_relu', 'softcap_logits'):
+        activation = 'gated_activation' if 'gated_activation' in namespace else 'squared_relu'
+        for name in ('prepare_qk', activation, 'softcap_logits'):
             namespace[name] = torch.compile(namespace[name], backend=count_graph,
                                             dynamic=True, fullgraph=True)
         torch.manual_seed(42)
