@@ -1,13 +1,12 @@
 from gpu_config import active_gpu
 import ast
-import inspect
-from pathlib import Path
+from contextlib import closing
+from itertools import islice
 import types
 import unittest
 
 import torch
 
-import prepare
 from tools.cpu_smoke import load_model_namespace
 
 
@@ -43,6 +42,30 @@ def documents(split):
     for batch in range(10000):
         rows = [[1 + (batch * 19 + index) % 63] * size for index, size in enumerate(sizes)]
         yield rows, batch // 4 + 1
+
+
+def ordered_batches(batch, length, reader=documents):
+    """Construct shifted targets independently from the original document tokens."""
+    def tokens():
+        for rows, epoch in reader('train'):
+            for row in rows:
+                for token in (0, *row):
+                    yield token, epoch
+
+    stream = tokens()
+    previous, _ = next(stream)
+    try:
+        while True:
+            tagged = list(islice(stream, batch * length))
+            if len(tagged) < batch * length:
+                return
+            values = [token for token, _ in tagged]
+            inputs = torch.tensor([previous, *values[:-1]], dtype=torch.long).view(batch, length)
+            targets = torch.tensor(values, dtype=torch.long).view(batch, length)
+            previous = values[-1]
+            yield inputs, targets, tagged[-1][1]
+    finally:
+        stream.close()
 
 
 class DeferredStream:
@@ -117,28 +140,22 @@ def deferred_training_batches(source):
     function = next(node for node in ast.parse(source).body
                     if isinstance(node, ast.FunctionDef) and node.name == 'make_training_dataloader')
     exec(compile(ast.Module(body=[function], type_ignores=[]), '<deferred_training_loader>', 'exec'), namespace)
-    loader = namespace['make_training_dataloader'](ToyTokenizer(), 2, 17, buffer_size=23)
-    inputs, targets, epoch = next(loader)
-    # Match the training loop's initial synchronization and two accumulation passes.
-    for _ in range(2):
-        stream.synchronize()
+    with closing(namespace['make_training_dataloader'](ToyTokenizer(), 2, 17)) as loader:
+        inputs, targets, epoch = next(loader)
+        # Match the training loop's initial synchronization and two accumulation passes.
         for _ in range(2):
-            stream.consume(inputs, targets, epoch)
-            inputs, targets, epoch = next(loader)
-        stream.synchronize()
+            stream.synchronize()
+            for _ in range(2):
+                stream.consume(inputs, targets, epoch)
+                inputs, targets, epoch = next(loader)
+            stream.synchronize()
     return stream.observed
 
 
 class TrainingLoaderTests(unittest.TestCase):
     def test_preserves_each_training_batch_when_nonblocking_transfers_are_deferred(self):
-        reference_namespace = dict(torch=torch, _document_batches=documents)
-        function = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
-                                   reference_namespace)
-        reference = function(ToyTokenizer(), 2, 17, 'train', buffer_size=23)
-        expected = []
-        for _ in range(4):
-            x, y, epoch = next(reference)
-            expected.append((x.clone(), y.clone(), epoch))
+        with closing(ordered_batches(2, 17)) as reference:
+            expected = list(islice(reference, 4))
         source = active_gpu().train_source().read_text()
         actual = deferred_training_batches(source)
         self.assertEqual(len(actual), len(expected))
@@ -148,47 +165,42 @@ class TrainingLoaderTests(unittest.TestCase):
             torch.testing.assert_close(targets, expected_targets, rtol=0, atol=0)
             self.assertEqual(epoch, expected_epoch)
 
-    def test_selects_the_largest_fit_with_fifo_ties_and_the_shortest_overflow(self):
+    def test_closes_the_original_document_reader_after_prefetch_finishes(self):
         namespace = load_model_namespace()
-        index = namespace['LengthIndexedDocuments']()
-        first = [10] * 5
-        second = [11] * 5
-        shortest = [12] * 2
-        longest = [13] * 9
-        index.extend([first, shortest, second, longest])
-        self.assertIs(index.pop_best(7), first)
-        later = [14] * 5
-        index.extend([later])
-        self.assertIs(index.pop_best(5), second)
-        self.assertIs(index.pop_best(1), shortest)
-        self.assertIs(index.pop_best(8), later)
-        self.assertIs(index.pop_best(2), longest)
-        self.assertEqual(len(index), 0)
+        closed = []
 
-    def test_matches_native_inputs_targets_and_epochs_across_refills_crops_and_empty_texts(self):
-        for batch, length, buffer in ((2, 15, 8), (4, 16, 23), (3, 63, 17)):
-            with self.subTest(batch=batch, length=length, buffer=buffer):
+        def reader(split):
+            try:
+                yield from documents(split)
+            finally:
+                closed.append(True)
+
+        namespace['_document_batches'] = reader
+        candidate = cpu_allocations('make_training_dataloader',
+                                    active_gpu().train_source().read_text(), namespace)
+        with closing(candidate(ToyTokenizer(), 2, 17)) as loader:
+            next(loader)
+        self.assertEqual(closed, [True])
+
+    def test_preserves_original_tokens_bos_and_epochs_across_row_and_document_boundaries(self):
+        for batch, length in ((2, 15), (4, 16), (3, 63)):
+            with self.subTest(batch=batch, length=length):
                 namespace = load_model_namespace()
                 namespace['_document_batches'] = documents
                 candidate = cpu_allocations('make_training_dataloader',
                                             active_gpu().train_source().read_text(),
                                             namespace)
-                reference_namespace = dict(torch=torch, _document_batches=documents)
-                reference = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
-                                            reference_namespace)
-                actual_tokenizer, reference_tokenizer = ToyTokenizer(), ToyTokenizer()
-                actual = candidate(actual_tokenizer, batch, length, buffer_size=buffer)
-                expected = reference(reference_tokenizer, batch, length, 'train', buffer_size=buffer)
-                for _ in range(12):
-                    x, y, epoch = next(actual)
-                    expected_x, expected_y, expected_epoch = next(expected)
-                    torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
-                    torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
-                    self.assertEqual(epoch, expected_epoch)
-                    self.assertTrue(torch.all(x[:, 0] == 0))
-                self.assertEqual(actual_tokenizer.calls, reference_tokenizer.calls)
+                with closing(candidate(ToyTokenizer(), batch, length)) as actual, \
+                        closing(ordered_batches(batch, length)) as expected:
+                    for _ in range(12):
+                        x, y, epoch = next(actual)
+                        expected_x, expected_y, expected_epoch = next(expected)
+                        torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
+                        torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
+                        self.assertEqual(epoch, expected_epoch)
+                        torch.testing.assert_close(x[:, 1:], y[:, :-1], rtol=0, atol=0)
 
-    def test_preserves_wide_token_ids_and_document_order_through_refills_and_cropping(self):
+    def test_preserves_wide_token_ids_in_the_original_order_across_batches(self):
         wide_ids = (65535, 65536, 2**24 + 1, 2**31, 2**32 - 1)
 
         def wide_documents(split):
@@ -199,34 +211,30 @@ class TrainingLoaderTests(unittest.TestCase):
                 yield rows, batch // 3 + 1
 
         source = active_gpu().train_source().read_text()
-        for batch, length, buffer in ((2, 17, 13), (3, 63, 19)):
-            with self.subTest(batch=batch, length=length, buffer=buffer):
+        for batch, length in ((2, 17), (3, 63)):
+            with self.subTest(batch=batch, length=length):
                 namespace = load_model_namespace()
                 namespace['_document_batches'] = wide_documents
                 candidate = cpu_allocations('make_training_dataloader', source, namespace)
-                reference = cpu_allocations('make_dataloader', inspect.getsource(prepare.make_dataloader),
-                                            dict(torch=torch, _document_batches=wide_documents))
-                tokenizer, reference_tokenizer = ToyTokenizer(), ToyTokenizer()
-                actual = candidate(tokenizer, batch, length, buffer_size=buffer)
-                expected = reference(reference_tokenizer, batch, length, 'train', buffer_size=buffer)
                 seen = set()
-                for _ in range(24):
-                    inputs, targets, epoch = next(actual)
-                    expected_inputs, expected_targets, expected_epoch = next(expected)
-                    torch.testing.assert_close(inputs, expected_inputs, rtol=0, atol=0)
-                    torch.testing.assert_close(targets, expected_targets, rtol=0, atol=0)
-                    self.assertEqual(epoch, expected_epoch)
-                    seen.update(targets.reshape(-1).tolist())
+                with closing(candidate(ToyTokenizer(), batch, length)) as actual, \
+                        closing(ordered_batches(batch, length, wide_documents)) as expected:
+                    for _ in range(24):
+                        inputs, targets, epoch = next(actual)
+                        expected_inputs, expected_targets, expected_epoch = next(expected)
+                        torch.testing.assert_close(inputs, expected_inputs, rtol=0, atol=0)
+                        torch.testing.assert_close(targets, expected_targets, rtol=0, atol=0)
+                        self.assertEqual(epoch, expected_epoch)
+                        seen.update(targets.reshape(-1).tolist())
                 self.assertEqual(seen, {0, *wide_ids})
-                self.assertEqual(tokenizer.calls, reference_tokenizer.calls)
 
-    def test_trains_the_current_model_from_packed_batches_and_returns_the_declared_average(self):
+    def test_trains_the_model_from_contiguous_batches_and_evaluates_the_tail_average(self):
         namespace = load_model_namespace()
         namespace['_document_batches'] = documents
         candidate = cpu_allocations('make_training_dataloader',
                                     active_gpu().train_source().read_text(),
                                     namespace)
-        loader = candidate(ToyTokenizer(), 2, 17, buffer_size=23)
+        loader = candidate(ToyTokenizer(), 2, 17)
         torch.manual_seed(42)
         config = namespace['GPTConfig'](
             sequence_len=16, vocab_size=64, n_layer=2, n_head=5, n_kv_head=1, n_embd=80)
@@ -237,27 +245,29 @@ class TrainingLoaderTests(unittest.TestCase):
         optimizer = model.setup_optimizer(embedding_lr=0.03, matrix_lr=0.02)
         average = namespace['TailEMA'](model, start=0.8, tau=0.075, blend=0.6)
         compiled = torch.compile(model, backend='aot_eager', fullgraph=True, dynamic=False)
-        for step in range(2):
-            for _ in range(2):
-                inputs, targets, epoch = next(loader)
-                with torch.autocast('cpu', dtype=torch.bfloat16):
-                    loss = compiled(inputs, targets) / 2
-                self.assertTrue(torch.isfinite(loss))
-                loss.backward()
-            for parameter in model.parameters():
-                self.assertTrue(torch.isfinite(parameter.grad).all())
-            optimizer.step()
-            model.zero_grad(set_to_none=True)
-            average.update(0.8 + step * 0.1)
-        average.apply()
-        compiled.eval()
-        with torch.no_grad(), torch.autocast('cpu', dtype=torch.bfloat16):
-            logits = compiled(inputs)
-            losses = compiled(inputs, targets, reduction='none')
-        self.assertEqual(logits.shape, (2, 17, 64))
-        self.assertEqual(losses.numel(), targets.numel())
-        self.assertTrue(torch.isfinite(logits).all())
-        self.assertTrue(torch.isfinite(losses).all())
+        with closing(loader):
+            for step in range(2):
+                for _ in range(2):
+                    inputs, targets, epoch = next(loader)
+                    with torch.autocast('cpu', dtype=torch.bfloat16):
+                        loss = compiled(inputs, targets) / 2
+                    self.assertTrue(torch.isfinite(loss))
+                    loss.backward()
+                for parameter in model.parameters():
+                    self.assertIsNotNone(parameter.grad)
+                    self.assertTrue(torch.isfinite(parameter.grad).all())
+                optimizer.step()
+                model.zero_grad(set_to_none=True)
+                average.update(0.8 + step * 0.1)
+            average.apply()
+            compiled.eval()
+            with torch.no_grad(), torch.autocast('cpu', dtype=torch.bfloat16):
+                logits = compiled(inputs)
+                losses = compiled(inputs, targets, reduction='none')
+            self.assertEqual(logits.shape, (*inputs.shape, config.vocab_size))
+            self.assertEqual(losses.numel(), targets.numel())
+            self.assertTrue(torch.isfinite(logits).all())
+            self.assertTrue(torch.isfinite(losses).all())
 
 
 if __name__ == '__main__':

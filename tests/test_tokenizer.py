@@ -1,6 +1,6 @@
 from gpu_config import active_gpu
 import ast
-from pathlib import Path
+from contextlib import closing
 import unittest
 
 import tiktoken
@@ -85,14 +85,14 @@ class SmallBatchTokenizerTests(unittest.TestCase):
         namespace = load_model_namespace(SOURCE)
         namespace["_document_batches"] = documents
         loader = cpu_allocations("make_training_dataloader", SOURCE.read_text(), namespace)
-        reference = loader(self.reference, 2, 16, buffer_size=8)
-        candidate = loader(self.candidate, 2, 16, buffer_size=8)
-        for _ in range(32):
-            expected_x, expected_y, expected_epoch = next(reference)
-            x, y, epoch = next(candidate)
-            torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
-            torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
-            self.assertEqual(epoch, expected_epoch)
+        with closing(loader(self.reference, 2, 16)) as reference, \
+                closing(loader(self.candidate, 2, 16)) as candidate:
+            for _ in range(32):
+                expected_x, expected_y, expected_epoch = next(reference)
+                x, y, epoch = next(candidate)
+                torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
+                torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
+                self.assertEqual(epoch, expected_epoch)
 
 
 if __name__ == "__main__":

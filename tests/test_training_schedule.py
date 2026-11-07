@@ -1,7 +1,6 @@
 from gpu_config import active_gpu
 import ast
 import math
-from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -19,10 +18,14 @@ class TrainingScheduleTests(unittest.TestCase):
                  (isinstance(node, ast.FunctionDef) and node.name in functions)]
         cls.namespace = {'math': math}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), 'train.py', 'exec'), cls.namespace)
+        cls.warmup_tokens = 104857600
+
+    def warmup_end(self):
+        return math.ceil(self.warmup_tokens / self.namespace['TOTAL_BATCH_SIZE'])
 
     def test_warms_momentum_before_holding_a_plateau(self):
         momentum = self.namespace['get_muon_momentum']
-        warmup_end = 104857600 // self.namespace['TOTAL_BATCH_SIZE']
+        warmup_end = self.warmup_end()
         values = [momentum(step, 0.1) for step in (0, 100, 200, warmup_end - 1, warmup_end)]
         self.assertEqual(values, sorted(values))
         self.assertLess(values[0], values[-1])
@@ -33,26 +36,28 @@ class TrainingScheduleTests(unittest.TestCase):
         tokens = (0, 26214400, 52428800, 78643200, 104857600, 131072000)
         for progress in (0.1, 0.8, 1.0):
             schedules = []
-            for batch in (262144, 131072):
+            for batch in (262144, 131072, self.namespace['TOTAL_BATCH_SIZE']):
                 with patch.dict(self.namespace, TOTAL_BATCH_SIZE=batch):
                     schedules.append([momentum(count // batch, progress) for count in tokens])
-            self.assertEqual(schedules[0], schedules[1])
+            for schedule in schedules[1:]:
+                self.assertEqual(schedules[0], schedule)
 
     def test_keeps_nominal_matrix_decay_exposure_per_token(self):
         decay = self.namespace['get_weight_decay']
         for progress in (0.0, 0.2, 0.35, 0.8, 1.0):
             exposures = []
-            for batch in (262144, 131072):
+            for batch in (262144, 131072, self.namespace['TOTAL_BATCH_SIZE']):
                 with patch.dict(self.namespace, TOTAL_BATCH_SIZE=batch):
                     exposures.append(decay(progress) / batch)
-            self.assertEqual(exposures[0], exposures[1])
+            for exposure in exposures[1:]:
+                self.assertEqual(exposures[0], exposure)
 
     def test_lowers_momentum_during_the_learning_rate_cooldown(self):
         momentum = self.namespace['get_muon_momentum']
         learning_rate = self.namespace['get_lr_multiplier']
         start = 1.0 - self.namespace['WARMDOWN_RATIO']
         progress = [start + (1.0 - start) * part / 10 for part in range(11)]
-        values = [momentum(1000, point) for point in progress]
+        values = [momentum(self.warmup_end(), point) for point in progress]
         rates = [learning_rate(point) for point in progress]
         self.assertEqual(values, sorted(values, reverse=True))
         self.assertEqual(rates, sorted(rates, reverse=True))
@@ -68,7 +73,8 @@ class TrainingScheduleTests(unittest.TestCase):
         try:
             self.namespace['WARMDOWN_RATIO'] = 0.0
             momentum = self.namespace['get_muon_momentum']
-            self.assertEqual(momentum(1000, 0.0), momentum(1000, 1.0))
+            values = [momentum(self.warmup_end(), point) for point in (0.0, 0.5, 1.0)]
+            self.assertEqual(values, [0.97] * 3)
         finally:
             self.namespace['WARMDOWN_RATIO'] = previous
 
