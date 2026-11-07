@@ -24,7 +24,7 @@
       "device_name_pattern": "(?:GeForce )?RTX 5090",
       "training_seconds": 3600,
       "rental_seconds": 6300,
-      "max_hourly_cost": 1,
+      "max_hourly_cost": 0.7,
       "attention_backend": "sdpa",
       "kernel_repo": null,
       "kernel_revision": null,
