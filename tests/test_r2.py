@@ -9,26 +9,43 @@ import threading
 import unittest
 from unittest.mock import patch
 import urllib.parse
+import urllib.request
 
 from tools import r2
 
 
 class RangeHandler(http.server.BaseHTTPRequestHandler):
+    """An object store that serves one payload by byte ranges, whole objects by path, and takes objects by PUT."""
     payload = b''
     failures = []
     requests = []
+    objects = {}
 
     def do_GET(self):
         type(self).requests.append(self.headers.get('Range'))
         if type(self).failures:
             self.send_error(type(self).failures.pop(0))
             return
-        start, end = (int(value) for value in self.headers['Range'].split('=')[1].split('-'))
-        body = type(self).payload[start:end + 1]
-        self.send_response(206)
+        if self.headers.get('Range') is None:
+            body = type(self).objects[self.path.split('?')[0]]
+            self.send_response(200)
+        else:
+            start, end = (int(value) for value in self.headers['Range'].split('=')[1].split('-'))
+            body = type(self).payload[start:end + 1]
+            self.send_response(206)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        if type(self).failures:
+            self.send_error(type(self).failures.pop(0))
+            return
+        type(self).objects[self.path.split('?')[0]] = body
+        self.send_response(200)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def log_message(self, *args):
         pass
@@ -41,6 +58,7 @@ class R2Tests(unittest.TestCase):
         RangeHandler.payload = bytes(range(256)) * 4099
         RangeHandler.failures = []
         RangeHandler.requests = []
+        RangeHandler.objects = {}
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), RangeHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = 'http://127.0.0.1:%d/runtime/archive?X-Amz-Signature=secret' % self.server.server_port
@@ -55,7 +73,7 @@ class R2Tests(unittest.TestCase):
         values = dict(url=self.url, bytes=len(RangeHandler.payload), sha256=self.sha256,
                       workers=3, chunk_bytes=50000)
         values.update(settings)
-        return subprocess.run([sys.executable, str(r2.FETCHER)], input=json.dumps(values).encode(),
+        return subprocess.run([sys.executable, str(r2.TRANSFER), 'fetch'], input=json.dumps(values).encode(),
                               capture_output=True, timeout=60)
 
     def test_signs_presigned_urls_like_the_aws_reference_example(self):
@@ -115,7 +133,7 @@ class R2Tests(unittest.TestCase):
     def test_streams_from_the_rental_into_its_extractor_with_settings_on_standard_input(self):
         bootstrap = self.root / 'autoresearch/.bootstrap'
         bootstrap.mkdir(parents=True)
-        (bootstrap / 'r2_fetch.py').write_bytes(r2.FETCHER.read_bytes())
+        (bootstrap / 'r2_transfer.py').write_bytes(r2.TRANSFER.read_bytes())
         (bootstrap / 'python').symlink_to(sys.executable)
         connection = ['bash', '-c', 'cd "$1" && exec bash -c "$2"', '_', str(self.root)]
         config = dict(host='store.example', bucket='runtime', key_id='key', secret='secret')
@@ -128,13 +146,66 @@ class R2Tests(unittest.TestCase):
     def test_fails_the_transfer_when_the_extractor_rejects_the_stream(self):
         bootstrap = self.root / 'autoresearch/.bootstrap'
         bootstrap.mkdir(parents=True)
-        (bootstrap / 'r2_fetch.py').write_bytes(r2.FETCHER.read_bytes())
+        (bootstrap / 'r2_transfer.py').write_bytes(r2.TRANSFER.read_bytes())
         (bootstrap / 'python').symlink_to(sys.executable)
         connection = ['bash', '-c', 'cd "$1" && exec bash -c "$2"', '_', str(self.root)]
         config = dict(host='store.example', bucket='runtime', key_id='key', secret='secret')
         with patch.object(r2, 'presign', return_value=self.url), self.assertRaises(RuntimeError):
             r2.fetch(connection, config, 'gpu-env.tar.xz', self.sha256, len(RangeHandler.payload),
                      'head -c 10 > /dev/null; exit 2', '.bootstrap/python', timeout=60, expires=600)
+
+
+    def machine(self):
+        """A work folder that runs commands as a rented machine would, with the bootstrap's script and Python."""
+        bootstrap = self.root / 'autoresearch/.bootstrap'
+        bootstrap.mkdir(parents=True)
+        (bootstrap / 'r2_transfer.py').write_bytes(r2.TRANSFER.read_bytes())
+        (bootstrap / 'python').symlink_to(sys.executable)
+        return ['bash', '-c', 'cd "$1" && exec bash -c "$2"', '_', str(self.root)]
+
+    def local_presign(self, config, key, expires, method='GET'):
+        return 'http://127.0.0.1:%d/%s?X-Amz-Signature=secret' % (self.server.server_port, key)
+
+    def test_has_the_machine_send_each_file_it_has_and_name_those_it_lacks(self):
+        connection = self.machine()
+        (self.root / 'autoresearch/run.exit').write_text('0\n')
+        (self.root / 'autoresearch/final-model.pt').write_bytes(RangeHandler.payload)
+        config = dict(host='store.example', bucket='runtime', key_id='key', secret='secret')
+        keys = {name: 'results/job/' + name for name in ('run.exit', 'final-model.pt', 'olmes.log')}
+        with patch.object(r2, 'presign', side_effect=self.local_presign):
+            sent, absent = r2.send(connection, config, keys, '.bootstrap/python', timeout=60, expires=600)
+        self.assertEqual(sent['final-model.pt'], dict(bytes=len(RangeHandler.payload), sha256=self.sha256))
+        self.assertEqual(absent, ['olmes.log'])
+        self.assertEqual(RangeHandler.objects['/results/job/final-model.pt'], RangeHandler.payload)
+        self.assertEqual(RangeHandler.objects['/results/job/run.exit'], b'0\n')
+
+    def test_reports_a_refused_upload_without_revealing_its_url(self):
+        connection = self.machine()
+        (self.root / 'autoresearch/run.log').write_text('log')
+        RangeHandler.failures = [403]
+        config = dict(host='store.example', bucket='runtime', key_id='key', secret='secret')
+        with patch.object(r2, 'presign', side_effect=self.local_presign):
+            with self.assertRaises(RuntimeError) as failure:
+                r2.send(connection, config, {'run.log': 'results/job/run.log'}, '.bootstrap/python',
+                        timeout=60, expires=600)
+        self.assertIn('HTTP Error 403', str(failure.exception))
+        self.assertNotIn('X-Amz-Signature', str(failure.exception))
+
+    def test_keeps_a_downloaded_object_only_once_it_matches_what_the_machine_sent(self):
+        RangeHandler.objects['/results/job/final-model.pt'] = RangeHandler.payload
+        target = self.root / 'final-model.pt'
+        target.write_bytes(b'previous')
+        local = 'http://127.0.0.1:%d/results/job/final-model.pt' % self.server.server_port
+        config = dict(host='store.example', bucket='runtime', key_id='key', secret='secret')
+        with patch.object(r2, 'message', lambda *args, **kwargs: urllib.request.Request(local)):
+            with self.assertRaises(ValueError):
+                r2.download(config, 'results/job/final-model.pt', target, '0' * 64, len(RangeHandler.payload),
+                            r2.time.time() + 60)
+            self.assertEqual(target.read_bytes(), b'previous')
+            r2.download(config, 'results/job/final-model.pt', target, self.sha256, len(RangeHandler.payload),
+                        r2.time.time() + 60)
+        self.assertEqual(target.read_bytes(), RangeHandler.payload)
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), ['final-model.pt'])
 
 
 if __name__ == '__main__':

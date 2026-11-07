@@ -17,11 +17,9 @@ from gpu_config import active_gpu, source_files
 from tools.runtime_archives import archive_specs
 
 PYTHON_VERSION = "3.12.16"
-KERNEL_REPO = "varunneal/flash-attention-3"
 KERNEL_REVISION = "de87b9b5af06dd9984df595bef90b2eba44b181a"
 KERNEL_BUILD = "torch29-cxx11-cu128-x86_64-linux"
 CUDA_IMAGE = "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66"
-SOURCES = source_files()
 
 
 def run(command, **kwargs):
@@ -72,33 +70,6 @@ def pack_runtime_assets(artifacts):
         return pack(assets, artifacts / "gpu-assets.tar.gz")
 
 
-def refresh_assets():
-    """Repackage current tokenizer assets using the unchanged locked runtime and kernel cache."""
-    artifacts = active_gpu().artifacts_directory(ROOT)
-    path = artifacts / "runtime.json"
-    original = path.read_bytes()
-    manifest = json.loads(original)
-    for name in ("pyproject.toml", "uv.lock"):
-        if digest(ROOT / name) != manifest["sources"][name]:
-            raise RuntimeError("The dependencies changed; rebuild the locked runtime first.")
-    for name, sha256 in archive_specs(manifest):
-        if digest(artifacts / name) != sha256:
-            raise RuntimeError("A prepared runtime archive changed; retain its original provenance.")
-    tokenizer = verify_tokenizer()
-    history = artifacts / "history"
-    history.mkdir(exist_ok=True)
-    (history / ("runtime-" + hashlib.sha256(original).hexdigest() + ".json")).write_bytes(original)
-    manifest["gpu_assets_sha256"] = pack_runtime_assets(artifacts)
-    manifest.pop("nanochat_revision", None)
-    manifest.pop("core_bundle_sha256", None)
-    manifest.update(evaluation_metric="val_bpb", tokenizer=tokenizer,
-                    sources={name: digest(ROOT / name) for name in source_files()})
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
-    temporary.replace(path)
-    print("Repackaged tokenizer and offline kernel assets; the locked runtime is unchanged.", flush=True)
-
-
 def refresh_source_hashes():
     """Reuse verified runtime archives after changing only training or repository rules."""
     artifacts = active_gpu().artifacts_directory(ROOT)
@@ -120,15 +91,10 @@ def refresh_source_hashes():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--refresh-source-hashes", action="store_true")
-    mode.add_argument("--refresh-assets", action="store_true")
+    parser.add_argument("--refresh-source-hashes", action="store_true")
     args = parser.parse_args()
     if args.refresh_source_hashes:
         refresh_source_hashes()
-        return
-    if args.refresh_assets:
-        refresh_assets()
         return
     tokenizer = verify_tokenizer()
     uv = shutil.which("uv")
@@ -178,7 +144,7 @@ def main():
     manifest = dict(
         gpu_id=profile.identifier, python_version=PYTHON_VERSION,
         kernel_repo=profile.values["kernel_repo"], kernel_revision=profile.values["kernel_revision"],
-        container_image=CUDA_IMAGE, evaluation_metric="val_bpb", tokenizer=tokenizer,
+        container_image=CUDA_IMAGE, tokenizer=tokenizer,
         sources={name: digest(ROOT / name) for name in source_files()},
     )
     manifest["gpu_env_sha256"] = pack(runtime, artifacts / "gpu-env.tar.gz")

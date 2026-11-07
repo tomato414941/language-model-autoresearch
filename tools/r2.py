@@ -1,4 +1,4 @@
-"""Keep verified runtime archives in Cloudflare R2 and let a rental fetch them directly."""
+"""Keep verified runtime archives and a run's results in Cloudflare R2, which the rented machine reaches directly."""
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -16,13 +16,15 @@ import urllib.request
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
-FETCHER = Path(__file__).resolve().parent / 'r2_fetch.py'
+# The rented machine's side of every transfer; it gets presigned URLs, never an R2 key.
+TRANSFER = Path(__file__).resolve().parent / 'r2_transfer.py'
 VARIABLES = ('R2_ENDPOINT', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY')
 PART_BYTES = 128 * 1024 * 1024
 UPLOAD_WORKERS = 4
 FETCH_WORKERS = 8
 FETCH_CHUNK_BYTES = 32 * 1024 * 1024
-RECEIPT_PREFIX = 'r2-fetch-receipt '
+RECEIPT_PREFIX = 'r2-receipt '
+DOWNLOAD_BYTES = 1024 * 1024
 
 
 def settings():
@@ -66,46 +68,51 @@ def signature(secret, stamp, method, path, params, headers, payload_hash, region
     return hmac.new(key, text.encode(), hashlib.sha256).hexdigest()
 
 
-def presigned_url(host, path, key_id, secret, expires, stamp, region='auto'):
+def presigned_url(host, path, key_id, secret, expires, stamp, method='GET', region='auto'):
     params = {'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
               'X-Amz-Credential': key_id + '/' + stamp[:8] + '/' + region + '/s3/aws4_request',
               'X-Amz-Date': stamp, 'X-Amz-Expires': str(int(expires)), 'X-Amz-SignedHeaders': 'host'}
-    params['X-Amz-Signature'] = signature(secret, stamp, 'GET', path, params, {'host': host},
+    params['X-Amz-Signature'] = signature(secret, stamp, method, path, params, {'host': host},
                                           'UNSIGNED-PAYLOAD', region)
     return 'https://' + host + quote(path, safe='/-_.~') + '?' + canonical_query(params)
 
 
-def presign(config, key, expires):
-    """Let a rental read one object until its lease ends, without holding any R2 key."""
+def presign(config, key, expires, method='GET'):
+    """Let a rented machine read, or with PUT write, one object until its rental ends, without holding any R2 key."""
     if not 1 <= expires <= 604800:
         raise ValueError('A presigned URL lasts between one second and seven days.')
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     return presigned_url(config['host'], '/' + config['bucket'] + '/' + key,
-                         config['key_id'], config['secret'], expires, stamp)
+                         config['key_id'], config['secret'], expires, stamp, method)
+
+
+def message(config, method, key, params=None, headers=None, payload=b''):
+    """One request signed with the processing server's R2 key."""
+    params = params or {}
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    path = '/' + config['bucket'] + '/' + key
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    signed = {name.lower(): value for name, value in (headers or {}).items()}
+    signed.update({'host': config['host'], 'x-amz-content-sha256': payload_hash, 'x-amz-date': stamp})
+    authorization = ('AWS4-HMAC-SHA256 Credential=' + config['key_id'] + '/' + stamp[:8]
+                     + '/auto/s3/aws4_request, SignedHeaders=' + ';'.join(sorted(signed))
+                     + ', Signature=' + signature(config['secret'], stamp, method, path, params,
+                                                  signed, payload_hash))
+    sent = {name: value for name, value in signed.items() if name != 'host'}
+    sent.update({'authorization': authorization, 'content-type': 'application/octet-stream'})
+    url = 'https://' + config['host'] + quote(path, safe='/-_.~')
+    if params:
+        url += '?' + canonical_query(params)
+    return urllib.request.Request(url, method=method, headers=sent,
+                                  data=payload if method in ('PUT', 'POST') else None)
 
 
 def request(config, method, key, params=None, headers=None, body=None, timeout=120):
-    params = params or {}
     payload = body if body is not None else b''
-    payload_hash = hashlib.sha256(payload).hexdigest()
-    path = '/' + config['bucket'] + '/' + key
     for attempt in range(4):
-        stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-        signed = {name.lower(): value for name, value in (headers or {}).items()}
-        signed.update({'host': config['host'], 'x-amz-content-sha256': payload_hash, 'x-amz-date': stamp})
-        authorization = ('AWS4-HMAC-SHA256 Credential=' + config['key_id'] + '/' + stamp[:8]
-                         + '/auto/s3/aws4_request, SignedHeaders=' + ';'.join(sorted(signed))
-                         + ', Signature=' + signature(config['secret'], stamp, method, path, params,
-                                                      signed, payload_hash))
-        sent = {name: value for name, value in signed.items() if name != 'host'}
-        sent.update({'authorization': authorization, 'content-type': 'application/octet-stream'})
-        url = 'https://' + config['host'] + quote(path, safe='/-_.~')
-        if params:
-            url += '?' + canonical_query(params)
-        message = urllib.request.Request(url, method=method, headers=sent,
-                                         data=payload if method in ('PUT', 'POST') else None)
         try:
-            with urllib.request.urlopen(message, timeout=timeout) as response:
+            with urllib.request.urlopen(message(config, method, key, params, headers, payload),
+                                        timeout=timeout) as response:
                 return response.headers, response.read()
         except urllib.error.HTTPError as error:
             if error.code < 500 or attempt == 3:
@@ -114,6 +121,38 @@ def request(config, method, key, params=None, headers=None, body=None, timeout=1
             if attempt == 3:
                 raise
         time.sleep(2 ** attempt)
+
+
+def download(config, key, path, sha256, size, until):
+    """Write the object to the path by `until`, in place of what was there only once its size and SHA-256 digest
+    match."""
+    path = Path(path)
+    temporary = path.with_name(path.name + '.download')
+    checksum, written = hashlib.sha256(), 0
+
+    def remaining():
+        left = until - time.time()
+        if left <= 0:
+            raise TimeoutError('The download ran out of time.')
+        return left
+
+    try:
+        with urllib.request.urlopen(message(config, 'GET', key), timeout=remaining()) as response, \
+                temporary.open('wb') as output:
+            for block in iter(lambda: response.read(DOWNLOAD_BYTES), b''):
+                remaining()
+                checksum.update(block)
+                output.write(block)
+                written += len(block)
+        if written != size or checksum.hexdigest() != sha256:
+            raise ValueError('The object differs from what the machine sent.')
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def delete(config, key):
+    request(config, 'DELETE', key, timeout=30)
 
 
 def stored(config, name, sha256):
@@ -184,7 +223,7 @@ def fetch(connection, config, name, sha256, size, unpack, interpreter, *, timeou
     settings_text = json.dumps(dict(url=presign(config, object_key(sha256, name), expires), bytes=size,
                                     sha256=sha256, workers=workers, chunk_bytes=chunk_bytes))
     command = ('set -euo pipefail; ' + shlex.quote('autoresearch/' + interpreter)
-               + ' autoresearch/.bootstrap/r2_fetch.py | (' + unpack + ')')
+               + ' autoresearch/.bootstrap/r2_transfer.py fetch | (' + unpack + ')')
     started = time.monotonic()
     try:
         result = subprocess.run(connection + ['bash -c ' + shlex.quote(command)], input=settings_text.encode(),
@@ -201,3 +240,22 @@ def fetch(connection, config, name, sha256, size, unpack, interpreter, *, timeou
         raise RuntimeError('The rental reported a different archive than the frozen digest.')
     return dict(archive=name, sha256=sha256, bytes=size, source='r2', connections=receipt['connections'],
                 elapsed_seconds=time.monotonic() - started)
+
+
+def send(connection, config, keys, interpreter, *, timeout, expires):
+    """Have the machine put each named file of its work folder to its key, and give what it sent, by name with its
+    size and SHA-256 digest, and the names it does not have."""
+    # The presigned URLs travel on standard input, so they never appear in a command line or log.
+    settings = json.dumps(dict(files={name: presign(config, key, expires, 'PUT') for name, key in keys.items()}))
+    command = 'cd autoresearch && ' + shlex.quote(interpreter) + ' .bootstrap/r2_transfer.py send'
+    try:
+        result = subprocess.run(connection + [command], input=settings.encode(), stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError('The upload of the results ran out of time.') from None
+    lines = result.stderr.decode(errors='replace').splitlines()
+    receipts = [json.loads(line[len(RECEIPT_PREFIX):]) for line in lines if line.startswith(RECEIPT_PREFIX)]
+    if result.returncode or len(receipts) != 1:
+        detail = next((line for line in reversed(lines) if line.strip()), 'no diagnostics')
+        raise RuntimeError('The machine could not send its results to R2: ' + detail[:300])
+    return receipts[0]['sent'], receipts[0]['absent']

@@ -1,7 +1,7 @@
 import contextlib
 import csv
-import io
 import inspect
+import io
 import json
 import math
 from pathlib import Path
@@ -10,213 +10,187 @@ import tarfile
 import unittest
 from unittest.mock import patch
 
-from tools import measurement, record_run, rental
 from gpu_config import read_config
+import prepare
+from tools import jobs, measurement, record_run, rental
 
-SOURCE = ("DATA_REVISION = 'fixed'\nTIME_BUDGET = 1800\nEVAL_TOKENS = 20971520\n"
-          "def evaluate_bpb():\n    return DATA_REVISION, EVAL_TOKENS\n")
+SOURCE = ("BASE_URL = 'https://data.example/fixed'\nDATA_DIR = 'data'\nTIME_BUDGET = 1800\n"
+          "def download_data():\n    return BASE_URL, DATA_DIR\n"
+          "def evaluate_bpb():\n    return 'reference'\n")
 
 
 class RecordedDecisionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
-        self.patches = [patch.object(record_run, 'ROOT', self.root), patch.object(rental, 'ROOT', self.root)]
-        for item in self.patches:
-            item.start()
+        self.root_patch = patch.object(jobs, 'ROOT', self.root)
+        self.root_patch.start()
 
     def tearDown(self):
-        for item in reversed(self.patches):
-            item.stop()
+        self.root_patch.stop()
         self.directory.cleanup()
 
-    def make_run(self, identifier, bpb, baseline=False, *, rules='fixture rules',
-                 measurement_source=None, gpu_name='H100 SXM', runtime_changes=None,
-                 suites=None, metric='val_bpb', gpu_id=None, default_gpu=None):
+    def make_run(self, identifier, val_bpb=1.0, baseline=False, *, gpu_id='h100', default_gpu=None,
+                 rules='fixture rules', measurement_source=None, gpu_name=None, runtime_changes=None, suites=None):
+        """A finished OLMES job of the GPU track with its snapshot and collected results."""
+        config = read_config()
+        config['active_gpu'] = default_gpu or gpu_id
+        if gpu_id == 'rtx5090':
+            config['gpus'][gpu_id].update(training_seconds=900, rental_seconds=2700, max_hourly_cost=0.8)
+        values = config['gpus'][gpu_id]
+        settings = {name: values[name] for name in ('training_seconds', 'rental_seconds', 'max_hourly_cost')}
         job = dict(id=identifier, commit='a' * 40, baseline=baseline, description='fixture source URL',
-                   gpu_name=gpu_name, phase='evaluated', exit_code=0, metric=metric)
-        snapshot = rental.job_path(identifier).parent
+                   gpu_id=gpu_id, gpu_name=gpu_name or values['gpu_name'], gpu_settings=settings,
+                   model_source=f'gpus/{gpu_id}/train.py', phase='evaluated', exit_code=0,
+                   metric=measurement.OLMES_METRIC)
+        snapshot = jobs.job_path(identifier).parent
         source = snapshot / 'source'
         source.mkdir(parents=True)
-        files = {'train.py': 'MODEL_WIDTH = 64\n', 'program.md': rules,
-                 'prepare.py': measurement_source or SOURCE,
-                 'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n'}
-        if gpu_id:
-            config = read_config()
-            config['active_gpu'] = default_gpu or gpu_id
-            if gpu_id == 'rtx5090':
-                config['gpus'][gpu_id].update(training_seconds=900, rental_seconds=2700, max_hourly_cost=0.8)
-            values = config['gpus'][gpu_id]
-            job.update(gpu_id=gpu_id, gpu_name=values['gpu_name'], model_source=f'gpus/{gpu_id}/train.py',
-                       gpu_settings={name: values[name] for name in
-                                     ('training_seconds', 'rental_seconds', 'max_hourly_cost')})
-            files['gpus.json'] = json.dumps(config)
-            files[job['model_source']] = files['train.py']
-            files['prepare.py'] = files['prepare.py'].replace('1800', str(values['training_seconds']))
-        if metric == measurement.OLMES_METRIC:
-            files['prepare.py'] += '\n' + inspect.getsource(record_run.prepare.suites_improve)
-            files.update({'evaluation/pyproject.toml': 'native dependency fixture\n',
-                          'evaluation/uv.lock': 'fixed native dependencies\n'})
+        files = {job['model_source']: 'MODEL_WIDTH = 64\n', 'program.md': rules,
+                 'prepare.py': (measurement_source or SOURCE).replace('1800', str(settings['training_seconds']))
+                 + '\n' + inspect.getsource(prepare.suites_improve),
+                 'pyproject.toml': '[project]\nname = "fixture"\n', 'uv.lock': 'fixed dependencies\n',
+                 'evaluation/pyproject.toml': 'native dependency fixture\n',
+                 'evaluation/uv.lock': 'fixed native dependencies\n', 'gpus.json': json.dumps(config)}
         for name, content in files.items():
             (source / name).parent.mkdir(parents=True, exist_ok=True)
             (source / name).write_text(content)
-        job['source_sha256'] = {name: rental.digest(source / name) for name in files}
+        job['source_sha256'] = {name: jobs.digest(source / name) for name in files}
         with tarfile.open(snapshot / 'source.tar.gz', 'w:gz') as archive:
             for name in files:
                 archive.add(source / name, arcname=name)
-        job['source_archive_sha256'] = rental.digest(snapshot / 'source.tar.gz')
+        job['source_archive_sha256'] = jobs.digest(snapshot / 'source.tar.gz')
         runtime = dict.fromkeys(measurement.RUNTIME_FIELDS, 'fixed runtime')
-        if metric == measurement.OLMES_METRIC:
-            runtime.update(tokenizer={'tokenizer.pkl': 'fixture tokenizer'}, olmes=dict(
-                revision=record_run.prepare.OLMES_REVISION,
-                suites=['native qa', 'native math', 'native code'],
-                approved_config_fix={'arc:rc:bpb::olmes:full': {'primary_metric': 'macro'}},
-                native_datasets_sha256='fixed complete native datasets',
-                request_manifest_sha256='fixed full requests', leaf_tasks=109,
-                computation='correct_answer_only', computed_requests=99886,
-                examples=99886, requests=654536))
+        runtime.update(gpu_assets_sha256='fixed assets', tokenizer={'tokenizer.pkl': 'fixture tokenizer'}, olmes=dict(
+            revision=prepare.OLMES_REVISION, suites=['native qa', 'native math', 'native code'],
+            approved_config_fix={'arc:rc:bpb::olmes:full': {'primary_metric': 'macro'}},
+            native_datasets_sha256='fixed complete native datasets', request_manifest_sha256='fixed full requests',
+            leaf_tasks=109, computation='correct_answer_only', computed_requests=99886, examples=99886,
+            requests=654536))
         runtime.update(runtime_changes or {})
         (snapshot / 'runtime.json').write_text(json.dumps(runtime))
-        job['runtime_manifest_sha256'] = rental.digest(snapshot / 'runtime.json')
-        rental.save(job)
-        results = rental.results_directory(job) if gpu_id else self.root / 'results'
-        directory = results / 'runs' / identifier
+        job['runtime_manifest_sha256'] = jobs.digest(snapshot / 'runtime.json')
+        jobs.save(job)
+        directory = self.root / 'gpus' / gpu_id / 'results/runs' / identifier
         directory.mkdir(parents=True)
-        (directory / 'run.log').write_text(
-            f'val_bpb: {bpb:.17g}\npeak_vram_mb: 45056.0\n'
-            f'training_seconds: {rental.training_seconds(job) + 0.2}\n'
-            f'total_seconds: {rental.training_seconds(job) + 700:.1f}\n')
-        if metric == measurement.OLMES_METRIC:
-            values = suites or dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0)
-            with (directory / 'run.log').open('a') as log:
-                for name, value in values.items():
-                    log.write(f'{name}: {value:.17g}\n')
-            (directory / 'final-model.pt').write_bytes(b'own model fixture')
-            (directory / 'olmes-metrics.jsonl').write_text('{"synthetic_native_metrics": true}\n')
-            summary = dict(complete=True, olmes_revision=runtime['olmes']['revision'],
-                           approved_config_fix=runtime['olmes']['approved_config_fix'],
-                           model_source_sha256=job['source_sha256']['train.py'],
-                           native_request_manifest_sha256=runtime['olmes']['request_manifest_sha256'],
-                           tokenizer_sha256=runtime['tokenizer']['tokenizer.pkl'],
-                           suites=values, leaf_tasks=109, examples=99886, requests=654536,
-                           computation='correct_answer_only', computed_requests=99886,
-                           metrics_all_sha256=rental.digest(directory / 'olmes-metrics.jsonl'),
-                           checkpoint_sha256=rental.digest(directory / 'final-model.pt'))
-            (directory / 'olmes-summary.json').write_text(json.dumps(summary))
+        suites = suites or dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0)
+        log = (f'val_bpb: {val_bpb:.17g}\npeak_vram_mb: 45056.0\n'
+               f'training_seconds: {settings["training_seconds"] + 0.2}\n'
+               f'total_seconds: {settings["training_seconds"] + 700:.1f}\n')
+        log += ''.join(f'{name}: {value:.17g}\n' for name, value in suites.items())
+        (directory / 'run.log').write_text(log)
+        (directory / 'final-model.pt').write_bytes(b'own model fixture')
+        (directory / 'olmes-metrics.jsonl').write_text('{"synthetic_native_metrics": true}\n')
+        summary = dict(complete=True, olmes_revision=runtime['olmes']['revision'],
+                       approved_config_fix=runtime['olmes']['approved_config_fix'],
+                       model_source_sha256=job['source_sha256'][job['model_source']],
+                       native_request_manifest_sha256=runtime['olmes']['request_manifest_sha256'],
+                       tokenizer_sha256=runtime['tokenizer']['tokenizer.pkl'],
+                       suites=suites, leaf_tasks=109, examples=99886, requests=654536,
+                       computation='correct_answer_only', computed_requests=99886,
+                       metrics_all_sha256=jobs.digest(directory / 'olmes-metrics.jsonl'),
+                       checkpoint_sha256=jobs.digest(directory / 'final-model.pt'))
+        (directory / 'olmes-summary.json').write_text(json.dumps(summary))
         return job, directory
 
     def record(self, identifier):
         with contextlib.redirect_stdout(io.StringIO()):
             return record_run.record_run(identifier)
 
-    def rows(self):
-        with (self.root / 'results.tsv').open(newline='') as source:
+    def ledger(self, gpu='h100'):
+        return self.root / 'gpus' / gpu / 'results/decisions.json'
+
+    def rows(self, gpu='h100'):
+        with (self.root / 'gpus' / gpu / 'results.tsv').open(newline='') as source:
             return list(csv.reader(source, delimiter='\t'))
 
     def test_compares_and_exports_each_gpu_against_only_its_own_incumbent(self):
-        self.make_run('h100-baseline', 0.9, baseline=True, gpu_id='h100')
-        self.make_run('rtx-baseline', 2.0, baseline=True, gpu_id='rtx5090')
+        self.make_run('h100-baseline', baseline=True, suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        self.make_run('rtx-baseline', baseline=True, gpu_id='rtx5090', suites=dict(qa_bpb=2, math_bpb=2, code_bpb=200))
         self.record('h100-baseline')
         self.record('rtx-baseline')
-        self.make_run('rtx-gain', 1.8, gpu_id='rtx5090')
+        self.make_run('rtx-gain', gpu_id='rtx5090', suites=dict(qa_bpb=1.8, math_bpb=1.8, code_bpb=180))
         gained = self.record('rtx-gain')
         self.assertEqual((gained['status'], gained['incumbent']), ('keep', 'rtx-baseline'))
-        self.make_run('h100-loss', 1.0, gpu_id='h100')
+        self.make_run('h100-loss', suites=dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100))
         discarded = self.record('h100-loss')
         self.assertEqual((discarded['status'], discarded['incumbent']), ('discard', 'h100-baseline'))
-        for gpu, best, count in (('h100', 'h100-baseline', 2), ('rtx5090', 'rtx-gain', 2)):
+        for gpu, best in (('h100', 'h100-baseline'), ('rtx5090', 'rtx-gain')):
             folder = self.root / 'gpus' / gpu
             self.assertEqual(json.loads((folder / 'best.json').read_text())['id'], best)
-            records = json.loads((folder / 'results/decisions.json').read_text())
-            self.assertEqual(len(records), count)
+            records = json.loads(self.ledger(gpu).read_text())
+            self.assertEqual(len(records), 2)
             self.assertTrue(all(row['gpu_id'] == gpu for row in records))
-            with (folder / 'results.tsv').open() as stream:
-                self.assertEqual(len(list(csv.reader(stream, delimiter='\t'))), count + 1)
+            self.assertEqual(len(self.rows(gpu)), 3)
 
     def test_records_a_jobs_own_gpu_settings_when_the_shared_default_selects_the_other_gpu(self):
         for gpu, default in (('h100', 'rtx5090'), ('rtx5090', 'h100')):
             with self.subTest(gpu=gpu):
-                self.make_run(gpu + '-base', 1.0, baseline=True, gpu_id=gpu, default_gpu=default)
+                self.make_run(gpu + '-base', baseline=True, gpu_id=gpu, default_gpu=default)
                 self.assertEqual(self.record(gpu + '-base')['status'], 'keep')
-                self.make_run(gpu + '-gain', 0.9, gpu_id=gpu, default_gpu=default)
+                self.make_run(gpu + '-gain', gpu_id=gpu, default_gpu=default,
+                              suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
                 record = self.record(gpu + '-gain')
                 self.assertEqual((record['status'], record['incumbent']), ('keep', gpu + '-base'))
 
-    def test_imports_original_h100_logs_and_results_without_remeasuring_or_rewriting_history(self):
-        from tools import gpu_tracks
-        self.make_run('historical', 0.974083, baseline=True)
-        self.record('historical')
-        original = (self.root / 'results/decisions.json').read_bytes()
-        log = (self.root / 'results/runs/historical/run.log').read_bytes()
-        with patch.object(gpu_tracks, 'ROOT', self.root), contextlib.redirect_stdout(io.StringIO()):
-            gpu_tracks.initialize()
-            gpu_tracks.initialize()
-        self.assertEqual((self.root / 'results/decisions.json').read_bytes(), original)
-        self.assertEqual(json.loads((self.root / 'gpus/h100/results/decisions.json').read_text()), json.loads(original))
-        self.assertEqual((self.root / 'gpus/h100/results/runs/historical/run.log').read_bytes(), log)
-        self.assertEqual(json.loads((self.root / 'gpus/h100/best.json').read_text())['id'], 'historical')
-        self.assertEqual(json.loads((self.root / 'gpus/rtx5090/results/decisions.json').read_text()), [])
-        self.assertIsNone(json.loads((self.root / 'gpus/rtx5090/best.json').read_text()))
+    def test_resolves_the_frozen_training_budget_in_the_measurement(self):
+        source = ('from gpu_config import active_gpu\nTIME_BUDGET = active_gpu().settings()["training_seconds"]\n'
+                  'DATA_DIR = "data"\ndef evaluate_bpb():\n    return 1\n')
+        reference = measurement.prepare_semantics(source.replace('active_gpu().settings()["training_seconds"]',
+                                                                 '1800'), dict(training_seconds=3600))
+        self.assertEqual(measurement.prepare_semantics(source, dict(training_seconds=1800)), reference)
+        self.assertNotEqual(measurement.prepare_semantics(source, dict(training_seconds=900)), reference)
 
-    def test_recognizes_relocated_cache_and_resolved_budget_as_the_same_measurement(self):
-        old = ('import os\nCACHE_DIR = os.path.expanduser("~/.cache/autoresearch")\n'
-               'TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")\nTIME_BUDGET = 1800\n'
-               'def evaluate_bpb():\n    return TOKENIZER_DIR, 123\n')
-        new = old.replace('TIME_BUDGET = 1800', 'TIME_BUDGET = active_gpu().settings()["training_seconds"]')
-        new = 'from gpu_config import active_gpu\n' + new.replace(
-            'os.path.join(CACHE_DIR, "tokenizer")', 'str(active_gpu().cache_directory("tokenizer"))')
-        settings = dict(training_seconds=1800)
-        reference = measurement.prepare_semantics(old)
-        self.assertEqual(measurement.prepare_semantics(new, settings=settings), reference)
-        self.assertNotEqual(measurement.prepare_semantics(new.replace('123', '456'), settings=settings), reference)
-        self.assertNotEqual(measurement.prepare_semantics(new, settings=dict(training_seconds=900)), reference)
-
-    def test_records_one_complete_baseline_and_exports_reference_bpb_with_unmeasured_suites(self):
+    def test_records_one_complete_baseline_and_exports_its_suites_and_reference_bpb(self):
         self.make_run('baseline', 0.974083, baseline=True)
         first = self.record('baseline')
         self.assertEqual(first, self.record('baseline'))
         self.assertEqual(first['status'], 'keep')
         rows = self.rows()
+        self.assertEqual(rows[0], ['commit', 'qa_bpb', 'math_bpb', 'code_bpb', 'val_bpb', 'memory_gb', 'status',
+                                   'description'])
+        self.assertEqual([float(value) for value in rows[1][1:5]], [1.0, 1.0, 100.0, 0.974083])
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0], ['commit', 'qa_bpb', 'math_bpb', 'code_bpb', 'val_bpb', 'memory_gb', 'status', 'description'])
-        self.assertEqual(rows[1][1:4], ['NA', 'NA', 'NA'])
-        self.assertEqual(float(rows[1][4]), first['val_bpb'])
-        self.assertEqual(len(rows[1]), 8)
 
-    def test_adopts_any_lower_bpb_and_discards_equal_or_higher_bpb(self):
-        self.make_run('baseline', 0.974083, baseline=True)
+    def test_decides_by_the_mean_suite_improvement_rate_and_records_val_only_as_reference(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
-        lower = math.nextafter(0.974083, -math.inf)
-        self.make_run('small-gain', lower)
-        self.assertEqual(self.record('small-gain')['status'], 'keep')
-        for identifier, bpb in (('tie', lower), ('higher', 0.98)):
-            self.make_run(identifier, bpb)
-            self.assertEqual(self.record(identifier)['status'], 'discard')
-        self.make_run('later', 0.97)
+        self.make_run('gain', 2.0, suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=105.0))
+        gained = self.record('gain')
+        self.assertEqual((gained['status'], gained['val_bpb']), ('keep', 2.0))
+        self.make_run('loss', 0.1, suites=dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0))
+        self.assertEqual(self.record('loss')['status'], 'discard')
+        self.assertEqual([float(value) for value in self.rows()[-2][1:4]], [0.9, 0.9, 105])
+        self.make_run('later', suites=dict(qa_bpb=0.8, math_bpb=0.9, code_bpb=105.0))
         later = self.record('later')
-        self.assertEqual((later['status'], later['incumbent']), ('keep', 'small-gain'))
+        self.assertEqual((later['status'], later['incumbent']), ('keep', 'gain'))
 
-    def test_records_missing_and_nonfinite_bpb_as_failed_attempts(self):
-        self.make_run('baseline', 1.0, baseline=True)
+    def test_records_complete_results_with_an_unavailable_reference_val(self):
+        self.make_run('baseline', math.nan, baseline=True)
+        record = self.record('baseline')
+        self.assertEqual((record['status'], record['val_bpb']), ('keep', None))
+        self.assertEqual(self.rows()[-1][4], '0.000000')
+
+    def test_requires_complete_artifacts_and_finite_positive_suite_values(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
-        for identifier, bpb in (('nan', math.nan), ('inf', math.inf), ('missing', 0.5)):
-            _, directory = self.make_run(identifier, bpb)
-            if identifier == 'missing':
-                path = directory / 'run.log'
-                path.write_text(path.read_text().replace('val_bpb:', 'unavailable:'))
-            record = self.record(identifier)
-            self.assertEqual(record['status'], 'crash')
-            self.assertIsNone(record['val_bpb'])
+        for identifier, values in (
+            ('missing', dict(qa_bpb=0.9, math_bpb=0.9)),
+            ('nonfinite', dict(qa_bpb=0.9, math_bpb=math.nan, code_bpb=90)),
+            ('zero', dict(qa_bpb=0.9, math_bpb=0, code_bpb=90)),
+        ):
+            self.make_run(identifier, suites=values)
+            self.assertEqual(self.record(identifier)['status'], 'crash')
             self.assertEqual(self.rows()[-1][1], '0.000000')
-
-    def test_records_a_failed_exit_even_when_it_printed_a_lower_bpb(self):
-        self.make_run('baseline', 1.0, baseline=True)
-        self.record('baseline')
-        self.make_run('failed', 0.5)
-        rental.save(dict(id='failed', phase='failed', exit_code=1))
-        failed = self.record('failed')
-        self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.5))
-        self.assertEqual(self.rows()[-1][1], '0.000000')
+        _, directory = self.make_run('partial', suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        path = directory / 'olmes-summary.json'
+        summary = json.loads(path.read_text())
+        summary['complete'] = False
+        path.write_text(json.dumps(summary))
+        self.assertEqual(self.record('partial')['status'], 'crash')
+        _, directory = self.make_run('lost-checkpoint', suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        (directory / 'final-model.pt').unlink()
+        self.assertEqual(self.record('lost-checkpoint')['status'], 'crash')
 
     def test_requires_complete_finite_summary_metrics_and_fixed_time_budgets(self):
         cases = [
@@ -224,221 +198,141 @@ class RecordedDecisionTests(unittest.TestCase):
             ('late', 'total_seconds: 2500.0', 'total_seconds: 3600.1'),
             ('missing-memory', 'peak_vram_mb: 45056.0', 'unavailable: 45056.0'),
             ('bad-memory', 'peak_vram_mb: 45056.0', 'peak_vram_mb: nan'),
-            ('duplicate', 'val_bpb: 1', 'val_bpb: 1\nval_bpb: 0.5'),
+            ('duplicate', 'qa_bpb: 1', 'qa_bpb: 1\nqa_bpb: 0.5'),
         ]
         for identifier, old, new in cases:
             with self.subTest(identifier=identifier):
-                _, directory = self.make_run(identifier, 1.0, baseline=True)
+                _, directory = self.make_run(identifier, baseline=True)
                 path = directory / 'run.log'
                 path.write_text(path.read_text().replace(old, new))
                 self.assertEqual(self.record(identifier)['status'], 'crash')
 
-    def test_requires_a_new_baseline_when_data_changes_and_then_compares_to_it_once(self):
-        self.make_run('baseline', 1.0, baseline=True)
+    def test_preserves_the_reference_val_of_a_failed_run(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
-        changed = SOURCE.replace("'fixed'", "'changed'")
-        self.make_run('candidate', 0.9, measurement_source=changed)
+        _, directory = self.make_run('failure', 0.95)
+        (directory / 'run.log').write_text('reference_val_bpb: 0.95\nNative evaluation failed.\n')
+        jobs.save(dict(id='failure', phase='failed', exit_code=1))
+        failed = self.record('failure')
+        self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.95))
+        self.assertEqual(self.rows()[-1][1:4], ['0.000000'] * 3)
+
+    def test_requires_a_new_baseline_when_data_changes_and_then_compares_to_it_once(self):
+        self.make_run('baseline', baseline=True)
+        self.record('baseline')
+        changed = SOURCE.replace('fixed', 'changed')
+        gain = dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90)
+        self.make_run('candidate', measurement_source=changed, suites=gain)
         with self.assertRaises(ValueError):
             self.record('candidate')
-        self.make_run('new-baseline', 1.1, baseline=True, measurement_source=changed)
+        self.make_run('new-baseline', baseline=True, measurement_source=changed)
         self.assertEqual(self.record('new-baseline')['status'], 'keep')
-        self.make_run('new-candidate', 1.0, measurement_source=changed)
+        self.make_run('new-candidate', measurement_source=changed, suites=gain)
         record = self.record('new-candidate')
         self.assertEqual((record['status'], record['incumbent']), ('keep', 'new-baseline'))
-        self.make_run('duplicate-baseline', 0.5, baseline=True, measurement_source=changed)
+        self.make_run('duplicate-baseline', baseline=True, measurement_source=changed)
         with self.assertRaises(ValueError):
             self.record('duplicate-baseline')
 
-    def test_reuses_historical_bpb_after_a_rule_change_while_preserving_the_original_record(self):
-        original = SOURCE + "CORE_MIN_DELTA = .01\ndef core_improves(a, b):\n    return a - b >= CORE_MIN_DELTA\ndef evaluate_core():\n    return 22\n"
-        self.make_run('baseline', 0.974083, baseline=True, measurement_source=original)
+    def test_compares_across_a_rule_change_and_refuses_a_second_baseline_for_it(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
-        ledger = self.root / 'results/decisions.json'
-        legacy = json.loads(ledger.read_text())
-        legacy[0].update(core_metric=0.10065166465157924, measurement={'id': 'legacy', 'definition': {'version': 1}})
-        historical = self.root / 'results/runs/baseline/core.json'
-        historical.write_text('{"historical": true}\n')
-        legacy[0]['artifacts']['core.json'] = rental.digest(historical)
-        ledger.write_text(json.dumps(legacy))
-        preserved = ledger.read_bytes()
-        self.record('baseline')
-        self.assertEqual(ledger.read_bytes(), preserved)
-        self.make_run('candidate', 0.974082, rules='BPB only; measure once')
-        candidate = self.record('candidate')
-        self.assertEqual((candidate['status'], candidate['incumbent']), ('keep', 'baseline'))
-        self.assertEqual(json.loads(ledger.read_text())[0], legacy[0])
-        self.assertEqual(rental.digest(historical), legacy[0]['artifacts']['core.json'])
-        self.make_run('repeat-baseline', 0.5, baseline=True, rules='another rule change')
+        self.make_run('candidate', rules='measure once', suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        self.assertEqual(self.record('candidate')['status'], 'keep')
+        self.make_run('repeat-baseline', baseline=True, rules='another rule change')
         with self.assertRaises(ValueError):
             self.record('repeat-baseline')
 
-    def test_requires_matching_evaluation_time_gpu_and_runtime(self):
-        self.make_run('baseline', 1.0, baseline=True)
+    def test_requires_matching_data_time_gpu_runtime_and_evaluation(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
         variants = [
-            ('evaluation', {'measurement_source': SOURCE.replace('20971520', '10485760')}),
-            ('time', {'measurement_source': SOURCE.replace('1800', '900')}),
+            ('data', {'measurement_source': SOURCE.replace("'data'", "'other-data'")}),
+            ('time', {'measurement_source': SOURCE.replace('TIME_BUDGET = 1800', 'TIME_BUDGET = 1800 + 1')}),
             ('gpu', {'gpu_name': 'different GPU'}),
             ('runtime', {'runtime_changes': {'kernel_revision': 'different kernel'}}),
+            ('evaluation', {'runtime_changes': {'olmes': dict(
+                revision='another revision', suites=['native qa', 'native math', 'native code'],
+                approved_config_fix={}, native_datasets_sha256='other datasets', request_manifest_sha256='other',
+                leaf_tasks=109, examples=99886, requests=654536)}}),
         ]
         for name, changes in variants:
             with self.subTest(name=name):
-                self.make_run(name, 0.9, **changes)
+                self.make_run(name, suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90), **changes)
                 with self.assertRaises(ValueError):
                     self.record(name)
 
-    def test_tracks_transitive_byte_counting_and_data_source_changes(self):
-        original = SOURCE.replace('return DATA_REVISION, EVAL_TOKENS',
-                                  'return DATA_REVISION, EVAL_TOKENS, byte_count()')
-        original += 'def byte_count():\n    return 1\n'
-        self.make_run('baseline', 1.0, baseline=True, measurement_source=original)
+    def test_tracks_transitive_data_source_changes(self):
+        original = SOURCE.replace('return BASE_URL, DATA_DIR', 'return BASE_URL, DATA_DIR, shard_name()')
+        original += 'def shard_name():\n    return "shard-1"\n'
+        self.make_run('baseline', baseline=True, measurement_source=original)
         self.record('baseline')
-        self.make_run('candidate', 0.9, measurement_source=original.replace('return 1\n', 'return 2\n'))
+        self.make_run('candidate', measurement_source=original.replace('shard-1', 'shard-2'),
+                      suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
         with self.assertRaises(ValueError):
             self.record('candidate')
 
-    def test_accepts_a_replacement_tokenizer_under_the_same_fixed_bpb_evaluation(self):
-        self.make_run('baseline', 1.0, baseline=True, runtime_changes={'gpu_assets_sha256': 'first tokenizer'})
+    def test_accepts_a_replacement_tokenizer_under_the_same_measurement(self):
+        self.make_run('baseline', baseline=True, runtime_changes={'gpu_assets_sha256': 'first tokenizer'})
         baseline = self.record('baseline')
-        self.make_run('candidate', 0.9, runtime_changes={'gpu_assets_sha256': 'different tokenizer'})
+        self.make_run('candidate', runtime_changes={'gpu_assets_sha256': 'different tokenizer'},
+                      suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
         candidate = self.record('candidate')
         self.assertEqual(candidate['status'], 'keep')
         self.assertEqual(candidate['measurement'], baseline['measurement'])
 
     def test_checks_archived_source_and_runtime_against_their_recorded_hashes(self):
-        self.make_run('baseline', 1.0, baseline=True)
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
         for name, filename in (('source', 'source.tar.gz'), ('runtime', 'runtime.json')):
             with self.subTest(name=name):
-                self.make_run(name, 0.9)
-                path = rental.job_path(name).parent / filename
+                self.make_run(name)
+                path = jobs.job_path(name).parent / filename
                 path.write_bytes(path.read_bytes() + b'changed')
                 with self.assertRaises(ValueError):
                     self.record(name)
 
     def test_checks_a_previously_recorded_log_before_exporting_it_again(self):
-        self.make_run('baseline', 1.0, baseline=True)
+        _, directory = self.make_run('baseline', baseline=True)
         self.record('baseline')
-        (self.root / 'results/runs/baseline/run.log').write_text('altered log')
+        (directory / 'run.log').write_text('altered log')
         with self.assertRaises(ValueError):
             self.record('baseline')
 
     def test_observes_an_unfinished_job_without_recording_a_failure(self):
-        self.make_run('baseline', 1.0, baseline=True)
-        rental.save(dict(id='baseline', phase='running', exit_code=None))
+        self.make_run('baseline', baseline=True)
+        jobs.save(dict(id='baseline', phase='running', exit_code=None))
         with self.assertRaises(ValueError):
             self.record('baseline')
 
-    def test_records_once_after_the_machine_is_returned_and_exports_the_bpb_decision(self):
-        self.make_run('baseline', 1.0, baseline=True)
+    def test_records_once_after_the_machine_is_returned_and_exports_the_decision(self):
+        self.make_run('baseline', baseline=True)
         self.record('baseline')
-        self.make_run('candidate', 0.9)
-        rental.save(dict(id='candidate', instance_id=42))
-        def give_back(job):
-            rental.save(dict(id=job['id'], deleted_at=1100))
+        self.make_run('candidate', suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
+        jobs.save(dict(id='candidate', instance_id=42, label='autoresearch-h100-candidate'))
+        returned = []
+
         def record(command):
-            self.assertEqual(rental.load(command[-1])['deleted_at'], 1100)
+            self.assertEqual(returned[-1], 'autoresearch-h100-candidate')
+            self.assertIn('returned_at', jobs.load(command[-1]))
             return self.record(command[-1])
-        with patch.object(rental.vast_backend, 'command'), \
-                patch.object(rental, 'return_machines', side_effect=give_back):
-            with patch.object(rental, 'run', side_effect=record):
-                for _ in range(2):
-                    rental.finalize(rental.load('candidate'))
-        records = json.loads((self.root / 'results/decisions.json').read_text())
+
+        with patch.object(rental.vast_backend, 'note'), \
+                patch.object(rental.vast_backend, 'give_back', side_effect=returned.append), \
+                patch.object(rental, 'run', side_effect=record):
+            rental.finalize(jobs.load('candidate'))
+            rental.finalize(jobs.load('candidate'))
+        records = json.loads(self.ledger().read_text())
         self.assertEqual(len(records), 2)
-        self.assertEqual((records[-1]['status'], records[-1]['val_bpb']), ('keep', 0.9))
+        self.assertEqual(records[-1]['status'], 'keep')
         self.assertEqual(self.rows()[-1][6], 'keep')
 
-    def test_decides_by_the_mean_suite_improvement_rate_and_records_val_only_as_reference(self):
-        native = measurement.OLMES_METRIC
-        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
-        self.record('native-baseline')
-        self.make_run('native-gain', 2.0, metric=native,
-                      suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=105.0))
-        gained = self.record('native-gain')
-        self.assertEqual((gained['status'], gained['val_bpb']), ('keep', 2.0))
-        self.make_run('native-loss', 0.1, metric=native,
-                      suites=dict(qa_bpb=1.0, math_bpb=1.0, code_bpb=100.0))
-        self.assertEqual(self.record('native-loss')['status'], 'discard')
-        self.assertEqual([float(value) for value in self.rows()[-2][1:4]], [0.9, 0.9, 105])
-
-    def test_records_complete_native_results_with_an_unavailable_reference_val(self):
-        self.make_run('native-baseline', math.nan, baseline=True, metric=measurement.OLMES_METRIC)
-        record = self.record('native-baseline')
-        self.assertEqual((record['status'], record['val_bpb']), ('keep', None))
-        self.assertEqual(self.rows()[-1][4], '0.000000')
-
-    def test_requires_complete_native_artifacts_and_finite_positive_suite_values(self):
-        native = measurement.OLMES_METRIC
-        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
-        self.record('native-baseline')
-        for identifier, values in (
-            ('missing', dict(qa_bpb=0.9, math_bpb=0.9)),
-            ('nonfinite', dict(qa_bpb=0.9, math_bpb=math.nan, code_bpb=90)),
-            ('zero', dict(qa_bpb=0.9, math_bpb=0, code_bpb=90)),
-        ):
-            self.make_run(identifier, 0.5, metric=native, suites=values)
-            self.assertEqual(self.record(identifier)['status'], 'crash')
-        _, directory = self.make_run('partial', 0.5, metric=native,
-                                     suites=dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90))
-        path = directory / 'olmes-summary.json'
-        summary = json.loads(path.read_text())
-        summary['complete'] = False
-        path.write_text(json.dumps(summary))
-        self.assertEqual(self.record('partial')['status'], 'crash')
-
     def test_uses_the_suite_decision_saved_before_the_measurement(self):
-        native = measurement.OLMES_METRIC
-        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
-        self.record('native-baseline')
-        self.make_run('native-gain', 1.0, metric=native,
-                      suites=dict(qa_bpb=0.99, math_bpb=0.99, code_bpb=99))
-        with patch.object(record_run.prepare, 'suites_improve', return_value=False):
-            self.assertEqual(self.record('native-gain')['status'], 'keep')
-
-    def test_compares_the_first_native_candidates_on_their_shared_val_then_uses_all_suites(self):
-        self.make_run('old-baseline', 0.974083, baseline=True)
-        self.record('old-baseline')
-        native = measurement.OLMES_METRIC
-        runtime = {'gpu_env_sha256': 'combined training and isolated evaluation',
-                   'training_gpu_env_sha256': 'fixed runtime'}
-        self.make_run('first-native-loss', 0.98, metric=native, runtime_changes=runtime)
-        lost = self.record('first-native-loss')
-        self.assertEqual((lost['status'], lost['decision_metric']), ('discard', 'val_bpb'))
-        self.make_run('first-native-gain', 0.97, metric=native, runtime_changes=runtime)
-        gained = self.record('first-native-gain')
-        self.assertEqual((gained['status'], gained['decision_metric']), ('keep', 'val_bpb'))
-        self.make_run('second-native', 0.99, metric=native, runtime_changes=runtime,
-                      suites=dict(qa_bpb=0.99, math_bpb=0.99, code_bpb=99))
-        second = self.record('second-native')
-        self.assertEqual((second['status'], second['decision_metric']), ('keep', native))
-
-    def test_keeps_the_existing_baseline_when_only_native_evaluation_is_added(self):
-        self.make_run('old-baseline', 0.974083, baseline=True)
-        self.record('old-baseline')
-        self.make_run('duplicate-native', 0.97, baseline=True, metric=measurement.OLMES_METRIC)
-        with self.assertRaises(ValueError):
-            self.record('duplicate-native')
-
-    def test_requires_a_complete_native_evaluation_and_common_val_for_the_first_candidate(self):
-        self.make_run('old-baseline', 0.974083, baseline=True)
-        self.record('old-baseline')
-        for identifier, val, suites in (
-            ('missing-reference', math.nan, dict(qa_bpb=0.9, math_bpb=0.9, code_bpb=90)),
-            ('missing-suite', 0.9, dict(qa_bpb=0.9, math_bpb=0.9)),
-        ):
-            self.make_run(identifier, val, metric=measurement.OLMES_METRIC, suites=suites)
-            self.assertEqual(self.record(identifier)['status'], 'crash')
-
-    def test_preserves_the_reference_val_when_native_evaluation_fails(self):
-        self.make_run('old-baseline', 0.974083, baseline=True)
-        self.record('old-baseline')
-        _, directory = self.make_run('native-failure', 0.95, metric=measurement.OLMES_METRIC)
-        (directory / 'run.log').write_text('reference_val_bpb: 0.95\nNative evaluation failed.\n')
-        rental.save(dict(id='native-failure', phase='failed', exit_code=1))
-        failed = self.record('native-failure')
-        self.assertEqual((failed['status'], failed['val_bpb']), ('crash', 0.95))
-        self.assertEqual(self.rows()[-1][1:4], ['0.000000'] * 3)
+        self.make_run('baseline', baseline=True)
+        self.record('baseline')
+        self.make_run('gain', suites=dict(qa_bpb=0.99, math_bpb=0.99, code_bpb=99))
+        with patch.object(prepare, 'suites_improve', return_value=False):
+            self.assertEqual(self.record('gain')['status'], 'keep')
 
     def test_recognizes_the_same_native_task_data_in_a_different_execution_order(self):
         tasks = [dict(alias=name, task_hash={'hash': name}, dataset_fingerprints={'test': 'fixed'},
@@ -450,19 +344,18 @@ class RecordedDecisionTests(unittest.TestCase):
         self.assertNotEqual(measurement.native_datasets_identity(changed_data), first)
 
     def test_requires_one_correct_answer_measurement_for_every_original_example(self):
-        native = measurement.OLMES_METRIC
-        self.make_run('native-baseline', 1.0, baseline=True, metric=native)
-        self.record('native-baseline')
-        _, directory = self.make_run('missing-example', 0.9, metric=native)
+        self.make_run('baseline', baseline=True)
+        self.record('baseline')
+        _, directory = self.make_run('missing-example')
         path = directory / 'olmes-summary.json'
         summary = json.loads(path.read_text())
         summary['computed_requests'] -= 1
         path.write_text(json.dumps(summary))
         self.assertEqual(self.record('missing-example')['status'], 'crash')
 
-    def test_validates_the_inference_batch_recorded_for_a_complete_native_result(self):
-        job, directory = self.make_run('batch-plan', 1.0, baseline=True, metric=measurement.OLMES_METRIC)
-        runtime_path = rental.job_path(job['id']).parent / 'runtime.json'
+    def test_validates_the_inference_batch_that_the_runtime_fixes(self):
+        job, directory = self.make_run('batch-plan', baseline=True)
+        runtime_path = jobs.job_path(job['id']).parent / 'runtime.json'
         runtime = json.loads(runtime_path.read_text())
         runtime['olmes']['inference_batch_size'] = 32
         runtime_path.write_text(json.dumps(runtime))

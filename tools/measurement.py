@@ -12,12 +12,12 @@ RUNTIME_FIELDS = (
     "python_version", "kernel_repo", "kernel_revision", "container_image",
     "gpu_env_sha256",
 )
-
-MEASUREMENT_ROOTS = (
-    "evaluate_bpb", "download_data", "train_tokenizer", "MAX_SEQ_LEN", "TIME_BUDGET",
-    "BASE_URL", "MAX_SHARD", "VAL_SHARD", "VAL_FILENAME", "DATA_DIR",
-)
+# The bindings of prepare.py that decide what a run may train on and for how long. The score itself is the OLMES
+# evaluation's, which the definition names by its revision, suites and datasets.
+MEASUREMENT_ROOTS = ("TIME_BUDGET", "download_data", "BASE_URL", "MAX_SHARD", "VAL_SHARD", "VAL_FILENAME", "DATA_DIR")
 OLMES_METRIC = "olmes_bpb"
+# How prepare.py reads the training budget at run time; the job's frozen budget takes its place in the hash.
+BUDGET = ('active_gpu().settings()["training_seconds"]', "TIME_BUDGET")
 
 
 def digest(value):
@@ -34,23 +34,14 @@ def native_datasets_identity(tasks):
     return digest(json.dumps(datasets, sort_keys=True, separators=(",", ":")).encode())
 
 
-def prepare_semantics(source, roots=MEASUREMENT_ROOTS, settings=None):
-    """Hash BPB, allowed data and budgets with their transitive module dependencies."""
+def prepare_semantics(source, settings):
+    """Hash the data a run may use and its frozen training budget, with their transitive module dependencies."""
     tree = ast.parse(source)
-    if settings is not None:
-        # Resolve only the approved budget and cache relocation bindings. Everything
-        # that computes scores or selects data remains part of the original hash.
-        replacements = {
-            "TIME_BUDGET": ('active_gpu().settings()["training_seconds"]',
-                            repr(settings["training_seconds"])),
-            "TOKENIZER_DIR": ('str(active_gpu().cache_directory("tokenizer"))',
-                              'os.path.join(CACHE_DIR, "tokenizer")'),
-        }
-        for node in tree.body:
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                replacement = replacements.get(node.targets[0].id)
-                if replacement and ast.dump(node.value) == ast.dump(ast.parse(replacement[0], mode="eval").body):
-                    node.value = ast.parse(replacement[1], mode="eval").body
+    expression = ast.dump(ast.parse(BUDGET[0], mode="eval").body)
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == BUDGET[1] and ast.dump(node.value) == expression):
+            node.value = ast.parse(repr(settings["training_seconds"]), mode="eval").body
     bindings = {}
     for node in tree.body:
         names = []
@@ -66,7 +57,7 @@ def prepare_semantics(source, roots=MEASUREMENT_ROOTS, settings=None):
             bindings.setdefault(name, []).append(node)
     if not {"evaluate_bpb", "TIME_BUDGET"} <= bindings.keys():
         raise ValueError("The archived source must define BPB evaluation and its training budget.")
-    pending = list(roots)
+    pending = list(MEASUREMENT_ROOTS)
     selected = set()
     seen = set()
     while pending:
@@ -83,6 +74,10 @@ def prepare_semantics(source, roots=MEASUREMENT_ROOTS, settings=None):
 
 
 def from_snapshot(job, directory):
+    """The measurement a job was prepared under, from its own snapshot: the data it may train on and its frozen budget,
+    its dependencies, runtime and GPU, and the OLMES evaluation."""
+    if job["metric"] != OLMES_METRIC:
+        raise ValueError("A measurement is an OLMES evaluation.")
     directory = Path(directory)
     archive_file = directory / "source.tar.gz"
     if digest(archive_file.read_bytes()) != job["source_archive_sha256"]:
@@ -92,18 +87,13 @@ def from_snapshot(job, directory):
         if not member.isfile() or member.size > 2_000_000:
             raise ValueError("The archived measurement source is invalid.")
         source = archive.extractfile(member).read()
-        settings = None
-        if job.get("gpu_id"):
-            config = archive.extractfile("gpus.json").read()
-            if digest(config) != job["source_sha256"]["gpus.json"]:
-                raise ValueError("The archived GPU settings differ from their recorded hash.")
-            config = json.loads(config)
-            profile = config["gpus"][job["gpu_id"]]
-            settings = {name: profile[name] for name in
-                        ("training_seconds", "rental_seconds", "max_hourly_cost")}
-            if (settings != job["gpu_settings"]
-                    or profile["gpu_name"] != job["gpu_name"]):
-                raise ValueError("The frozen GPU settings differ from the prepared job.")
+        config = archive.extractfile("gpus.json").read()
+    if digest(config) != job["source_sha256"]["gpus.json"]:
+        raise ValueError("The archived GPU settings differ from their recorded hash.")
+    profile = json.loads(config)["gpus"][job["gpu_id"]]
+    settings = {name: profile[name] for name in ("training_seconds", "rental_seconds", "max_hourly_cost")}
+    if settings != job["gpu_settings"] or profile["gpu_name"] != job["gpu_name"]:
+        raise ValueError("The frozen GPU settings differ from the prepared job.")
     if digest(source) != job["source_sha256"]["prepare.py"]:
         raise ValueError("The measurement source differs from its recorded hash.")
     runtime_bytes = (directory / "runtime.json").read_bytes()
@@ -111,33 +101,17 @@ def from_snapshot(job, directory):
         raise ValueError("The archived runtime differs from its recorded hash.")
     runtime = json.loads(runtime_bytes)
     definition = dict(
-        version=2, metric="val_bpb", prepare_semantics_sha256=prepare_semantics(source, settings=settings),
-        dependencies={name: job["source_sha256"][name]
-                      for name in ("pyproject.toml", "uv.lock")},
+        version=3, metric=OLMES_METRIC, prepare_semantics_sha256=prepare_semantics(source, settings),
+        dependencies={name: job["source_sha256"][name] for name in
+                      ("pyproject.toml", "uv.lock", "evaluation/pyproject.toml", "evaluation/uv.lock")},
         gpu_name=job["gpu_name"], num_gpus=1,
         runtime={name: runtime[name] for name in RUNTIME_FIELDS},
+        olmes={name: runtime["olmes"][name] for name in
+               ("revision", "suites", "approved_config_fix", "native_datasets_sha256")},
     )
-    if job.get("metric") != OLMES_METRIC:
-        definition["runtime"]["gpu_env_sha256"] = runtime.get(
-            "training_gpu_env_sha256", runtime["gpu_env_sha256"])
-    if job.get("metric") == OLMES_METRIC:
-        evaluation = runtime["olmes"]
-        definition.update(version=3, metric=OLMES_METRIC,
-                          prepare_semantics_sha256=prepare_semantics(source, (
-                              "TIME_BUDGET", "download_data", "BASE_URL", "MAX_SHARD",
-                              "VAL_SHARD", "VAL_FILENAME", "DATA_DIR"), settings=settings),
-                          olmes={name: evaluation[name] for name in
-                                 ("revision", "suites", "approved_config_fix", "native_datasets_sha256")})
-        definition["dependencies"].update({name: job["source_sha256"][name] for name in
-                                           ("evaluation/pyproject.toml", "evaluation/uv.lock")})
     # The source archive retains the rules and model; tokenizer assets are a model choice.
     encoded = json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
     return dict(id=digest(encoded), definition=definition)
-
-
-def for_metric(job, directory, metric):
-    """Identify a shared evaluation, including the unchanged reference BPB runtime."""
-    return from_snapshot(dict(job, metric=metric), directory)
 
 
 def decision_helper(job, directory, name):

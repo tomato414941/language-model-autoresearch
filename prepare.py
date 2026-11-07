@@ -528,13 +528,6 @@ def evaluate_bpb(model, tokenizer, batch_size):
     return total_nats / (math.log(2) * total_bytes)
 
 
-def bpb_improves(candidate, incumbent):
-    """Keep a candidate whose finite val_bpb is lower than the incumbent's."""
-    if not math.isfinite(candidate) or not math.isfinite(incumbent):
-        raise ValueError("A val_bpb decision requires two finite values.")
-    return candidate < incumbent
-
-
 def suites_improve(candidate, incumbent):
     """Keep a candidate whose BPB falls on average over the suites, each suite counted by its rate of change."""
     if not incumbent or set(candidate) != set(incumbent):

@@ -36,7 +36,7 @@ class RuntimeTransportTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def package(self, parallel_decoder=False):
+    def package(self):
         actual = package_transport.subprocess.check_output
 
         def execute(command, **kwargs):
@@ -46,8 +46,7 @@ class RuntimeTransportTests(unittest.TestCase):
 
         with patch.object(package_transport.subprocess, 'check_output', side_effect=execute):
             return package_transport.package(self.reference, self.output, manifest=self.manifest,
-                                             verification_directory=self.root / 'checks', relocation_check=True,
-                                             parallel_decoder=parallel_decoder)
+                                             verification_directory=self.root / 'checks', relocation_check=True)
 
     def test_preserves_all_canonical_bytes_modes_links_and_manifest_identity_after_transcoding(self):
         original_tree = package_transport.tree_identity(self.source)
@@ -67,7 +66,7 @@ class RuntimeTransportTests(unittest.TestCase):
             package_transport.attach(self.manifest, report)
 
     def test_parallel_bootstrap_restores_the_same_runtime_and_records_its_decoder(self):
-        report = self.package(parallel_decoder=True)
+        report = self.package()
         self.assertEqual(report['runtime_tree'], package_transport.tree_identity(self.source))
         manifest = json.loads(self.manifest.read_text())
         self.assertEqual(manifest['gpu_env_sha256'], self.original['gpu_env_sha256'])

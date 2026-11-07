@@ -3,16 +3,14 @@
 import argparse
 import datetime as dt
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from tools.rental import load, ssh_command
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools import vast_backend
+from tools.jobs import load
+from tools.rental import key_file, ssh_command
 
 
 def main():
@@ -24,15 +22,12 @@ def main():
     held = job.get('instance_id') is not None and job['instance_id'] not in returned
     print(json.dumps(dict(
         observed_at=dt.datetime.now(dt.timezone.utc).isoformat(), phase=job['phase'],
-        expires_at=job.get('expires_at'), exit_code=job.get('exit_code'),
+        deadline=job.get('deadline'), exit_code=job.get('exit_code'),
         instance=job.get('instance_id'), returned=not held,
     ), indent=2), flush=True)
     if not held or not job.get('ssh_config'):
         return
-    with tempfile.TemporaryDirectory(prefix='autoresearch-observe-') as temporary:
-        key = Path(temporary) / 'key'
-        key.write_text(os.environ['VAST_SSH_KEY'].rstrip() + '\n')
-        key.chmod(0o600)
+    with key_file() as key:
         command = (
             'nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv,noheader; '
             'if test -d autoresearch; then cd autoresearch; '

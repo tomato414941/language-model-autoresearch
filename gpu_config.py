@@ -68,8 +68,6 @@ def read_config(path=None):
             raise ValueError("GPU identifiers must be simple directory names.")
         if not isinstance(values, dict) or not isinstance(values.get("gpu_name"), str):
             raise ValueError("Every GPU profile must name its GPU.")
-        if values.get("archive_delivery", "auto") not in ("auto", "ssh"):
-            raise ValueError("archive_delivery must be auto or ssh.")
     return data
 
 
@@ -86,18 +84,11 @@ def active_gpu():
 
 
 def profile_for_job(job):
-    identifier = job.get("gpu_id")
-    if identifier is not None:
-        profile = get_profile(identifier)
-        if job.get("gpu_name", profile.gpu_name) != profile.gpu_name:
-            raise ValueError("The job's GPU identity differs from its track.")
-        return profile
-    # Before tracks were introduced, this loop used only the H100.
-    name = job.get("gpu_name", "H100 SXM")
-    for identifier, values in read_config()["gpus"].items():
-        if values["gpu_name"] == name:
-            return GPUProfile(identifier, values)
-    raise ValueError("The historical job's GPU is not configured.")
+    """The profile of the GPU track the job was prepared for."""
+    profile = get_profile(job["gpu_id"])
+    if job["gpu_name"] != profile.gpu_name:
+        raise ValueError("The job's GPU identity differs from its track.")
+    return profile
 
 
 def source_files(profile=None):

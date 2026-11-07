@@ -13,8 +13,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import prepare
-from tools.package_runtime import (KERNEL_REPO, KERNEL_REVISION, PYTHON_VERSION, digest,
-                                   pack, verify_tokenizer)
+from tools.package_runtime import PYTHON_VERSION, digest, pack, verify_tokenizer
 from tools.measurement import native_datasets_identity
 from gpu_config import active_gpu, source_files
 
@@ -59,7 +58,6 @@ def package_assets():
     runtime.update(
         gpu_id=profile.identifier, sources={name: digest(ROOT / name) for name in source_files()},
         evaluation_metric="olmes_bpb", gpu_env_sha256=staged["gpu_env_sha256"],
-        training_gpu_env_sha256=runtime.get("training_gpu_env_sha256", runtime["gpu_env_sha256"]),
         gpu_assets_sha256=assets_sha256, tokenizer=verify_tokenizer(),
         olmes=dict(revision=manifest["olmes_revision"], suites=manifest["suites"],
                    approved_config_fix=APPROVED_CONFIG_FIX, native_datasets_sha256=datasets_sha256,

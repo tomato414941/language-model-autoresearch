@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import gpu_config
 import train as dispatcher
-from tools import rental
+from tools import jobs
 
 
 class GPUConfigurationTests(unittest.TestCase):
@@ -31,17 +31,6 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def save(self):
         self.path.write_text(json.dumps(self.config))
-
-    def test_reads_and_validates_each_gpus_archive_delivery_setting(self):
-        for delivery in ('auto', 'ssh'):
-            with self.subTest(delivery=delivery):
-                self.config['gpus']['rtx5090']['archive_delivery'] = delivery
-                self.save()
-                self.assertEqual(gpu_config.get_profile('rtx5090').values['archive_delivery'], delivery)
-        self.config['gpus']['rtx5090']['archive_delivery'] = 'invalid'
-        self.save()
-        with self.assertRaisesRegex(ValueError, 'archive_delivery'):
-            gpu_config.read_config()
 
     def test_switches_source_history_and_budgets_from_one_active_setting(self):
         self.config['gpus']['rtx5090'].update(training_seconds=900, rental_seconds=2700, max_hourly_cost=0.8)
@@ -74,8 +63,8 @@ class GPUConfigurationTests(unittest.TestCase):
                    expected_eval_seconds=720)
         with patch.object(gpu_config, 'CONFIG_PATH', self.path):
             self.assertEqual(gpu_config.profile_for_job(job).identifier, 'h100')
-            self.assertEqual(rental.execution_budget(job), 2820)
-            self.assertEqual(rental.lease_seconds(job), 3600)
+            self.assertEqual(jobs.machine_seconds(job), 180 + 1800 + 720 + 120)
+            self.assertEqual(jobs.rental_seconds(job), 3600)
 
     def test_selects_each_process_gpu_without_changing_the_shared_default(self):
         self.config['active_gpu'] = 'rtx5090'

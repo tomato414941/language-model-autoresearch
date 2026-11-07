@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from gpu_config import active_gpu
 from tools.package_runtime import PYTHON_VERSION, digest
-from tools.runtime_archives import UNPACK_XZ
 
 INTERPRETER = f'.python/cpython-{PYTHON_VERSION}-linux-x86_64-gnu/bin/python3.12'
 
@@ -119,9 +118,7 @@ def attach(path, report):
     (history / ('runtime-' + hashlib.sha256(original).hexdigest() + '.json')).write_bytes(original)
     manifest['transport'] = {name: report[name] for name in
                              ('format', 'canonical_gpu_env_sha256', 'bootstrap_sha256',
-                              'gpu_env_xz_sha256', 'runtime_tree')}
-    if report['format'] == 'python-xz-mt':
-        manifest['transport']['decoder_source_sha256'] = report['decoder_source_sha256']
+                              'gpu_env_xz_sha256', 'runtime_tree', 'decoder_source_sha256')}
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(manifest, indent=2) + '\n')
     temporary.replace(path)
@@ -149,7 +146,7 @@ def add_parallel_decoder(bootstrap):
 
 
 def package(reference, artifacts, verify_only=False, manifest=None, verification_directory=None,
-            relocation_check=False, parallel_decoder=False):
+            relocation_check=False):
     reference, artifacts = Path(reference).resolve(), Path(artifacts).resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
     verification_directory = Path(verification_directory).resolve() if verification_directory else artifacts
@@ -180,18 +177,16 @@ def package(reference, artifacts, verify_only=False, manifest=None, verification
                 with lzma.LZMAFile(output, 'wb', preset=6) as compressed:
                     shutil.copyfileobj(source, compressed, 1024*1024)
         payload.with_suffix('.tmp').replace(payload)
-    decoder_sha256 = add_parallel_decoder(bootstrap) if parallel_decoder else None
+    decoder_sha256 = add_parallel_decoder(bootstrap)
     print('Runtime compressed; verifying every decoded file with the standalone Python.', flush=True)
     imports = {}
     with tempfile.TemporaryDirectory(dir=artifacts, prefix='.bootstrap-check-') as boot_dir:
         boot = Path(boot_dir)
         with tarfile.open(bootstrap) as archive:
             archive.extractall(boot, filter='fully_trusted')
-        if parallel_decoder and digest(boot / 'runtime_unpack.py') != decoder_sha256:
+        if digest(boot / 'runtime_unpack.py') != decoder_sha256:
             raise ValueError('The parallel decoder differs from its packaged source.')
-        verify_command = ([str(boot / INTERPRETER), str(boot / 'runtime_unpack.py'), 'identity']
-                          if parallel_decoder else
-                          [str(boot / INTERPRETER), str(ROOT / 'tools/runtime_archives.py'), 'verify-stream'])
+        verify_command = [str(boot / INTERPRETER), str(boot / 'runtime_unpack.py'), 'identity']
         verification_started = time.monotonic()
         with payload.open('rb') as source:
             restored = json.loads(subprocess.check_output(
@@ -203,9 +198,7 @@ def package(reference, artifacts, verify_only=False, manifest=None, verification
             with tempfile.TemporaryDirectory(dir=verification_directory, prefix='.transport-check-') as target_dir:
                 target = Path(target_dir)
                 with payload.open('rb') as source:
-                    unpack_command = ([str(boot / INTERPRETER), str(boot / 'runtime_unpack.py'), 'extract']
-                                      if parallel_decoder else
-                                      [str(boot / INTERPRETER), '-c', UNPACK_XZ])
+                    unpack_command = [str(boot / INTERPRETER), str(boot / 'runtime_unpack.py'), 'extract']
                     subprocess.run(unpack_command, cwd=target, stdin=source, check=True)
                 if tree_identity(target) != original:
                     raise ValueError('The relocated runtime differs from the immutable archive.')
@@ -221,15 +214,13 @@ def package(reference, artifacts, verify_only=False, manifest=None, verification
                         text=True, env=environment).strip()
     if digest(reference) != canonical_sha256:
         raise ValueError('The immutable runtime archive changed during compression.')
-    report = dict(format='python-xz-mt' if parallel_decoder else 'python-xz',
+    report = dict(format='python-xz-mt', decoder_source_sha256=decoder_sha256,
                   runtime_tree=original, canonical_gpu_env_sha256=canonical_sha256,
                   bootstrap_sha256=digest(bootstrap), gpu_env_xz_sha256=digest(payload),
                   bootstrap_bytes=bootstrap.stat().st_size, gpu_env_xz_bytes=payload.stat().st_size,
                   imports=imports, relocation_imports_checked=relocation_check,
                   unchanged_runtime_verified=True, elapsed_seconds=time.time() - started,
                   decoder_verification_seconds=decoder_verification_seconds)
-    if parallel_decoder:
-        report['decoder_source_sha256'] = decoder_sha256
     path = artifacts / 'transport.json'
     path.write_text(json.dumps(report, indent=2) + '\n')
     if manifest is not None:
@@ -246,11 +237,10 @@ def main():
     parser.add_argument('--verify-only', action='store_true')
     parser.add_argument('--verification-directory', type=Path)
     parser.add_argument('--check-relocation', action='store_true')
-    parser.add_argument('--parallel-decoder', action='store_true')
     args = parser.parse_args()
     artifacts = args.output or active_gpu().artifacts_directory(ROOT)
     package(args.archive or artifacts / 'gpu-env.tar.gz', artifacts, args.verify_only, args.manifest,
-            args.verification_directory, args.check_relocation, args.parallel_decoder)
+            args.verification_directory, args.check_relocation)
 
 
 if __name__ == '__main__':
