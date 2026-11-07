@@ -30,7 +30,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Modify the evaluation. The metric is AI2's three OLMES suites `olmo3:base_easy:qa_bpb`, `olmo3:base_easy:math_bpb` and `olmo3:base_easy:code_bpb` (see the rules at the end).
 - Train on data that is not allowed. The allowed data is what `prepare.py` downloads: FineWeb-Edu, FineMath's `finemath-3plus` and `finemath-4plus`, and Common Pile's `stackv2_edu_filtered`, at the revisions pinned there. Only the human adds data. Never train on the validation shard, the tokenizer included, and do not filter the allowed data by its content.
 - Continue an earlier run's training. Every run trains from scratch and ends within its rental.
-- Use other models in training: no distillation from a teacher, and no other model's weights or outputs.
+- Use other models in training: no distillation from a teacher, no other model's weights, and no data that another model generates for this work. A published dataset counts as data, even if a model wrote it, and only the human adds data.
 
 **The goal is simple: lower the bits per byte on AI2's three OLMES suites for QA, math and code.** Compare a candidate with the current best of its GPU on the three suites: keep it when its rates of improvement, averaged over the suites, are positive (`prepare.suites_improve`): each suite counts equally, as the share by which its BPB falls. Since the time budget is fixed, you don't need to worry about training time — it is fixed for each GPU. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes, with its evaluation, within its rental.
 
