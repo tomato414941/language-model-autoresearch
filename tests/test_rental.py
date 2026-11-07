@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import ast
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -930,6 +932,78 @@ class RentalLifecycleTests(unittest.TestCase):
     def test_rejects_conflicting_exit_status_observations(self):
         with self.assertRaisesRegex(RuntimeError, 'Exit status'):
             self.collect_at_boundary(b'1\n', observed=0)
+
+    def collect_from(self, files, failing=()):
+        """Run a finished evaluation against a rental holding the given files, failing chosen copies in turn."""
+        failing = {name: list(errors) for name, errors in dict(failing).items()}
+        identifier = f'collection-{self.collection_cases}'
+        self.collection_cases += 1
+        job = {**self.job, 'id': identifier, 'label': 'autoresearch-' + identifier, 'expires_at': 4500,
+               'metric': 'olmes_bpb'}
+        rental.job_path(identifier).parent.mkdir(parents=True)
+        rental.save(job)
+        for name in ('gpu-env.tar.gz', 'gpu-assets.tar.gz'):
+            path = self.root / 'artifacts' / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b'archive fixture')
+        (rental.job_path(identifier).parent / 'source.tar.gz').write_bytes(b'source fixture')
+        copies = []
+
+        def command(arguments, **kwargs):
+            text = arguments[-1]
+            if text.startswith('nvidia-smi'):
+                fields = '0, 0' if 'utilization.gpu' in text else '0'
+                return subprocess.CompletedProcess(arguments, 0, stdout='NVIDIA H100 80GB HBM3, ' + fields + '\n')
+            if 'kill -0' in text:
+                return subprocess.CompletedProcess(arguments, 0, stdout='exit 0')
+            if text.startswith('cd autoresearch && cat '):
+                name = text.split('cat ', 1)[1]
+                copies.append((name, kwargs['timeout']))
+                if failing.get(name):
+                    kwargs['stdout'].write(b'partial')
+                    raise failing[name].pop(0)
+                if name not in files:
+                    raise subprocess.CalledProcessError(1, arguments)
+                kwargs['stdout'].write(files[name])
+            if text.startswith('cd autoresearch && sha256sum -- '):
+                names = text.split('-- ', 1)[1].split(' 2>', 1)[0].split()
+                return subprocess.CompletedProcess(arguments, 0, stdout=''.join(
+                    f'{hashlib.sha256(files[name]).hexdigest()}  {name}\n' for name in names if name in files))
+            return subprocess.CompletedProcess(arguments, 0, stdout='')
+
+        output = io.StringIO()
+        with patch.object(rental, 'run', side_effect=command), patch.object(rental.time, 'time', return_value=1000):
+            with patch.object(rental.time, 'sleep'), patch('sys.stdout', output):
+                rental.execute(job, ['ssh'])
+        return rental.load(identifier), copies, output.getvalue()
+
+    def rental_files(self):
+        names = ('run.log', 'prepare.log', 'bootstrap.log', 'olmes.log', 'olmes-summary.json',
+                 'olmes-metrics.jsonl', 'olmes-details.tar.gz', 'final-model.pt')
+        return {**{name: ('final ' + name).encode() for name in names}, 'run.exit': b'0\n'}
+
+    def test_copies_a_large_checkpoint_for_as_long_as_the_rental_lasts(self):
+        job, copies, output = self.collect_from(self.rental_files())
+        self.assertEqual(dict(copies)['final-model.pt'], job['expires_at'] - 5 - 1000)
+        self.assertEqual(job['collection_errors'], {})
+
+    def test_copies_again_a_file_that_differs_from_the_rentals_before_returning_it(self):
+        files = self.rental_files()
+        job, copies, output = self.collect_from(files, {'final-model.pt': [subprocess.TimeoutExpired('ssh', 30)]})
+        directory = self.root / 'results/runs' / job['id']
+        self.assertEqual((directory / 'final-model.pt').read_bytes(), files['final-model.pt'])
+        self.assertEqual([name for name, timeout in copies].count('final-model.pt'), 2)
+        self.assertEqual((job['phase'], job['collection_errors']), ('evaluated', {}))
+
+    def test_records_each_file_it_could_not_collect(self):
+        files = self.rental_files()
+        del files['olmes-details.tar.gz']
+        lost = [subprocess.CalledProcessError(255, 'ssh') for _ in range(3)]
+        job, copies, output = self.collect_from(files, {'final-model.pt': lost})
+        self.assertEqual(job['collection_errors'], {'olmes-details.tar.gz': 'absent',
+                                                    'final-model.pt': 'CalledProcessError'})
+        self.assertIn('final-model.pt was not collected: CalledProcessError.', output)
+        self.assertFalse((self.root / 'results/runs' / job['id'] / 'final-model.pt').exists())
 
     def test_records_timestamped_gpu_memory_and_utilization_samples_in_order(self):
         results = [subprocess.CompletedProcess([], 0, stdout='NVIDIA H100 80GB HBM3, 45060, 96\n'),

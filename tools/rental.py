@@ -46,7 +46,7 @@ OLMES_SOURCES = tuple('evaluation/' + name for name in (
 LEASE_SECONDS = 3600  # The rental length of jobs prepared before GPU tracks.
 CLEANUP_SECONDS = 60  # A run ends this long before vast-rental's own deadline for the machine.
 EXECUTION_SETUP_SECONDS = 180  # Post-transfer data setup and compilation estimate.
-COLLECTION_SECONDS = 45
+COLLECTION_SECONDS = 120  # Copying every result file back, the checkpoint included.
 LABEL_PREFIX = 'autoresearch-'  # Rentals whose label starts with this belong to this loop.
 BOOTSTRAP = 'gpu-bootstrap.tar.gz'
 FAILED_COST_LIMIT = Decimal('0.50')
@@ -549,16 +549,60 @@ def execute(job, connection):
         artifacts += ('olmes.log', 'olmes-summary.json', 'olmes-metrics.jsonl',
                       'olmes-details.tar.gz', 'final-model.pt')
 
+    failures = {}
+
+    def copy(name):
+        """Copy one file of the rental; a failed copy keeps the previous one."""
+        path = destination / Path(name).name
+        temporary = path.with_name(path.name + '.tmp')
+        try:
+            with temporary.open('wb') as output:
+                # Only the rental's deadline bounds a copy, so a large checkpoint arrives whole.
+                remote('cd autoresearch && cat ' + shlex.quote(name), timeout=math.inf,
+                       stdout=output, stderr=subprocess.DEVNULL)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def collect(names):
-        for name in names:
-            path = destination / Path(name).name
-            temporary = path.with_name(path.name + '.tmp')
+        """Copy the files back until each equals the rental's own, three tries at most, and record the rest."""
+        pending = list(names)
+        for _ in range(3):
+            for name in pending:
+                try:
+                    copy(name)
+                    failures.pop(name, None)
+                except (subprocess.SubprocessError, OSError, TimeoutError) as error:
+                    failures[name] = type(error).__name__
             try:
-                with temporary.open('wb') as output:
-                    remote('cd autoresearch && cat ' + shlex.quote(name), stdout=output, stderr=subprocess.DEVNULL)
-                temporary.replace(path)
+                listing = remote('cd autoresearch && sha256sum -- ' + shlex.join(pending) + ' 2>/dev/null; true',
+                                 capture_output=True, text=True).stdout
             except (subprocess.SubprocessError, OSError, TimeoutError):
-                temporary.unlink(missing_ok=True)
+                listing = None
+            held = dict(line.split('  ', 1)[::-1] for line in (listing or '').splitlines() if '  ' in line)
+            retry = []
+            for name in pending:
+                path = destination / Path(name).name
+                if name in held:
+                    if path.exists() and digest(path) == held[name]:
+                        failures.pop(name, None)
+                    else:
+                        failures.setdefault(name, 'different')
+                        retry.append(name)
+                elif name in failures:
+                    # Without a listing a failed copy is tried again; a listing without it means the rental lacks it.
+                    if listing is None:
+                        retry.append(name)
+                    else:
+                        failures[name] = 'absent'
+            pending = retry
+            if not pending:
+                break
+        for name in names:
+            if name in failures:
+                print(f'{name} was not collected: {failures[name]}.', flush=True)
+        job['collection_errors'] = dict(failures)
+        save(job)
 
     collect((*artifacts, 'run.exit'))
     try:

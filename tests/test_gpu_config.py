@@ -74,7 +74,7 @@ class GPUConfigurationTests(unittest.TestCase):
                    expected_eval_seconds=720)
         with patch.object(gpu_config, 'CONFIG_PATH', self.path):
             self.assertEqual(gpu_config.profile_for_job(job).identifier, 'h100')
-            self.assertEqual(rental.execution_budget(job), 2745)
+            self.assertEqual(rental.execution_budget(job), 2820)
             self.assertEqual(rental.lease_seconds(job), 3600)
 
     def test_selects_each_process_gpu_without_changing_the_shared_default(self):
